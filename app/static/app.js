@@ -15,6 +15,33 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+// Every modal/panel is only ever closeable through whatever explicit Close
+// button its own code happens to add -- most also close on a backdrop click,
+// but that's opt-in per call site, and NONE of them close on Escape. If a
+// given modal's Close button is ever unreachable (cut off, a render glitch,
+// content taller than expected) there's no way out short of reloading the
+// page. These two listeners are a blanket safety net so every current and
+// future .modal-overlay/.panel-overlay always has two escape hatches, without
+// each call site needing to remember to wire them up itself.
+document.addEventListener("click", (e) => {
+  if (e.target.classList && (e.target.classList.contains("modal-overlay") || e.target.classList.contains("panel-overlay"))) {
+    e.target.remove();
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  // .panel-overlay (z-index 60) always renders above .modal-overlay
+  // (z-index 50) -- e.g. opening Redlines from inside a document's detail
+  // panel stacks a modal on top of it, but the panel is still the higher
+  // layer. Closing by that same precedence (not raw DOM order) is what
+  // keeps Escape and the backdrop-click handler above agreeing on which
+  // layer is actually on top.
+  const panels = document.querySelectorAll(".panel-overlay");
+  if (panels.length) { panels[panels.length - 1].remove(); return; }
+  const modals = document.querySelectorAll(".modal-overlay");
+  if (modals.length) modals[modals.length - 1].remove();
+});
+
 // Copies text to the clipboard and flashes the clicked button green with
 // "Copied!" for a moment, so clicking Copy actually feels like it did
 // something instead of silently succeeding.
@@ -756,6 +783,13 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
 // ---------------------------------------------------------------------------
 
 async function openShareModal(generatedId) {
+  // .panel-overlay outranks .modal-overlay in z-index, so a leftover detail
+  // panel (from openDetail, or from a notification-bell click landing here
+  // while a panel is still open) would render on top of this modal and
+  // physically block its Close button. Belt-and-suspenders on top of
+  // openDetail's own callers already closing it -- this covers every path
+  // that can reach here, not just the ones that remember to.
+  document.querySelectorAll(".panel-overlay").forEach((o) => o.remove());
   const overlay = el("div", { class: "modal-overlay" });
   const body = el("div", {}, el("p", { class: "subtitle" }, "Loading..."));
   const modal = el("div", { class: "modal" }, [el("h2", {}, "Share for review"), body]);
@@ -825,6 +859,10 @@ async function openShareModal(generatedId) {
 }
 
 async function openRedlinesModal(generatedId) {
+  // See the matching comment in openShareModal -- a leftover detail panel
+  // would otherwise render on top of this modal (panel-overlay's z-index
+  // beats modal-overlay's) and swallow clicks meant for its Close button.
+  document.querySelectorAll(".panel-overlay").forEach((o) => o.remove());
   const overlay = el("div", { class: "modal-overlay" });
   const box = el("div", { class: "modal", style: "width:680px;" }, [el("h2", {}, "Redlines"), el("p", { class: "subtitle" }, "Loading...")]);
   overlay.appendChild(box);
@@ -1553,8 +1591,16 @@ function DocumentsView() {
         el("div", {}, valuesHtml ? el("div", { html: valuesHtml }) : el("div", { style: "color:var(--muted);font-size:13px;" }, "No field values recorded.")),
         el("div", { class: "panel-actions" }, [
           el("a", { class: "btn", href: `/api/generated/${d.id}/download` }, "Download .docx"),
-          el("button", { class: "btn secondary", onclick: () => openShareModal(d.id) }, "Share for review"),
-          el("button", { class: "btn secondary", onclick: () => openRedlinesModal(d.id) }, "Redlines"),
+          // Close the panel before opening either modal -- .panel-overlay is
+          // deliberately a higher z-index than .modal-overlay (so a detail
+          // panel always sits above a modal opened from elsewhere), which
+          // means leaving it open here would stack it ON TOP of Redlines/
+          // Share's own modal and physically cover their Close button --
+          // clicking it would hit the panel's slide-out underneath, not the
+          // button, with no visible sign why. This is what "Preview
+          // document" below already does correctly.
+          el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openShareModal(d.id); } }, "Share for review"),
+          el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openRedlinesModal(d.id); } }, "Redlines"),
           el("button", {
             class: "btn secondary",
             onclick: () => {
