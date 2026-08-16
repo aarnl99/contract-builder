@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from sqlmodel import Session, select
@@ -20,7 +20,7 @@ from .models import (
     User, Template, Placeholder, GeneratedContract, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
     ShareLink, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest,
 )
-from .auth import hash_password, verify_password, get_current_user, get_optional_user
+from .auth import hash_password, verify_password, validate_password_strength, get_current_user, get_optional_user
 from . import docx_engine as de
 from . import redline_engine as rl
 from . import email_engine as ee
@@ -90,22 +90,64 @@ class LoginBody(BaseModel):
     password: str
 
 
+class ResendVerificationBody(BaseModel):
+    email: str
+
+
+RESEND_VERIFICATION_COOLDOWN = 60  # seconds -- keeps "resend" from being spammed
+
+
+def _base_url(request: Request) -> str:
+    """Absolute origin for building links that go out in email (e.g. the
+    verify-email link), since those are opened outside this app's own
+    hash-routed pages and need a real, fully-qualified URL."""
+    return f"{request.url.scheme}://{request.url.netloc}"
+
+
+def _send_verification_email(request: Request, user: User) -> None:
+    link = f"{_base_url(request)}/verify-email/{user.verification_token}"
+    body = (
+        f"Hi{' ' + user.name if user.name else ''},\n\n"
+        "Please confirm your email address to finish setting up your Rotely account:\n\n"
+        f"{link}\n\n"
+        "If you didn't create this account, you can ignore this email.\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(user.email, "Confirm your email for Rotely", body)
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- account still exists, just no email goes out
+
+
 @app.post("/api/register")
 def register(body: RegisterBody, request: Request, session: Session = Depends(get_session)):
     email = body.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(400, "Please provide a valid email address")
-    if len(body.password) < 8:
-        raise HTTPException(400, "Password must be at least 8 characters")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "Please provide your full name")
+    password_error = validate_password_strength(body.password)
+    if password_error:
+        raise HTTPException(400, password_error)
     existing = session.exec(select(User).where(User.email == email)).first()
     if existing:
         raise HTTPException(400, "An account with that email already exists")
-    user = User(email=email, password_hash=hash_password(body.password), name=body.name.strip())
+
+    user = User(
+        email=email, password_hash=hash_password(body.password), name=name,
+        email_verified=False, verification_token=secrets.token_urlsafe(32),
+        verification_sent_at=datetime.utcnow(),
+    )
     session.add(user)
     session.commit()
     session.refresh(user)
-    request.session["user_id"] = user.id
-    return {"id": user.id, "email": user.email, "name": user.name}
+
+    _send_verification_email(request, user)
+    # Deliberately NOT logging them in here -- email_verified is False, so
+    # even if a client tried to use a returned session it wouldn't help;
+    # login stays blocked until they click the link.
+    return {"registered": True, "email": user.email}
 
 
 @app.post("/api/login")
@@ -114,8 +156,42 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
     user = session.exec(select(User).where(User.email == email)).first()
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(401, "Invalid email or password")
+    if not user.email_verified:
+        raise HTTPException(403, {"code": "email_not_verified", "message": "Please verify your email before logging in."})
     request.session["user_id"] = user.id
     return {"id": user.id, "email": user.email, "name": user.name}
+
+
+@app.get("/verify-email/{token}")
+def verify_email(token: str, session: Session = Depends(get_session)):
+    """Real (non-hash) route since this link is opened from an email client,
+    not from within the app. Redirects back into the SPA either way so the
+    person always lands somewhere that explains what happened."""
+    user = session.exec(select(User).where(User.verification_token == token, User.verification_token != "")).first()
+    if not user:
+        return RedirectResponse(url="/#/login?verify_error=1")
+    user.email_verified = True
+    user.verification_token = ""
+    session.add(user)
+    session.commit()
+    return RedirectResponse(url="/#/login?verified=1")
+
+
+@app.post("/api/resend-verification")
+def resend_verification(body: ResendVerificationBody, request: Request, session: Session = Depends(get_session)):
+    email = body.email.strip().lower()
+    user = session.exec(select(User).where(User.email == email)).first()
+    # Always return the same generic response whether or not the account
+    # exists or is already verified, so this endpoint can't be used to probe
+    # which emails have accounts.
+    if user and not user.email_verified:
+        if not user.verification_sent_at or (datetime.utcnow() - user.verification_sent_at).total_seconds() >= RESEND_VERIFICATION_COOLDOWN:
+            user.verification_token = user.verification_token or secrets.token_urlsafe(32)
+            user.verification_sent_at = datetime.utcnow()
+            session.add(user)
+            session.commit()
+            _send_verification_email(request, user)
+    return {"ok": True}
 
 
 @app.post("/api/logout")
