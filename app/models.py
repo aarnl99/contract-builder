@@ -143,6 +143,12 @@ class ShareLink(SQLModel, table=True):
     token: str = Field(index=True, unique=True)
     access_code: str  # short passcode the sender shares with the client out of band
     client_email: str = ""  # optional, set by the sender when creating the link -- shown to the client as "Editing as"
+    # Optional override for what the client sees as "the document sender"
+    # (contact link, reply-to on outbound mail) -- falls back to the
+    # account's own login email when blank, but lets an account holder who
+    # drafts under a different address than they log in with show the right
+    # one to this particular client.
+    sender_email: str = ""
     status: str = "open"  # open | closed
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_viewed_at: Optional[datetime] = None
@@ -172,14 +178,33 @@ class RedlineSubmission(SQLModel, table=True):
 
 
 class RedlineEdit(SQLModel, table=True):
-    """One proposed change to a single placeholder field, within a
+    """One proposed change to an exact spot in the document, within a
     submission. `evaluation` is computed automatically against the field's
-    threshold at submit time; `decision` is the account owner's call."""
+    threshold at submit time (fields only); `decision` is the account
+    owner's call.
+
+    Historically this was always "a new value for a known placeholder
+    field," applied by regenerating the whole document from the master
+    template with a field_key -> value map. That meant every occurrence of
+    a field sharing the same field_key changed together, and only
+    previously-marked placeholder text could be redlined at all.
+
+    Edits now carry `location_json`, the exact (container, paragraph, run
+    segments) in the specific generated document this edit targets --
+    captured by the browser the same way template authoring already maps a
+    selection to an exact spot (see docx_engine.mark_placeholder). Applying
+    an edit means splicing new text in at that one location in that one
+    document (docx_engine.apply_text_edits), not re-filling a token
+    everywhere it appears. That's what makes two occurrences of the same
+    field independently redlinable, and what makes redlining any text --
+    not just a previously-marked placeholder -- possible: a "text" edit
+    simply has an empty field_key and no threshold rule."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     submission_id: int = Field(foreign_key="redlinesubmission.id", index=True)
-    field_key: str
-    label: str  # snapshot of the field's label at proposal time
+    # "" for a free-text edit not tied to any known placeholder field.
+    field_key: str = ""
+    label: str  # snapshot of the field's label (or a short excerpt of the original text, for free-text edits)
     original_value: str
     proposed_value: str
     comment: str = ""  # optional, client's note on why they're suggesting this specific change
@@ -188,6 +213,12 @@ class RedlineEdit(SQLModel, table=True):
     # Only set when decision == "countered": the owner's own proposed value,
     # sent back to the client instead of a flat accept/reject.
     counter_value: str = ""
+    # {"container_path": [[t,r,c],...], "paragraph_index": int,
+    #  "segments": [{"r","start","end"}, ...]} -- the exact spot in the
+    # generated document (GeneratedContract.file_path, at submission time)
+    # this edit targets. Empty "{}" only for rows written before this field
+    # existed; such rows can no longer be applied and are skipped.
+    location_json: str = "{}"
 
 
 # ---------------------------------------------------------------------------
