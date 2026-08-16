@@ -1,4 +1,4 @@
-const state = { user: null, plan: null, documentTypes: ["NDA", "Services Agreement", "Consulting Agreement", "Employment Agreement", "Lease Agreement", "Sales Contract", "Other"] };
+const state = { user: null, plan: null, isAdmin: false, documentTypes: ["NDA", "Services Agreement", "Consulting Agreement", "Employment Agreement", "Lease Agreement", "Sales Contract", "Other"] };
 
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
@@ -65,6 +65,7 @@ function currentTabFromHash() {
   const h = location.hash || "";
   if (h.startsWith("#/masters")) return "masters";
   if (h.startsWith("#/documents")) return "documents";
+  if (h.startsWith("#/admin")) return "admin";
   if (h.startsWith("#/draft")) return "draft";
   return "draft";
 }
@@ -80,11 +81,15 @@ function topbar() {
   ]);
 
   if (state.user) {
-    const tabs = el("div", { class: "nav-tabs" }, [
+    const tabButtons = [
       el("button", { class: activeTab === "draft" ? "active" : "", onclick: () => (location.hash = "#/draft") }, "Draft"),
       el("button", { class: activeTab === "masters" ? "active" : "", onclick: () => (location.hash = "#/masters") }, "Master Documents"),
       el("button", { class: activeTab === "documents" ? "active" : "", onclick: () => (location.hash = "#/documents") }, "Documents"),
-    ]);
+    ];
+    if (state.isAdmin) {
+      tabButtons.push(el("button", { class: activeTab === "admin" ? "active" : "", onclick: () => (location.hash = "#/admin") }, "Admin"));
+    }
+    const tabs = el("div", { class: "nav-tabs" }, tabButtons);
     left.appendChild(tabs);
   }
   bar.appendChild(left);
@@ -205,6 +210,7 @@ function refreshTopbarInPlace() {
   if (!oldBar) return;
   api("/api/me").then((me) => {
     state.plan = me.plan;
+    state.isAdmin = !!me.is_admin;
     const newBar = topbar();
     oldBar.replaceWith(newBar);
   });
@@ -326,6 +332,7 @@ function AuthView(mode) {
         state.user = user;
         const meRes = await api("/api/me");
         state.plan = meRes.plan;
+        state.isAdmin = !!meRes.is_admin;
         location.hash = "#/draft";
       } catch (e) {
         errorBox.innerHTML = "";
@@ -1422,6 +1429,186 @@ function EditorView(templateId) {
 }
 
 // ---------------------------------------------------------------------------
+// Admin dashboard (owner-only -- see ADMIN_EMAIL in main.py)
+// ---------------------------------------------------------------------------
+
+function fmtCompactNumber(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "K";
+  return String(n);
+}
+
+function fmtBytes(n) {
+  if (!n) return "0 MB";
+  const mb = n / (1024 * 1024);
+  if (mb < 1024) return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+  return `${(mb / 1024).toFixed(2)} GB`;
+}
+
+function fmtShortDate(iso) {
+  return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function statTile(label, value, hint) {
+  return el("div", { class: "stat-tile" }, [
+    el("div", { class: "stat-label" }, label),
+    el("div", { class: "stat-value" }, value),
+    hint ? el("div", { class: "stat-hint" }, hint) : null,
+  ]);
+}
+
+// Single-series bar chart -- one hue (no legend box needed, see
+// dataviz guidance: a single series names itself via the title). Bars are
+// capped at 24px thick with a 4px rounded top edge and a 2px surface gap
+// between them; a hairline baseline carries the axis. Hover shows an exact
+// date + count in a small tooltip anchored to the bar.
+function buildBarChart(title, series, colorClass) {
+  const card = el("div", { class: "chart-card" });
+  card.appendChild(el("div", { class: "chart-title" }, title));
+
+  const max = Math.max(1, ...series.map((d) => d.count));
+  const plot = el("div", { class: "bar-chart" });
+  const tooltip = el("div", { class: "chart-tooltip" });
+  tooltip.style.display = "none";
+  card.appendChild(tooltip);
+
+  series.forEach((d) => {
+    const h = Math.round((d.count / max) * 100);
+    const barWrap = el("div", { class: "bar-col" });
+    const bar = el("div", {
+      class: "bar " + colorClass,
+      style: `height:${Math.max(d.count > 0 ? 3 : 0, h)}%`,
+    });
+    barWrap.appendChild(bar);
+    barWrap.addEventListener("mouseenter", () => {
+      tooltip.textContent = `${fmtShortDate(d.date)} — ${d.count}`;
+      tooltip.style.display = "block";
+      const wrapRect = barWrap.getBoundingClientRect();
+      const plotRect = plot.getBoundingClientRect();
+      tooltip.style.left = `${wrapRect.left - plotRect.left + wrapRect.width / 2}px`;
+    });
+    barWrap.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
+    plot.appendChild(barWrap);
+  });
+  card.appendChild(plot);
+  card.appendChild(el("div", { class: "chart-baseline" }));
+
+  const totalCount = series.reduce((s, d) => s + d.count, 0);
+  card.appendChild(el("div", { class: "chart-footnote" }, `${totalCount} total over the last ${series.length} days`));
+  return card;
+}
+
+function statusRow(label, ok, okText, badText) {
+  return el("div", { class: "status-row" }, [
+    el("span", { class: "status-dot " + (ok ? "good" : "bad") }),
+    el("span", { class: "status-label" }, label),
+    el("span", { class: "status-value" }, ok ? okText : badText),
+  ]);
+}
+
+function AdminView() {
+  const wrap = el("div", { class: "admin-view" });
+  wrap.appendChild(el("h1", {}, "Admin"));
+  wrap.appendChild(el("p", { class: "subtitle" }, "Owner-only view of how Rotely itself is doing -- not visible to any other account."));
+
+  const body = el("div", {}, [el("div", { class: "empty-state card" }, "Loading...")]);
+  wrap.appendChild(body);
+
+  api("/api/admin/overview").then((data) => {
+    body.innerHTML = "";
+    const t = data.totals;
+    const sys = data.system;
+
+    // Stat tiles
+    const statsRow = el("div", { class: "stats-row" }, [
+      statTile("Total users", fmtCompactNumber(t.users), `${t.verified_users} verified`),
+      statTile("New signups", fmtCompactNumber(t.users_last_7d), "last 7 days"),
+      statTile("Contracts generated", fmtCompactNumber(t.generated_contracts), `${t.generated_last_7d} this week`),
+      statTile("Open share links", fmtCompactNumber(t.share_links_open), `${t.redline_pending} redlines pending`),
+    ]);
+    body.appendChild(statsRow);
+
+    // Charts
+    const chartsRow = el("div", { class: "charts-row" }, [
+      buildBarChart("Signups per day", data.signups_series, "accent"),
+      buildBarChart("Contracts generated per day", data.contracts_series, "success"),
+    ]);
+    body.appendChild(chartsRow);
+
+    const lowerRow = el("div", { class: "admin-lower-row" });
+
+    // System health card
+    const sysCard = el("div", { class: "card" });
+    sysCard.appendChild(el("div", { class: "chart-title" }, "System"));
+    sysCard.appendChild(statusRow("Email sending (SendGrid)", sys.sendgrid_configured, "Configured", "Not configured"));
+    sysCard.appendChild(statusRow("AI drafting (Anthropic)", sys.anthropic_configured, "Configured", "Not configured"));
+
+    const meterRow = el("div", { class: "status-row" });
+    meterRow.appendChild(el("span", { class: "status-label" }, "Disk usage"));
+    meterRow.appendChild(el("span", { class: "status-value" }, `${fmtBytes(sys.disk_used_bytes)} / ${fmtBytes(sys.disk_total_bytes)}`));
+    sysCard.appendChild(meterRow);
+    sysCard.appendChild(el("div", { class: "meter" }, [el("div", { class: "meter-fill", style: `width:${Math.min(100, sys.disk_pct)}%` })]));
+
+    const buildRow = el("div", { class: "status-row", style: "margin-top:10px;" });
+    buildRow.appendChild(el("span", { class: "status-label" }, "Deployed commit"));
+    buildRow.appendChild(el("span", { class: "status-value mono" }, sys.git_commit));
+    sysCard.appendChild(buildRow);
+    lowerRow.appendChild(sysCard);
+
+    // Plan breakdown card
+    const planCard = el("div", { class: "card" });
+    planCard.appendChild(el("div", { class: "chart-title" }, "Users by plan"));
+    const planLabels = { starter: "Starter", pro: "Pro", unlimited: "Unlimited" };
+    const planTotal = Object.values(data.users_by_plan).reduce((s, n) => s + n, 0) || 1;
+    Object.keys(planLabels).forEach((key) => {
+      const n = data.users_by_plan[key] || 0;
+      const pct = Math.round((n / planTotal) * 100);
+      const row = el("div", { class: "plan-bar-row" });
+      row.appendChild(el("div", { class: "plan-bar-label" }, [planLabels[key], el("span", {}, `${n}`)]));
+      row.appendChild(el("div", { class: "plan-bar-track" }, [el("div", { class: "plan-bar-fill", style: `width:${pct}%` })]));
+      planCard.appendChild(row);
+    });
+    lowerRow.appendChild(planCard);
+
+    body.appendChild(lowerRow);
+
+    // Recent users table
+    const usersCard = el("div", { class: "card" });
+    usersCard.appendChild(el("div", { class: "chart-title" }, "Recent signups"));
+    const table = el("div", { class: "admin-table" });
+    table.appendChild(
+      el("div", { class: "admin-table-row header" }, [
+        el("div", {}, "User"),
+        el("div", {}, "Plan"),
+        el("div", {}, "Verified"),
+        el("div", {}, "Templates"),
+        el("div", {}, "Contracts"),
+        el("div", {}, "Joined"),
+      ])
+    );
+    data.recent_users.forEach((u) => {
+      table.appendChild(
+        el("div", { class: "admin-table-row" }, [
+          el("div", {}, [el("div", { style: "font-weight:600;" }, u.name || u.email), el("div", { style: "color:var(--muted-soft);font-size:12px;" }, u.email)]),
+          el("div", {}, planLabels[u.plan] || u.plan),
+          el("div", {}, u.email_verified ? el("span", { class: "status-dot good", style: "display:inline-block;" }) : el("span", { class: "status-dot bad", style: "display:inline-block;" })),
+          el("div", {}, String(u.template_count)),
+          el("div", {}, String(u.contract_count)),
+          el("div", {}, fmtShortDate(u.created_at)),
+        ])
+      );
+    });
+    usersCard.appendChild(table);
+    body.appendChild(usersCard);
+  }).catch((e) => {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "error-box" }, e.message || "Failed to load admin data."));
+  });
+
+  return wrap;
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -1441,6 +1628,7 @@ async function router() {
   const [meRes] = await Promise.all([api("/api/me"), ensureDocumentTypes()]);
   state.user = meRes.user;
   state.plan = meRes.plan;
+  state.isAdmin = !!meRes.is_admin;
 
   if (!state.user && !hash.startsWith("#/login") && !hash.startsWith("#/register")) {
     render(shell(AuthView("login")));
@@ -1455,6 +1643,10 @@ async function router() {
   if (hash.startsWith("#/register")) return render(shell(AuthView("register")));
   if (hash.startsWith("#/masters")) return render(shell(MastersView()));
   if (hash.startsWith("#/documents")) return render(shell(DocumentsView()));
+  if (hash.startsWith("#/admin")) {
+    if (!state.isAdmin) { location.hash = "#/draft"; return; }
+    return render(shell(AdminView()));
+  }
 
   const draftMatch = hash.match(/^#\/draft\/(\d+)/);
   if (draftMatch) return render(shell(DraftView(parseInt(draftMatch[1], 10))));
