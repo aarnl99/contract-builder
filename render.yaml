@@ -2,7 +2,7 @@ services:
   - type: web
     name: rotely
     env: python
-    plan: free
+    plan: starter
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     envVars:
@@ -10,4 +10,10 @@ services:
         generateValue: true
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: DATA_DIR
+        value: /var/data
     autoDeploy: true
+    disk:
+      name: rotely-data
+      mountPath: /var/data
+      sizeGB: 1
