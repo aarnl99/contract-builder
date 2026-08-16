@@ -24,11 +24,23 @@ async function api(path, opts = {}) {
   });
   if (!res.ok) {
     let msg = res.statusText;
+    let code = null;
     try {
       const data = await res.json();
-      msg = data.detail || msg;
+      // detail is usually a plain string, but some endpoints (e.g. login
+      // blocked on an unverified email) send a structured
+      // {code, message} object so the caller can react to *which* error
+      // this is, not just display text.
+      if (data && typeof data.detail === "object" && data.detail !== null) {
+        msg = data.detail.message || msg;
+        code = data.detail.code || null;
+      } else {
+        msg = data.detail || msg;
+      }
     } catch (e) {}
-    throw new Error(msg);
+    const err = new Error(msg);
+    if (code) err.code = code;
+    throw err;
   }
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) return res.json();
@@ -208,40 +220,131 @@ function AuthView(mode) {
   const card = el("div", { class: "card" });
   wrap.appendChild(card);
 
+  // If we just landed here from the verify-email link (a real, non-hash
+  // redirect from main.py's /verify-email/{token}), surface a banner once
+  // and strip the query off the hash so it doesn't linger through reloads.
+  const hashQuery = new URLSearchParams(location.hash.split("?")[1] || "");
+  const justVerified = hashQuery.get("verified") === "1";
+  const verifyError = hashQuery.get("verify_error") === "1";
+  if (justVerified || verifyError) {
+    history.replaceState(null, "", location.pathname + "#/login");
+  }
+
+  let registeredEmail = null; // set right after a successful register -- swaps the card to "check your email"
+
   function draw() {
     card.innerHTML = "";
     card.appendChild(
       el("div", { class: "auth-logo" }, [el("div", { class: "word" }, "Rotely.ai")])
     );
+
+    if (registeredEmail) {
+      const resendNote = el("div", { style: "font-size:12.5px;color:var(--muted);margin-top:10px;" }, "");
+      const resendBtn = el("button", { class: "btn secondary block", style: "margin-top:12px;" }, "Resend email");
+      resendBtn.addEventListener("click", async () => {
+        resendBtn.disabled = true;
+        try {
+          await api("/api/resend-verification", { method: "POST", body: { email: registeredEmail } });
+          resendNote.textContent = "Sent -- check your inbox (and spam folder).";
+        } catch (e) {
+          resendNote.textContent = e.message;
+        } finally {
+          resendBtn.disabled = false;
+        }
+      });
+      const backBtn = el(
+        "button",
+        { class: "btn ghost block", style: "margin-top:8px;", onclick: () => { registeredEmail = null; tab = "login"; draw(); } },
+        "Back to log in"
+      );
+      card.appendChild(el("h1", {}, "Check your email"));
+      card.appendChild(
+        el("p", { class: "subtitle" }, [
+          "We sent a confirmation link to ",
+          el("strong", {}, registeredEmail),
+          ". Click it to activate your account, then log in below.",
+        ])
+      );
+      card.appendChild(resendBtn);
+      card.appendChild(resendNote);
+      card.appendChild(backBtn);
+      return;
+    }
+
     const errorBox = el("div");
+    if (tab === "login" && justVerified) {
+      errorBox.appendChild(el("div", { class: "notice-box" }, "Email verified -- you can log in now."));
+    } else if (tab === "login" && verifyError) {
+      errorBox.appendChild(el("div", { class: "error-box" }, "That verification link is invalid or expired. Request a new one below."));
+    }
+
     const tabs = el("div", { class: "auth-tabs", style: "justify-content:center;" }, [
       el("button", { class: tab === "login" ? "active" : "", onclick: () => { tab = "login"; draw(); } }, "Log in"),
       el("button", { class: tab === "register" ? "active" : "", onclick: () => { tab = "register"; draw(); } }, "Create account"),
     ]);
 
     const emailInput = el("input", { type: "email", placeholder: "you@example.com" });
-    const passInput = el("input", { type: "password", placeholder: "At least 8 characters" });
-    const nameInput = el("input", { type: "text", placeholder: "Full name (optional)" });
+    const passInput = el("input", { type: "password", placeholder: tab === "register" ? "At least 8 characters" : "Password" });
+    const nameInput = el("input", { type: "text", placeholder: "Full name" });
+    const confirmInput = el("input", { type: "password", placeholder: "Re-enter your password" });
 
     const fields = [el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Email"), emailInput])];
     if (tab === "register") {
-      fields.push(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Name"), nameInput]));
+      fields.push(
+        el("div", { class: "form-row" }, [el("label", { class: "field-label" }, ["Full name", el("span", { class: "req" }, " *")]), nameInput])
+      );
     }
     fields.push(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Password"), passInput]));
+    if (tab === "register") {
+      fields.push(
+        el("div", { style: "font-size:12px;color:var(--muted);margin:-8px 0 2px;" }, "At least 8 characters, with an uppercase letter, a lowercase letter, and a number.")
+      );
+      fields.push(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Confirm password"), confirmInput]));
+    }
 
     const submitBtn = el("button", { class: "btn block" }, tab === "login" ? "Log in" : "Create account");
     submitBtn.addEventListener("click", async () => {
       errorBox.innerHTML = "";
+      if (tab === "register") {
+        if (!nameInput.value.trim()) {
+          errorBox.appendChild(el("div", { class: "error-box" }, "Please enter your full name."));
+          return;
+        }
+        if (passInput.value !== confirmInput.value) {
+          errorBox.appendChild(el("div", { class: "error-box" }, "Passwords don't match."));
+          return;
+        }
+      }
       try {
-        const body = { email: emailInput.value, password: passInput.value };
-        if (tab === "register") body.name = nameInput.value;
-        const user = await api(tab === "login" ? "/api/login" : "/api/register", { method: "POST", body });
+        if (tab === "register") {
+          const res = await api("/api/register", { method: "POST", body: { email: emailInput.value, password: passInput.value, name: nameInput.value } });
+          registeredEmail = res.email;
+          draw();
+          return;
+        }
+        const user = await api("/api/login", { method: "POST", body: { email: emailInput.value, password: passInput.value } });
         state.user = user;
         const meRes = await api("/api/me");
         state.plan = meRes.plan;
         location.hash = "#/draft";
       } catch (e) {
+        errorBox.innerHTML = "";
         errorBox.appendChild(el("div", { class: "error-box" }, e.message));
+        if (e.code === "email_not_verified") {
+          const resendBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Resend verification email");
+          resendBtn.addEventListener("click", async () => {
+            resendBtn.disabled = true;
+            resendBtn.textContent = "Sending...";
+            try {
+              await api("/api/resend-verification", { method: "POST", body: { email: emailInput.value } });
+              resendBtn.textContent = "Sent -- check your inbox";
+            } catch (e2) {
+              resendBtn.disabled = false;
+              resendBtn.textContent = "Resend verification email";
+            }
+          });
+          errorBox.appendChild(resendBtn);
+        }
       }
     });
 
