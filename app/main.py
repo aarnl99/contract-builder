@@ -1722,7 +1722,8 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
             "edits": [
                 {
                     "field_key": e.field_key, "label": e.label,
-                    "proposed_value": e.proposed_value, "decision": e.decision, "counter_value": e.counter_value,
+                    "proposed_value": e.proposed_value, "original_value": e.original_value,
+                    "decision": e.decision, "counter_value": e.counter_value,
                     "location": json.loads(e.location_json or "{}") or None,
                 }
                 for e in responded_edits
