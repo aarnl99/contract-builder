@@ -287,3 +287,20 @@ class EmailDraftRequest(SQLModel, table=True):
     generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Notification(SQLModel, table=True):
+    """One in-app bell notification for an account owner. Deliberately
+    narrow-scoped: only two things ever create a row here -- a client
+    submitting redlines for review, and a client acknowledging the owner's
+    response to a submission (see main.py's submit_redlines and
+    acknowledge_response). Nothing else should write to this table."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    type: str  # "redline_submitted" | "response_acknowledged"
+    title: str
+    body: str = ""
+    generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    read_at: Optional[datetime] = None

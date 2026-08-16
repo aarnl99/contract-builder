@@ -19,7 +19,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from .db import init_db, get_session, UPLOADS_DIR, DATA_DIR
 from .models import (
     User, Template, Placeholder, GeneratedContract, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
-    ShareLink, ShareLinkView, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest,
+    ShareLink, ShareLinkView, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest, Notification,
 )
 from .auth import hash_password, verify_password, validate_password_strength, get_current_user, get_optional_user
 from . import docx_engine as de
@@ -270,6 +270,58 @@ def set_plan(body: PlanBody, user: User = Depends(get_current_user), session: Se
     session.add(user)
     session.commit()
     return {"plan": _plan_info(session, user)}
+
+
+# ---------------------------------------------------------------------------
+# Notifications -- the bell in the topbar. Deliberately narrow: the only two
+# things that ever create a row are a client submitting redlines and a
+# client acknowledging the owner's response (see _notify's call sites).
+# ---------------------------------------------------------------------------
+
+def _notification_payload(n: Notification) -> dict:
+    return {
+        "id": n.id,
+        "type": n.type,
+        "title": n.title,
+        "body": n.body,
+        "generated_contract_id": n.generated_contract_id,
+        "created_at": n.created_at.isoformat() + "Z",
+        "read": n.read_at is not None,
+    }
+
+
+@app.get("/api/notifications")
+def list_notifications(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    rows = session.exec(
+        select(Notification).where(Notification.user_id == user.id).order_by(Notification.created_at.desc()).limit(50)
+    ).all()
+    unread_count = len([n for n in rows if n.read_at is None])
+    return {"notifications": [_notification_payload(n) for n in rows], "unread_count": unread_count}
+
+
+@app.post("/api/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    n = session.get(Notification, notification_id)
+    if not n or n.user_id != user.id:
+        raise HTTPException(404, "Notification not found")
+    if not n.read_at:
+        n.read_at = datetime.utcnow()
+        session.add(n)
+        session.commit()
+    return {"id": n.id, "read": True}
+
+
+@app.post("/api/notifications/read-all")
+def mark_all_notifications_read(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    unread = session.exec(
+        select(Notification).where(Notification.user_id == user.id, Notification.read_at.is_(None))
+    ).all()
+    now = datetime.utcnow()
+    for n in unread:
+        n.read_at = now
+        session.add(n)
+    session.commit()
+    return {"ok": True, "marked": len(unread)}
 
 
 # ---------------------------------------------------------------------------
@@ -1675,6 +1727,13 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     owner = session.get(User, gc.owner_id)
     if owner:
         _send_redlines_submitted_notification(owner, gc, link, len(resolved), body.note.strip())
+        who = link.client_email.strip() or "A reviewer"
+        _notify(
+            session, owner.id, "redline_submitted",
+            title=f'{who} sent redlines on "{gc.name}"',
+            body=f"{len(resolved)} change{'s' if len(resolved) != 1 else ''} proposed." if resolved else "",
+            generated_contract_id=gc.id,
+        )
     return {"ok": True}
 
 
@@ -1704,7 +1763,10 @@ class AckResponseBody(BaseModel):
 @app.post("/api/share/{token}/acknowledge-response")
 def acknowledge_response(token: str, body: AckResponseBody, request: Request, session: Session = Depends(get_session)):
     """Marks the owner's batched response as seen, so it doesn't keep
-    reappearing on later visits once the client has continued past it."""
+    reappearing on later visits once the client has continued past it. Also
+    the second (and last) trigger for the owner's notification bell -- the
+    owner learns the client actually looked at their accept/reject/counter
+    call, without needing to keep checking back themselves."""
     link = _require_share_session(request, token, session)
     submission = session.get(RedlineSubmission, body.submission_id)
     if not submission or submission.share_link_id != link.id:
@@ -1712,6 +1774,17 @@ def acknowledge_response(token: str, body: AckResponseBody, request: Request, se
     submission.client_ack_at = datetime.utcnow()
     session.add(submission)
     session.commit()
+
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    owner = session.get(User, gc.owner_id) if gc else None
+    if owner and gc:
+        _send_response_acknowledged_notification(owner, gc, link)
+        who = link.client_email.strip() or "The reviewer"
+        _notify(
+            session, owner.id, "response_acknowledged",
+            title=f'{who} saw your response on "{gc.name}"',
+            generated_contract_id=gc.id,
+        )
     return {"ok": True}
 
 
@@ -1826,6 +1899,35 @@ def _send_redlines_submitted_notification(owner: User, gc: GeneratedContract, li
         )
     except RuntimeError:
         pass  # SENDGRID_API_KEY not configured yet -- the submission is still recorded, just no email goes out
+
+
+def _send_response_acknowledged_notification(owner: User, gc: GeneratedContract, link: ShareLink):
+    """Lets the owner know the client actually opened and moved past their
+    accept/reject/counter response, the second (and last) of the two
+    triggers for owner-facing notifications -- see acknowledge_response."""
+    who = link.client_email.strip() or "The reviewer"
+    body = (
+        f'{who} saw your response on "{gc.name}" and continued.\n\n'
+        "Log in to your Rotely documents library for the full history.\n\n- Rotely"
+    )
+    try:
+        ee.send_email(
+            owner.email, f'{who} saw your response on "{gc.name}"', body,
+            reply_to=(link.client_email.strip() or None),
+        )
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the in-app notification below still lands either way
+
+
+def _notify(session: Session, user_id: int, type_: str, title: str, body: str = "", generated_contract_id: Optional[int] = None):
+    """Writes one row to the owner's in-app notification bell. The ONLY two
+    call sites for this, on purpose (see the Notification model docstring):
+    submit_redlines (a client submitted redlines) and acknowledge_response
+    (a client acknowledged the owner's response). Nothing else should call
+    this -- keeping the bell to exactly those two triggers is a deliberate
+    product decision, not an oversight."""
+    session.add(Notification(user_id=user_id, type=type_, title=title, body=body, generated_contract_id=generated_contract_id))
+    session.commit()
 
 
 def _send_ready_notification(user: User, gc: GeneratedContract, file_path: str):
