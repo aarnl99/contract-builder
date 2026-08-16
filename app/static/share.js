@@ -159,10 +159,90 @@ function JoinCta() {
   ]);
 }
 
+// Maps a browser text selection back to an exact (paragraph, run,
+// char-offset) location the way template authoring already does for
+// marking placeholders (see app.js's computeSelectionSegments) -- reused
+// here so a client can redline ANY text in the document, not just spots the
+// sender pre-marked as a field.
+function computeSelectionSegments(containerEl) {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!containerEl.contains(range.commonAncestorContainer)) return null;
+
+  function toTextNode(node, offset) {
+    if (node.nodeType === 3) return { node, offset };
+    if (offset < node.childNodes.length) {
+      let n = node.childNodes[offset];
+      while (n && n.nodeType !== 3 && n.firstChild) n = n.firstChild;
+      if (n && n.nodeType === 3) return { node: n, offset: 0 };
+    }
+    let n = node.lastChild;
+    while (n && n.nodeType !== 3 && n.lastChild) n = n.lastChild;
+    if (n && n.nodeType === 3) return { node: n, offset: n.length };
+    return { node: null, offset: 0 };
+  }
+
+  function findAncestorWithClass(node, cls) {
+    let e = node.nodeType === 3 ? node.parentElement : node;
+    while (e && !(e.classList && e.classList.contains(cls))) e = e.parentElement;
+    return e;
+  }
+
+  const startTN = toTextNode(range.startContainer, range.startOffset);
+  const endTN = toTextNode(range.endContainer, range.endOffset);
+  if (!startTN.node || !endTN.node) return null;
+
+  const startRunEl = findAncestorWithClass(startTN.node, "run");
+  const endRunEl = findAncestorWithClass(endTN.node, "run");
+  const startParaEl = findAncestorWithClass(startTN.node, "para");
+  const endParaEl = findAncestorWithClass(endTN.node, "para");
+  if (!startRunEl || !endRunEl || !startParaEl || !endParaEl) return null;
+  if (startParaEl !== endParaEl) return { error: "cross-paragraph" };
+
+  const pIndex = parseInt(startParaEl.dataset.p, 10);
+  const tablePath = startParaEl.dataset.path || "";
+  const text = range.toString();
+
+  if (startRunEl === endRunEl) {
+    const r = parseInt(startRunEl.dataset.r, 10);
+    let s = startTN.offset, e = endTN.offset;
+    if (s > e) [s, e] = [e, s];
+    return { paragraph_index: pIndex, table_path: tablePath, segments: [{ r, start: s, end: e }], text };
+  }
+
+  const allRuns = Array.from(startParaEl.querySelectorAll(".run"));
+  const startIdx = allRuns.indexOf(startRunEl);
+  const endIdx = allRuns.indexOf(endRunEl);
+  if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return null;
+
+  const segments = [];
+  for (let i = startIdx; i <= endIdx; i++) {
+    const runEl = allRuns[i];
+    const r = parseInt(runEl.dataset.r, 10);
+    const runLen = (runEl.textContent || "").length;
+    let s, e;
+    if (i === startIdx) { s = startTN.offset; e = runLen; }
+    else if (i === endIdx) { s = 0; e = endTN.offset; }
+    else { s = 0; e = runLen; }
+    if (s < e) segments.push({ r, start: s, end: e });
+  }
+  if (!segments.length) return null;
+  return { paragraph_index: pIndex, table_path: tablePath, segments, text };
+}
+
+function locKey(loc) {
+  return `${loc.table_path || ""}|${loc.paragraph_index}|${loc.segments.map((s) => `${s.r}:${s.start}:${s.end}`).join(",")}`;
+}
+
 // Redline directly in the document, the way you'd suggest an edit in a
-// shared Google Doc: highlight a field, then a small "Suggest edit" action
-// appears for it, and the document itself shows the strikethrough-old /
-// underlined-new diff right where that text lives.
+// shared Google Doc: select any text (a pre-marked field's value, or any
+// other word/clause), a small "Suggest edit" action appears for exactly
+// that spot, and the document itself shows the strikethrough-old /
+// underlined-new diff right where that text lives. Each edit is tied to
+// its own exact location, so two occurrences of the same field (or the
+// same phrase) can be redlined independently -- changing one never
+// changes the other.
 function DocumentView(data) {
   const shell = el("div", { class: "redline-shell" });
 
@@ -170,7 +250,7 @@ function DocumentView(data) {
   const header = el("div", { class: "redline-header" }, [
     el("h1", { class: "rh-title" }, data.name),
     el("div", { class: "rh-subtype" }, data.document_type),
-    el("div", { class: "rh-instruction" }, "Select text to suggest a change."),
+    el("div", { class: "rh-instruction" }, "Select any text in the document to suggest a change — a highlighted field or any other word or clause."),
   ]);
   if (data.parties && data.parties.length) {
     header.appendChild(
@@ -182,34 +262,47 @@ function DocumentView(data) {
   }
   shell.appendChild(header);
 
+  const pristineHtml = data.html || "<p>No preview available.</p>";
   const preview = el("div", { class: "contract-view" });
-  preview.innerHTML = data.html || "<p>No preview available.</p>";
+  preview.innerHTML = pristineHtml;
 
   const errBox = el("div", { style: "margin-top:14px;" });
 
   const fieldByKey = {};
   (data.fields || []).forEach((f) => { fieldByKey[f.field_key] = f; });
-  const edits = {}; // field_key -> { value, comment }, only present when value differs from current_value
+
+  // locKey(location) -> { field_key, label, location, original_text, value, comment }
+  const edits = {};
 
   if (data.draft && data.draft.edits) {
-    data.draft.edits.forEach((e) => { edits[e.field_key] = { value: e.proposed_value, comment: e.comment || "" }; });
+    data.draft.edits.forEach((e) => {
+      if (!e.location || !e.location.segments || !e.location.segments.length) return;
+      const loc = { table_path: e.location.table_path || "", paragraph_index: e.location.paragraph_index, segments: e.location.segments };
+      edits[locKey(loc)] = {
+        field_key: e.field_key || "", label: e.label || "", location: loc,
+        original_text: e.original_value || "", value: e.proposed_value, comment: e.comment || "",
+      };
+    });
   }
 
-  const hasInlineTargets = !!preview.querySelector(".field-value[data-field-key]");
-  const orphanFields = hasInlineTargets ? [] : (data.fields || []); // older drafts made before inline highlighting existed
+  function findParaEl(tablePath, pIdx) {
+    const sel = tablePath
+      ? `.para[data-path="${cssEscape(tablePath)}"][data-p="${pIdx}"]`
+      : `.para[data-p="${pIdx}"]:not([data-path])`;
+    return preview.querySelector(sel);
+  }
 
   // ---- stats bar ----
   const statsBar = el("div", { class: "stats-bar" });
   function renderStats() {
     statsBar.innerHTML = "";
-    const total = (data.fields || []).length;
     const changed = Object.keys(edits).length;
-    [
-      [String(total), total === 1 ? "field open for redlining" : "fields open for redlining"],
-      [String(changed), changed === 1 ? "change suggested" : "changes suggested"],
-    ].forEach(([num, cap]) => {
-      statsBar.appendChild(el("div", { class: "stat-tile" }, [el("div", { class: "num" }, num), el("div", { class: "cap" }, cap)]));
-    });
+    statsBar.appendChild(
+      el("div", { class: "stat-tile" }, [
+        el("div", { class: "num" }, String(changed)),
+        el("div", { class: "cap" }, changed === 1 ? "change suggested" : "changes suggested"),
+      ])
+    );
   }
 
   // ---- redline list (sidebar) ----
@@ -218,15 +311,14 @@ function DocumentView(data) {
     redlineList.innerHTML = "";
     const keys = Object.keys(edits);
     if (!keys.length) {
-      redlineList.appendChild(el("div", { class: "redline-list-empty" }, "Nothing redlined yet. Highlight text in the document to get started."));
+      redlineList.appendChild(el("div", { class: "redline-list-empty" }, "Nothing redlined yet. Highlight any text in the document to get started."));
       return;
     }
     keys.forEach((key) => {
-      const f = fieldByKey[key];
       const e = edits[key];
       const rows = [
         el("div", { class: "rl-diff" }, [
-          el("span", { class: "old" }, (f && f.current_value) || "(blank)"),
+          el("span", { class: "old" }, e.original_text || "(blank)"),
           " → ",
           el("span", { class: "new" }, e.value || "(blank)"),
         ]),
@@ -235,8 +327,8 @@ function DocumentView(data) {
       redlineList.appendChild(
         el("div", { class: "redline-list-item" }, [
           el("div", { class: "rl-top" }, [
-            el("div", { class: "rl-label" }, f ? f.label : key),
-            el("div", { class: "rl-remove", onclick: () => setSuggestion(key, undefined, "") }, "Remove"),
+            el("div", { class: "rl-label" }, e.label || "Custom edit"),
+            el("div", { class: "rl-remove", onclick: () => removeSuggestion(key) }, "Remove"),
           ]),
           ...rows,
         ])
@@ -244,73 +336,94 @@ function DocumentView(data) {
     });
   }
 
-  function spansForKey(key) {
-    return Array.from(preview.querySelectorAll(`.field-value[data-field-key="${cssEscape(key)}"]`));
-  }
-
-  function paintSpan(span, key) {
-    const f = fieldByKey[key];
-    const original = (f && f.current_value) || "";
-    const e = edits[key];
-    if (e) {
-      span.classList.add("has-suggestion");
-      span.innerHTML = "";
-      span.appendChild(el("span", { class: "fv-del" }, original || "(blank)"));
-      span.appendChild(el("span", { class: "fv-ins" }, e.value || "(blank)"));
-    } else {
-      span.classList.remove("has-suggestion");
-      span.textContent = original;
-    }
-  }
-
-  function refreshAll() {
+  // ---- repaint: always redraw from the pristine HTML, then re-apply every
+  // current edit's del/ins diff at its exact run/offset location. Simpler
+  // and far less error-prone than mutating the live DOM incrementally,
+  // since two edits can land in the same run and need to be spliced
+  // together in one pass. ----
+  function repaint() {
+    preview.innerHTML = pristineHtml;
+    const byPara = {};
+    Object.values(edits).forEach((e) => {
+      const pk = `${e.location.table_path || ""} ${e.location.paragraph_index}`;
+      (byPara[pk] = byPara[pk] || []).push(e);
+    });
+    Object.entries(byPara).forEach(([pk, list]) => {
+      const [tablePath, pIdxStr] = pk.split(" ");
+      const paraEl = findParaEl(tablePath, parseInt(pIdxStr, 10));
+      if (!paraEl) return;
+      const runEls = Array.from(paraEl.querySelectorAll(".run"));
+      const byRun = {};
+      list.forEach((e) => {
+        e.location.segments.forEach((seg) => {
+          (byRun[seg.r] = byRun[seg.r] || []).push({ seg, edit: e });
+        });
+      });
+      Object.entries(byRun).forEach(([rIdxStr, segEdits]) => {
+        const runEl = runEls[parseInt(rIdxStr, 10)];
+        if (!runEl) return;
+        segEdits.sort((a, b) => a.seg.start - b.seg.start);
+        const text = runEl.textContent;
+        const frag = document.createDocumentFragment();
+        const seen = new Set();
+        let cursor = 0;
+        segEdits.forEach(({ seg, edit }) => {
+          if (seg.start > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, seg.start)));
+          frag.appendChild(el("span", { class: "fv-del" }, text.slice(seg.start, seg.end)));
+          if (!seen.has(edit)) {
+            frag.appendChild(el("span", { class: "fv-ins" }, edit.value || "(blank)"));
+            seen.add(edit);
+          }
+          cursor = seg.end;
+        });
+        if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+        runEl.classList.add("has-suggestion");
+        runEl.innerHTML = "";
+        runEl.appendChild(frag);
+      });
+    });
     renderStats();
     renderList();
   }
 
-  function setSuggestion(key, value, comment) {
-    const f = fieldByKey[key];
-    const original = ((f && f.current_value) || "").trim();
-    if (value === undefined) {
-      delete edits[key];
-    } else if (value.trim() === original && !(comment || "").trim()) {
+  function commitSuggestion(key, location, fieldKey, label, originalText, value, comment) {
+    const trimmed = (value || "").trim();
+    if (trimmed === (originalText || "").trim() && !(comment || "").trim()) {
       delete edits[key];
     } else {
-      edits[key] = { value: value.trim(), comment: (comment || "").trim() };
+      edits[key] = { field_key: fieldKey, label, location, original_text: originalText, value: trimmed, comment: (comment || "").trim() };
     }
-    spansForKey(key).forEach((span) => paintSpan(span, key));
-    refreshAll();
     closePopover();
     deselectField();
+    repaint();
   }
 
-  // ---- select-first interaction: click a field to select it, a small
-  // floating "Suggest edit" action appears, THEN the popover opens ----
-  let selectedSpan = null;
+  function removeSuggestion(key) {
+    delete edits[key];
+    closePopover();
+    deselectField();
+    repaint();
+  }
+
+  // ---- select-first interaction: select something (a click on an
+  // already-highlighted field, or a drag over any text), a small floating
+  // "Suggest edit" action appears, THEN the popover opens ----
+  let selectedEl = null;
   let actionChip = null;
 
-  function positionNear(el2, anchorRect) {
-    el2.style.top = Math.min(window.innerHeight - 60, anchorRect.bottom + 8) + "px";
-    el2.style.left = Math.min(window.innerWidth - 200, Math.max(8, anchorRect.left)) + "px";
-  }
-
   function deselectField() {
-    if (selectedSpan) selectedSpan.classList.remove("selected");
-    selectedSpan = null;
+    if (selectedEl) selectedEl.classList.remove("selected");
+    selectedEl = null;
     if (actionChip) { actionChip.remove(); actionChip = null; }
   }
 
-  function selectField(span, key) {
-    if (selectedSpan === span) return;
-    deselectField();
-    closePopover();
-    span.classList.add("selected");
-    selectedSpan = span;
-    const label = edits[key] ? "Edit suggestion ✎" : "Suggest edit ✎";
+  function showActionChip(anchorRect, label, onClick) {
+    if (actionChip) actionChip.remove();
     actionChip = el("button", { class: "field-action-chip" }, label);
-    actionChip.addEventListener("click", (e) => { e.stopPropagation(); openPopover(span, key); });
+    actionChip.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
     document.body.appendChild(actionChip);
-    positionNear(actionChip, span.getBoundingClientRect());
+    actionChip.style.top = Math.min(window.innerHeight - 60, anchorRect.bottom + 8) + "px";
+    actionChip.style.left = Math.min(window.innerWidth - 200, Math.max(8, anchorRect.left)) + "px";
   }
 
   let activePopover = null;
@@ -318,88 +431,153 @@ function DocumentView(data) {
     if (activePopover) { activePopover.remove(); activePopover = null; }
   }
   document.addEventListener("click", (e) => {
-    if (e.target.closest(".field-value") || e.target.closest(".field-action-chip") || e.target.closest(".redline-popover")) return;
+    if (e.target.closest(".run") || e.target.closest(".field-action-chip") || e.target.closest(".redline-popover")) return;
     closePopover();
     deselectField();
   });
 
-  function openPopover(anchorSpan, key) {
+  function openEditPopover(opts) {
     closePopover();
-    const f = fieldByKey[key];
-    if (!f) return;
-    const existing = edits[key];
-    const current = existing ? existing.value : (f.current_value || "");
+    const { key, location, fieldKey, label, originalText, currentValue, currentComment, fieldType, anchorRect } = opts;
     let input;
-    if (f.field_type === "multiline") input = el("textarea", {}, current);
-    else if (f.field_type === "date") input = el("input", { type: "date", value: current });
-    else if (f.field_type === "number") input = el("input", { type: "number", value: current });
-    else input = el("input", { type: "text", value: current });
-    const commentInput = el("textarea", { class: "rp-comment", placeholder: "Why? (optional)" }, existing ? existing.comment : "");
+    if (fieldType === "multiline") input = el("textarea", {}, currentValue);
+    else if (fieldType === "date") input = el("input", { type: "date", value: currentValue });
+    else if (fieldType === "number") input = el("input", { type: "number", value: currentValue });
+    else if (fieldType === "text") input = el("input", { type: "text", value: currentValue });
+    else input = el("textarea", { rows: "2" }, currentValue); // free-text selection, not a known field -- could be a whole clause
+    const commentInput = el("textarea", { class: "rp-comment", placeholder: "Why? (optional)" }, currentComment || "");
 
     const children = [
-      el("div", { class: "rp-label" }, f.label),
+      el("div", { class: "rp-label" }, label || "Selected text"),
+      el("div", { style: "font-size:12.5px;color:var(--muted);margin:-2px 0 8px;" }, [`Currently: "${originalText || "(blank)"}"`]),
       input,
       el("div", { class: "rp-label", style: "margin-top:10px;" }, "Comment"),
       commentInput,
       el("div", { class: "rp-actions" }, [
         el("button", { class: "btn secondary", onclick: () => { closePopover(); deselectField(); } }, "Cancel"),
-        el("button", { class: "btn", onclick: () => setSuggestion(key, input.value, commentInput.value) }, "Suggest edit"),
+        el("button", { class: "btn", onclick: () => commitSuggestion(key, location, fieldKey, label, originalText, input.value, commentInput.value) }, "Suggest edit"),
       ]),
     ];
-    if (existing) {
-      children.push(el("div", { class: "rp-remove", onclick: () => setSuggestion(key, undefined, "") }, "Remove suggestion"));
+    if (edits[key]) {
+      children.push(el("div", { class: "rp-remove", onclick: () => removeSuggestion(key) }, "Remove suggestion"));
     }
 
     const pop = el("div", { class: "redline-popover" }, children);
     document.body.appendChild(pop);
-    const rect = anchorSpan.getBoundingClientRect();
-    pop.style.top = Math.min(window.innerHeight - 280, rect.bottom + 8) + "px";
-    pop.style.left = Math.min(window.innerWidth - 300, Math.max(8, rect.left)) + "px";
+    pop.style.top = Math.min(window.innerHeight - 280, anchorRect.bottom + 8) + "px";
+    pop.style.left = Math.min(window.innerWidth - 300, Math.max(8, anchorRect.left)) + "px";
     activePopover = pop;
     input.focus();
   }
 
-  preview.querySelectorAll(".field-value[data-field-key]").forEach((span) => {
-    const key = span.getAttribute("data-field-key");
-    span.addEventListener("click", (e) => { e.stopPropagation(); selectField(span, key); });
-  });
+  // A run belongs to an existing edit if its (table_path, paragraph_index,
+  // run index) shows up in that edit's segments.
+  function findEditForRun(tablePath, pIdx, rIdx) {
+    return Object.entries(edits).find(([, e]) => {
+      const loc = e.location;
+      return loc.table_path === tablePath && loc.paragraph_index === pIdx && loc.segments.some((s) => s.r === rIdx);
+    });
+  }
 
-  // apply any resumed draft to the spans before first paint
-  Object.keys(edits).forEach((key) => spansForKey(key).forEach((span) => paintSpan(span, key)));
+  function handleRunClick(runEl) {
+    const paraEl = runEl.closest(".para");
+    if (!paraEl) return;
+    const pIdx = parseInt(paraEl.dataset.p, 10);
+    const tablePath = paraEl.dataset.path || "";
+    const rIdx = parseInt(runEl.dataset.r, 10);
+
+    const found = findEditForRun(tablePath, pIdx, rIdx);
+    if (found) {
+      const [key, e] = found;
+      deselectField();
+      runEl.classList.add("selected");
+      selectedEl = runEl;
+      showActionChip(runEl.getBoundingClientRect(), "Edit suggestion ✎", () => {
+        const f = fieldByKey[e.field_key];
+        openEditPopover({
+          key, location: e.location, fieldKey: e.field_key, label: e.label,
+          originalText: e.original_text, currentValue: e.value, currentComment: e.comment,
+          fieldType: f ? f.field_type : "", anchorRect: runEl.getBoundingClientRect(),
+        });
+      });
+      return;
+    }
+
+    const fieldKey = runEl.getAttribute("data-field-key");
+    if (fieldKey) {
+      const runLen = (runEl.textContent || "").length;
+      const loc = { table_path: tablePath, paragraph_index: pIdx, segments: [{ r: rIdx, start: 0, end: runLen }] };
+      const f = fieldByKey[fieldKey];
+      deselectField();
+      runEl.classList.add("selected");
+      selectedEl = runEl;
+      showActionChip(runEl.getBoundingClientRect(), "Suggest edit ✎", () => {
+        openEditPopover({
+          key: locKey(loc), location: loc, fieldKey, label: f ? f.label : fieldKey,
+          originalText: runEl.textContent, currentValue: runEl.textContent, currentComment: "",
+          fieldType: f ? f.field_type : "text", anchorRect: runEl.getBoundingClientRect(),
+        });
+      });
+      return;
+    }
+
+    // Plain prose, plain click with no drag -- nothing to do; the person
+    // needs to select (drag over) the text they want to redline.
+    deselectField();
+    closePopover();
+  }
+
+  function handleTextSelection(info, anchorRect) {
+    const loc = { table_path: info.table_path || "", paragraph_index: info.paragraph_index, segments: info.segments };
+    const key = locKey(loc);
+    const existing = edits[key];
+    deselectField();
+    showActionChip(anchorRect, existing ? "Edit suggestion ✎" : "Suggest edit ✎", () => {
+      openEditPopover({
+        key, location: loc, fieldKey: existing ? existing.field_key : "", label: existing ? existing.label : "",
+        originalText: existing ? existing.original_text : info.text,
+        currentValue: existing ? existing.value : info.text,
+        currentComment: existing ? existing.comment : "",
+        fieldType: existing && existing.field_key ? (fieldByKey[existing.field_key] || {}).field_type || "" : "",
+        anchorRect,
+      });
+    });
+  }
+
+  function attachRunHandlers() {
+    preview.addEventListener("mouseup", onPreviewMouseUp);
+  }
+
+  function onPreviewMouseUp(e) {
+    setTimeout(() => {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return;
+      if (sel.isCollapsed) {
+        const runEl = e.target.closest ? e.target.closest(".run") : null;
+        if (!runEl || !preview.contains(runEl)) { deselectField(); closePopover(); return; }
+        handleRunClick(runEl);
+        return;
+      }
+      const range = sel.getRangeAt(0);
+      if (!preview.contains(range.commonAncestorContainer)) return;
+      const rect = range.getBoundingClientRect();
+      const info = computeSelectionSegments(preview);
+      sel.removeAllRanges();
+      if (!info) return;
+      if (info.error === "cross-paragraph") {
+        alert("Please select text within a single paragraph.");
+        return;
+      }
+      handleTextSelection(info, rect);
+    }, 0);
+  }
+
+  attachRunHandlers();
+  repaint();
 
   const docCard = el("div", { class: "redline-doc-card" }, [preview]);
 
-  // ---- fallback for contracts drafted before inline highlighting existed ----
-  let orphanList = null;
-  if (orphanFields.length) {
-    orphanList = el("div", { class: "field-edit-list", style: "margin-top:16px;" });
-    orphanFields.forEach((f) => {
-      const existing = edits[f.field_key];
-      let input;
-      const val = existing ? existing.value : (f.current_value || "");
-      if (f.field_type === "multiline") input = el("textarea", {}, val);
-      else if (f.field_type === "date") input = el("input", { type: "date", value: val });
-      else if (f.field_type === "number") input = el("input", { type: "number", value: val });
-      else input = el("input", { type: "text", value: val });
-      const commentInput = el("input", { type: "text", placeholder: "Comment (optional)", value: existing ? existing.comment : "" });
-      const sync = () => setSuggestion(f.field_key, input.value, commentInput.value);
-      input.addEventListener("change", sync);
-      commentInput.addEventListener("change", sync);
-      orphanList.appendChild(
-        el("div", { class: "field-edit-card" }, [
-          el("div", { class: "field-label-row" }, [
-            el("div", { class: "field-label", style: "margin:0;" }, f.label),
-            el("div", { class: "original" }, f.current_value ? `Currently: ${f.current_value}` : "Currently blank"),
-          ]),
-          input,
-          commentInput,
-        ])
-      );
-    });
-    docCard.appendChild(orphanList);
-  }
-
-  const noteInput = el("textarea", { placeholder: "Anything else worth flagging that isn't one of the fields above?" }, (data.draft && data.draft.note) || "");
+  const noteInput = el("textarea", { placeholder: "Anything else worth flagging that isn't captured above?" }, (data.draft && data.draft.note) || "");
   noteInput.addEventListener("input", renderStats);
   docCard.appendChild(
     el("div", { class: "form-row", style: "margin-top:20px;" }, [el("label", { class: "field-label" }, "General comment (optional)"), noteInput])
@@ -417,7 +595,7 @@ function DocumentView(data) {
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving...";
     try {
-      const editList = Object.entries(edits).map(([field_key, e]) => ({ field_key, proposed_value: e.value, comment: e.comment }));
+      const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location }));
       await api(`/api/share/${TOKEN}/save-progress`, { method: "POST", body: { edits: editList, note: noteInput.value.trim() } });
       saveNote.textContent = "Saved — come back anytime with your access code.";
     } catch (e) {
@@ -459,7 +637,7 @@ function DocumentView(data) {
   const submitBtn = el("button", { class: "btn" }, "Finalize and submit");
   submitBtn.addEventListener("click", async () => {
     errBox.innerHTML = "";
-    const editList = Object.entries(edits).map(([field_key, e]) => ({ field_key, proposed_value: e.value, comment: e.comment }));
+    const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location }));
     if (!editList.length && !noteInput.value.trim()) {
       errBox.appendChild(el("div", { class: "error-box" }, "Suggest a change or add a comment before submitting."));
       return;
@@ -486,8 +664,6 @@ function DocumentView(data) {
     );
   }
 
-  refreshAll();
-
   return shell;
 }
 
@@ -504,17 +680,21 @@ async function loadDocument() {
         try {
           await api(`/api/share/${TOKEN}/acknowledge-response`, { method: "POST", body: { submission_id: data.response.submission_id } });
         } catch (e) { /* non-fatal -- worst case it shows again next visit */ }
-        // Countered fields become fresh suggestions for the next round; fold
+        // Countered edits become fresh suggestions for the next round; fold
         // them into the normal draft-resume path so DocumentView picks them
-        // up the same way it would a saved-progress draft.
+        // up the same way it would a saved-progress draft. Only ones that
+        // still carry a usable location can be seeded -- matches what
+        // DocumentView itself requires to resume a draft edit.
         const seeded = data.response.edits
-          .filter((e) => e.decision === "countered")
-          .map((e) => ({ field_key: e.field_key, proposed_value: e.counter_value, comment: "" }));
+          .filter((e) => e.decision === "countered" && e.location && e.location.segments && e.location.segments.length)
+          .map((e) => ({ field_key: e.field_key, label: e.label, proposed_value: e.counter_value, comment: "", location: e.location }));
         const fresh = await api(`/api/share/${TOKEN}`);
         if (seeded.length) {
           fresh.draft = fresh.draft || { note: "", edits: [] };
-          const existingKeys = new Set(fresh.draft.edits.map((e) => e.field_key));
-          seeded.forEach((s) => { if (!existingKeys.has(s.field_key)) fresh.draft.edits.push(s); });
+          const existingKeys = new Set(
+            fresh.draft.edits.filter((e) => e.location && e.location.segments).map((e) => locKey(e.location))
+          );
+          seeded.forEach((s) => { if (!existingKeys.has(locKey(s.location))) fresh.draft.edits.push(s); });
         }
         showDocument(fresh);
       })]));
