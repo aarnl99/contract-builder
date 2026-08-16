@@ -163,6 +163,8 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
         raise HTTPException(401, "Invalid email or password")
     if not user.email_verified:
         raise HTTPException(403, {"code": "email_not_verified", "message": "Please verify your email before logging in."})
+    if user.is_suspended:
+        raise HTTPException(403, {"code": "account_suspended", "message": "This account has been suspended. Contact support if you think this is a mistake."})
     request.session["user_id"] = user.id
     return {"id": user.id, "email": user.email, "name": user.name}
 
@@ -2013,6 +2015,7 @@ def _user_summary(u: User, tpl_counts: dict, gen_counts: dict) -> dict:
         "plan": u.plan,
         "created_at": u.created_at.isoformat(),
         "email_verified": u.email_verified,
+        "is_suspended": u.is_suspended,
         "template_count": tpl_counts.get(u.id, 0),
         "contract_count": gen_counts.get(u.id, 0),
     }
@@ -2076,6 +2079,164 @@ def admin_users(admin: User = Depends(get_admin_user), session: Session = Depend
         g.owner_id for g in session.exec(select(GeneratedContract)).all()
     )
     return {"users": [_user_summary(u, tpl_counts, gen_counts) for u in users]}
+
+
+def _get_admin_target(session: Session, admin: User, user_id: int, *, block_self: bool = False) -> User:
+    if block_self and user_id == admin.id:
+        raise HTTPException(400, "You can't do that to your own admin account.")
+    target = session.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "User not found")
+    return target
+
+
+class AdminSuspendBody(BaseModel):
+    suspended: bool
+
+
+@app.post("/api/admin/users/{user_id}/suspend")
+def admin_set_suspended(
+    user_id: int, body: AdminSuspendBody,
+    admin: User = Depends(get_admin_user), session: Session = Depends(get_session),
+):
+    target = _get_admin_target(session, admin, user_id, block_self=True)
+    target.is_suspended = body.suspended
+    session.add(target)
+    session.commit()
+    return {"id": target.id, "is_suspended": target.is_suspended}
+
+
+class AdminPlanBody(BaseModel):
+    plan: str
+
+
+@app.post("/api/admin/users/{user_id}/plan")
+def admin_set_plan(
+    user_id: int, body: AdminPlanBody,
+    admin: User = Depends(get_admin_user), session: Session = Depends(get_session),
+):
+    plan = body.plan.strip().lower()
+    if plan not in PLAN_LIMITS:
+        raise HTTPException(400, f"Unknown plan '{body.plan}'. Choose one of: {', '.join(PLAN_LIMITS)}.")
+    target = _get_admin_target(session, admin, user_id)
+    target.plan = plan
+    session.add(target)
+    session.commit()
+    return {"id": target.id, "plan": target.plan}
+
+
+@app.post("/api/admin/users/{user_id}/resend-verification")
+def admin_resend_verification(
+    user_id: int, request: Request,
+    admin: User = Depends(get_admin_user), session: Session = Depends(get_session),
+):
+    target = _get_admin_target(session, admin, user_id)
+    if target.email_verified:
+        return {"ok": True, "sent": False, "message": "This account is already verified."}
+    target.verification_token = target.verification_token or secrets.token_urlsafe(32)
+    target.verification_sent_at = datetime.utcnow()
+    session.add(target)
+    session.commit()
+    _send_verification_email(request, target)
+    return {"ok": True, "sent": True}
+
+
+def _generate_temp_password() -> str:
+    # Ambiguous characters (0/O, 1/l/I) left out so a password relayed by
+    # phone or read off a screen doesn't get mistyped.
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+    while True:
+        pw = "".join(secrets.choice(alphabet) for _ in range(12))
+        if not validate_password_strength(pw):
+            return pw
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+def admin_reset_password(
+    user_id: int, request: Request,
+    admin: User = Depends(get_admin_user), session: Session = Depends(get_session),
+):
+    """Sets a new random temporary password and, if SendGrid is configured,
+    emails it to the account holder. Always also returns it in the response
+    so the admin dashboard can show/copy it -- the only path to recovering
+    it if email isn't set up or doesn't land, since it's hashed immediately
+    and never stored in plain text."""
+    target = _get_admin_target(session, admin, user_id)
+    new_password = _generate_temp_password()
+    target.password_hash = hash_password(new_password)
+    session.add(target)
+    session.commit()
+
+    emailed = False
+    body = (
+        f"Hi{' ' + target.name if target.name else ''},\n\n"
+        "An administrator reset the password on your Rotely account. Your new temporary password is:\n\n"
+        f"{new_password}\n\n"
+        "Please log in and change it as soon as you can.\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(target.email, "Your Rotely password was reset", body)
+        emailed = True
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured -- admin still gets the password below to relay manually
+
+    return {"ok": True, "emailed": emailed, "temporary_password": new_password}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(
+    user_id: int,
+    admin: User = Depends(get_admin_user), session: Session = Depends(get_session),
+):
+    """Permanently deletes a user account and everything that traces back to
+    it: templates, generated contracts, share links + their views, redline
+    submissions/edits, email alias, and draft requests -- plus their uploads
+    folder on disk. Irreversible; there's no undo/soft-delete for this."""
+    target = _get_admin_target(session, admin, user_id, block_self=True)
+
+    generated_ids = [
+        g.id for g in session.exec(select(GeneratedContract).where(GeneratedContract.owner_id == user_id)).all()
+    ]
+    share_link_ids = []
+    if generated_ids:
+        share_link_ids = [
+            s.id for s in session.exec(
+                select(ShareLink).where(ShareLink.generated_contract_id.in_(generated_ids))
+            ).all()
+        ]
+    if share_link_ids:
+        submission_ids = [
+            r.id for r in session.exec(
+                select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(share_link_ids))
+            ).all()
+        ]
+        if submission_ids:
+            for edit in session.exec(select(RedlineEdit).where(RedlineEdit.submission_id.in_(submission_ids))).all():
+                session.delete(edit)
+            for sub in session.exec(select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(share_link_ids))).all():
+                session.delete(sub)
+        for view in session.exec(select(ShareLinkView).where(ShareLinkView.share_link_id.in_(share_link_ids))).all():
+            session.delete(view)
+        for link in session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(generated_ids))).all():
+            session.delete(link)
+
+    for gc in session.exec(select(GeneratedContract).where(GeneratedContract.owner_id == user_id)).all():
+        session.delete(gc)
+    for tpl in session.exec(select(Template).where(Template.owner_id == user_id)).all():
+        for ph in session.exec(select(Placeholder).where(Placeholder.template_id == tpl.id)).all():
+            session.delete(ph)
+        session.delete(tpl)
+    for alias in session.exec(select(EmailAlias).where(EmailAlias.user_id == user_id)).all():
+        session.delete(alias)
+    for req in session.exec(select(EmailDraftRequest).where(EmailDraftRequest.user_id == user_id)).all():
+        session.delete(req)
+
+    session.delete(target)
+    session.commit()
+
+    shutil.rmtree(os.path.join(UPLOADS_DIR, str(user_id)), ignore_errors=True)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

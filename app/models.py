@@ -43,6 +43,11 @@ class User(SQLModel, table=True):
     verification_token: str = Field(default="", index=True)
     verification_sent_at: Optional[datetime] = None
 
+    # Admin-only account hold: a suspended account can't log in, and any
+    # existing session is rejected on the next request (see
+    # auth.get_current_user), without deleting any of their data.
+    is_suspended: bool = False
+
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
 

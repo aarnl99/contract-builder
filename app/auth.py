@@ -41,6 +41,12 @@ def get_current_user(request: Request, session: Session = Depends(get_session)) 
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    if user.is_suspended:
+        # Checked here (not just at login) so an admin suspending someone
+        # mid-session kicks them out on their very next request, rather than
+        # waiting for their cookie session to expire on its own.
+        request.session.clear()
+        raise HTTPException(status_code=403, detail={"code": "account_suspended", "message": "This account has been suspended."})
     return user
 
 
@@ -48,4 +54,8 @@ def get_optional_user(request: Request, session: Session = Depends(get_session))
     user_id = request.session.get("user_id")
     if not user_id:
         return None
-    return session.get(User, user_id)
+    user = session.get(User, user_id)
+    if user and user.is_suspended:
+        request.session.clear()
+        return None
+    return user
