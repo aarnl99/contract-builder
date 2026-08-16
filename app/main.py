@@ -4,6 +4,7 @@ import json
 import shutil
 import secrets
 import string
+import httpx
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Optional
@@ -51,6 +52,15 @@ INBOUND_WEBHOOK_SECRET = os.environ.get("INBOUND_WEBHOOK_SECRET", "")
 # column -- just an email compared at request time -- so promoting the
 # owner never needs a migration against the already-live database.
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "aaronkluan@gmail.com").strip().lower()
+
+# Google "Sign in with Google" -- standard server-side OAuth Authorization
+# Code flow. Both of these are already set in the Render environment; the
+# redirect URI registered on the Google Cloud OAuth client is
+# {origin}/api/auth/google/callback, so that route path is load-bearing --
+# changing it also means updating the client's Authorized redirect URIs in
+# Google Cloud Console.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 app = FastAPI(title="Rotely")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
@@ -184,6 +194,23 @@ def verify_email(token: str, session: Session = Depends(get_session)):
     return RedirectResponse(url="/#/login?verified=1")
 
 
+RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour -- a reset link stops working after this
+RESET_REQUEST_COOLDOWN = 60  # seconds -- keeps "forgot password" from being spammed, same as resend-verification
+
+
+@app.get("/reset-password/{token}")
+def reset_password_link(token: str, session: Session = Depends(get_session)):
+    """Real (non-hash) route opened from the reset email, same reasoning as
+    /verify-email above. Doesn't consume the token -- just checks it's still
+    valid and hands off into the SPA's set-new-password screen, which is
+    what actually spends it via POST /api/reset-password."""
+    user = session.exec(select(User).where(User.reset_token == token, User.reset_token != "")).first()
+    valid = bool(user and user.reset_sent_at and (datetime.utcnow() - user.reset_sent_at).total_seconds() < RESET_TOKEN_MAX_AGE)
+    if not valid:
+        return RedirectResponse(url="/#/login?reset_error=1")
+    return RedirectResponse(url=f"/#/reset-password?token={token}")
+
+
 @app.post("/api/resend-verification")
 def resend_verification(body: ResendVerificationBody, request: Request, session: Session = Depends(get_session)):
     email = body.email.strip().lower()
@@ -199,6 +226,154 @@ def resend_verification(body: ResendVerificationBody, request: Request, session:
             session.commit()
             _send_verification_email(request, user)
     return {"ok": True}
+
+
+class ForgotPasswordBody(BaseModel):
+    email: str
+
+
+def _send_reset_email(request: Request, user: User) -> None:
+    link = f"{_base_url(request)}/reset-password/{user.reset_token}"
+    body = (
+        f"Hi{' ' + user.name if user.name else ''},\n\n"
+        "Someone (hopefully you) asked to reset the password on your Rotely account. "
+        f"This link works for the next hour:\n\n{link}\n\n"
+        "If you didn't request this, you can safely ignore this email -- your password hasn't changed.\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(user.email, "Reset your Rotely password", body)
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the token still works if they already have the link some other way
+
+
+@app.post("/api/forgot-password")
+def forgot_password(body: ForgotPasswordBody, request: Request, session: Session = Depends(get_session)):
+    email = body.email.strip().lower()
+    user = session.exec(select(User).where(User.email == email)).first()
+    # Same generic response either way, whether or not the account exists --
+    # this endpoint must not be usable to probe which emails have accounts.
+    if user:
+        if not user.reset_sent_at or (datetime.utcnow() - user.reset_sent_at).total_seconds() >= RESET_REQUEST_COOLDOWN:
+            user.reset_token = secrets.token_urlsafe(32)
+            user.reset_sent_at = datetime.utcnow()
+            session.add(user)
+            session.commit()
+            _send_reset_email(request, user)
+    return {"ok": True}
+
+
+class ResetPasswordBody(BaseModel):
+    token: str
+    password: str
+
+
+@app.post("/api/reset-password")
+def reset_password(body: ResetPasswordBody, request: Request, session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.reset_token == body.token, User.reset_token != "")).first()
+    if not user or not user.reset_sent_at or (datetime.utcnow() - user.reset_sent_at).total_seconds() >= RESET_TOKEN_MAX_AGE:
+        raise HTTPException(400, "That reset link is invalid or has expired. Request a new one.")
+    password_error = validate_password_strength(body.password)
+    if password_error:
+        raise HTTPException(400, password_error)
+
+    user.password_hash = hash_password(body.password)
+    user.reset_token = ""
+    user.reset_sent_at = None
+    # A password reset is also good proof of email ownership -- verify and
+    # lift any suspension hold isn't implied by this, but an unverified
+    # account that successfully resets its password can log in from here on.
+    user.email_verified = True
+    session.add(user)
+    session.commit()
+
+    if not user.is_suspended:
+        request.session["user_id"] = user.id
+    return {"ok": True, "logged_in": not user.is_suspended}
+
+
+@app.get("/api/auth/google/start")
+def google_auth_start(request: Request):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(503, "Google sign-in isn't configured on this deploy.")
+    state = secrets.token_urlsafe(24)
+    request.session["google_oauth_state"] = state
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": f"{_base_url(request)}/api/auth/google/callback",
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "prompt": "select_account",
+    }
+    url = f"https://accounts.google.com/o/oauth2/v2/auth?{httpx.QueryParams(params)}"
+    return RedirectResponse(url=url)
+
+
+@app.get("/api/auth/google/callback")
+def google_auth_callback(request: Request, code: str = "", state: str = "", error: str = "", session: Session = Depends(get_session)):
+    """Standard OAuth Authorization Code exchange: trade the one-time code
+    for tokens, fetch the person's Google profile, then log them in --
+    creating an account on the fly if this is their first time, matched by
+    email against any existing password-based account so the two sign-in
+    paths converge on one account rather than silently creating a
+    duplicate."""
+    expected_state = request.session.pop("google_oauth_state", None)
+    if error or not code or not state or state != expected_state:
+        return RedirectResponse(url="/#/login?google_error=1")
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return RedirectResponse(url="/#/login?google_error=1")
+
+    try:
+        token_res = httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": f"{_base_url(request)}/api/auth/google/callback",
+                "grant_type": "authorization_code",
+            },
+            timeout=10,
+        )
+        token_res.raise_for_status()
+        access_token = token_res.json()["access_token"]
+
+        profile_res = httpx.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        profile_res.raise_for_status()
+        profile = profile_res.json()
+    except (httpx.HTTPError, KeyError):
+        return RedirectResponse(url="/#/login?google_error=1")
+
+    email = (profile.get("email") or "").strip().lower()
+    if not email or not profile.get("verified_email", True):
+        return RedirectResponse(url="/#/login?google_error=1")
+    google_sub = profile.get("id", "")
+    name = profile.get("name", "") or email.split("@")[0]
+
+    user = session.exec(select(User).where(User.email == email)).first()
+    if not user:
+        user = User(
+            email=email, password_hash=hash_password(secrets.token_urlsafe(32)), name=name,
+            email_verified=True, google_sub=google_sub,
+        )
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+    elif not user.google_sub:
+        user.google_sub = google_sub
+        user.email_verified = True  # Google already verified this address
+        session.add(user)
+        session.commit()
+
+    if user.is_suspended:
+        return RedirectResponse(url="/#/login?google_error=1")
+    request.session["user_id"] = user.id
+    return RedirectResponse(url="/#/draft")
 
 
 @app.post("/api/logout")

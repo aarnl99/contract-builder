@@ -48,6 +48,20 @@ class User(SQLModel, table=True):
     # auth.get_current_user), without deleting any of their data.
     is_suspended: bool = False
 
+    # "Forgot password" flow: set when /api/forgot-password is requested,
+    # cleared once used (or replaced by a fresh request) so it can't be
+    # replayed. reset_sent_at both rate-limits repeat requests and expires
+    # the link after an hour, the same pattern as email verification above.
+    reset_token: str = Field(default="", index=True)
+    reset_sent_at: Optional[datetime] = None
+
+    # Set once someone signs in via "Continue with Google", so the login
+    # page can tell them to use that button instead of a password if they
+    # never set one, and so account creation on first Google sign-in knows
+    # not to expect a password. Empty for accounts that only ever used
+    # email/password.
+    google_sub: str = Field(default="", index=True)
+
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
 
