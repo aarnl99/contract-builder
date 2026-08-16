@@ -35,6 +35,14 @@ class User(SQLModel, table=True):
     plan: str = DEFAULT_PLAN  # "starter" | "pro" | "unlimited"
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+    # Email verification: a new account can't log in until they click the
+    # link sent to verification_token. The token is cleared once used, so
+    # it also can't be replayed. verification_sent_at drives the "resend"
+    # flow's light rate limiting (see main.py).
+    email_verified: bool = False
+    verification_token: str = Field(default="", index=True)
+    verification_sent_at: Optional[datetime] = None
+
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
 
