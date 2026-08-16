@@ -1566,25 +1566,60 @@ def apply_redline_submission(
 ):
     """Applies every accepted edit (anything explicitly accepted, plus
     anything auto-approved that the owner hasn't overridden by rejecting
-    it) directly onto the exact document that was shared -- splicing each
-    edit's new text in at its recorded location, rather than regenerating
-    the whole document from the master template with a field_key -> value
-    map. That's what makes redlining two occurrences of the same field
-    independently correct: each occurrence has its own location, so
-    changing one never touches the other. Produces a new GeneratedContract
-    row, same as a normal draft, so the version history stays intact. Not
-    counted against the monthly plan limit -- this is finishing a document
-    already in progress, not starting a new one."""
+    it) directly onto a document -- splicing each edit's new text in at its
+    recorded location, rather than regenerating the whole document from the
+    master template with a field_key -> value map. That's what makes
+    redlining two occurrences of the same field independently correct: each
+    occurrence has its own location, so changing one never touches the
+    other. Produces a new GeneratedContract row, same as a normal draft, so
+    the version history stays intact. Not counted against the monthly plan
+    limit -- this is finishing a document already in progress, not starting
+    a new one.
+
+    A share link can receive more than one redline round before any of them
+    get applied (the client's view of the document never reflects an
+    earlier apply -- they're always redlining the original text). Splicing
+    every round onto that same original text independently would silently
+    drop whichever rounds got applied first: applying round 2 after round 1
+    already went in would produce a version missing round 1's changes
+    entirely, since it never saw them. So this always builds on top of the
+    most recently applied round from this same share link (if any), not the
+    original -- rounds compound instead of forking. `chained_from` in the
+    response tells the caller when that happened, so the UI can surface it
+    rather than applying silently."""
     submission = session.get(RedlineSubmission, submission_id)
     if not submission:
         raise HTTPException(404, "Submission not found")
     link = session.get(ShareLink, submission.share_link_id)
-    gc = session.get(GeneratedContract, link.generated_contract_id) if link else None
-    if not gc or gc.owner_id != user.id:
+    origin_gc = session.get(GeneratedContract, link.generated_contract_id) if link else None
+    if not origin_gc or origin_gc.owner_id != user.id:
         raise HTTPException(404, "Submission not found")
-    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    tpl = session.get(Template, origin_gc.template_id) if origin_gc.template_id else None
     if not tpl:
         raise HTTPException(400, "The master document this was drafted from no longer exists.")
+
+    # Find every submission on this same share link that's already been
+    # applied, and use whichever produced revision is most recent as the
+    # base to build on -- falls back to the original document if this is
+    # the first round applied.
+    sibling_sub_ids = [
+        s.id for s in session.exec(
+            select(RedlineSubmission).where(RedlineSubmission.share_link_id == link.id)
+        ).all()
+    ]
+    base_gc = origin_gc
+    chained_from = None
+    if sibling_sub_ids:
+        already_applied = session.exec(
+            select(GeneratedContract)
+            .where(GeneratedContract.source_submission_id.in_(sibling_sub_ids))
+            .order_by(GeneratedContract.created_at.desc())
+        ).all()
+        if already_applied:
+            base_gc = already_applied[0]
+            chained_from = {"id": base_gc.id, "name": base_gc.name}
+
+    gc = base_gc
     if not os.path.exists(gc.file_path):
         raise HTTPException(410, "This document is no longer available.")
 
@@ -1599,7 +1634,11 @@ def apply_redline_submission(
         if loc.get("segments"):
             edit_targets.append((e, loc))
     if not edit_targets:
-        raise HTTPException(400, "None of the accepted edits have a usable location to apply anymore.")
+        raise HTTPException(
+            400,
+            "None of the accepted edits have a usable location to apply anymore "
+            + ("(the version this would build on has changed too much since)." if chained_from else "."),
+        )
 
     doc = de.load(gc.file_path)
     try:
@@ -1660,7 +1699,12 @@ def apply_redline_submission(
     session.refresh(new_gc)
 
     preview_doc = de.load(out_path)
-    return {"generated_id": new_gc.id, "name": new_gc.name, "html": de.render_paragraphs_html(preview_doc)}
+    return {
+        "generated_id": new_gc.id,
+        "name": new_gc.name,
+        "html": de.render_paragraphs_html(preview_doc),
+        "chained_from": chained_from,
+    }
 
 
 # ---------------------------------------------------------------------------
