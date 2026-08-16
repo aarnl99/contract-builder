@@ -1784,12 +1784,179 @@ function AdminView() {
     });
     usersCard.appendChild(table);
     body.appendChild(usersCard);
+    body.appendChild(buildManageUsersCard());
   }).catch((e) => {
     body.innerHTML = "";
     body.appendChild(el("div", { class: "error-box" }, e.message || "Failed to load admin data."));
   });
 
   return wrap;
+}
+
+function showTempPasswordModal(user, password, emailed) {
+  const overlay = el("div", { class: "modal-overlay" });
+  const modalBody = el("div", {}, [
+    el(
+      "p",
+      { class: "subtitle" },
+      emailed
+        ? `A new password was emailed to ${user.email}. It's also shown below in case that doesn't arrive.`
+        : `Email sending isn't configured on this deploy, so relay this password to ${user.email} yourself.`
+    ),
+    el("div", { class: "share-info-box" }, [
+      el("div", { class: "row" }, [
+        el("div", { style: "min-width:0;" }, [el("div", { class: "k" }, "Temporary password"), el("div", { class: "v mono" }, password)]),
+        el("button", { class: "btn secondary small copy-btn", onclick: () => navigator.clipboard.writeText(password) }, "Copy"),
+      ]),
+    ]),
+    el("div", { style: "font-size:12px;color:var(--muted);margin-top:10px;" }, "This won't be shown again — copy it now if you need it."),
+  ]);
+  const modal = el("div", { class: "modal" }, [
+    el("h2", {}, "Password reset"),
+    modalBody,
+    el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Close")]),
+  ]);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+}
+
+function buildManageUsersCard() {
+  const card = el("div", { class: "card" });
+  card.appendChild(el("div", { class: "chart-title" }, "Manage users"));
+  const tableWrap = el("div", { class: "admin-table" }, [el("div", { class: "empty-state" }, "Loading...")]);
+  card.appendChild(tableWrap);
+
+  const planLabels = { starter: "Starter", pro: "Pro", unlimited: "Unlimited" };
+
+  function refresh() {
+    api("/api/admin/users")
+      .then((data) => {
+        tableWrap.innerHTML = "";
+        tableWrap.appendChild(
+          el("div", { class: "admin-table-row manage header" }, [
+            el("div", {}, "User"),
+            el("div", {}, "Plan"),
+            el("div", {}, "Verified"),
+            el("div", {}, "Status"),
+            el("div", {}, "Actions"),
+          ])
+        );
+        data.users.forEach((u) => {
+          const isSelf = !!(state.user && u.email === state.user.email);
+
+          const planSelect = el(
+            "select",
+            { class: "filter-select" },
+            Object.keys(planLabels).map((k) => el("option", { value: k }, planLabels[k]))
+          );
+          planSelect.value = u.plan;
+          planSelect.addEventListener("change", async () => {
+            const prev = u.plan;
+            planSelect.disabled = true;
+            try {
+              await api(`/api/admin/users/${u.id}/plan`, { method: "POST", body: { plan: planSelect.value } });
+              u.plan = planSelect.value;
+            } catch (e) {
+              alert(e.message);
+              planSelect.value = prev;
+            }
+            planSelect.disabled = false;
+          });
+
+          const verifiedCell = el("div", {}, [
+            el("span", { class: `status-dot ${u.email_verified ? "good" : "bad"}`, style: "display:inline-block;margin-right:6px;" }),
+            el("span", {}, u.email_verified ? "Verified" : "Unverified"),
+          ]);
+          if (!u.email_verified) {
+            const resendBtn = el("button", { class: "btn ghost small", style: "margin-left:6px;" }, "Resend");
+            resendBtn.addEventListener("click", async () => {
+              resendBtn.disabled = true;
+              resendBtn.textContent = "Sending...";
+              try {
+                const r = await api(`/api/admin/users/${u.id}/resend-verification`, { method: "POST" });
+                resendBtn.textContent = r.sent ? "Sent" : "Already verified";
+              } catch (e) {
+                alert(e.message);
+                resendBtn.disabled = false;
+                resendBtn.textContent = "Resend";
+              }
+            });
+            verifiedCell.appendChild(resendBtn);
+          }
+
+          const statusCell = el("div", {}, [
+            el("span", { class: `status-dot ${u.is_suspended ? "bad" : "good"}`, style: "display:inline-block;margin-right:6px;" }),
+            el("span", {}, u.is_suspended ? "Suspended" : "Active"),
+          ]);
+          if (!isSelf) {
+            const toggleBtn = el("button", { class: "btn ghost small", style: "margin-left:6px;" }, u.is_suspended ? "Reactivate" : "Suspend");
+            toggleBtn.addEventListener("click", async () => {
+              const next = !u.is_suspended;
+              if (next && !confirm(`Suspend ${u.email}? They'll be logged out immediately and can't log back in until reactivated.`)) return;
+              toggleBtn.disabled = true;
+              try {
+                await api(`/api/admin/users/${u.id}/suspend`, { method: "POST", body: { suspended: next } });
+                refresh();
+              } catch (e) {
+                alert(e.message);
+                toggleBtn.disabled = false;
+              }
+            });
+            statusCell.appendChild(toggleBtn);
+          }
+
+          const actionsCell = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;" });
+          const resetBtn = el("button", { class: "btn secondary small" }, "Reset password");
+          resetBtn.addEventListener("click", async () => {
+            if (!confirm(`Set a new temporary password for ${u.email}? Their current password stops working immediately.`)) return;
+            resetBtn.disabled = true;
+            try {
+              const r = await api(`/api/admin/users/${u.id}/reset-password`, { method: "POST" });
+              showTempPasswordModal(u, r.temporary_password, r.emailed);
+            } catch (e) {
+              alert(e.message);
+            }
+            resetBtn.disabled = false;
+          });
+          actionsCell.appendChild(resetBtn);
+          if (!isSelf) {
+            const deleteBtn = el("button", { class: "btn danger small" }, "Delete");
+            deleteBtn.addEventListener("click", async () => {
+              if (!confirm(`Permanently delete ${u.email}? This deletes their master documents, generated contracts, and share links, and can't be undone.`)) return;
+              deleteBtn.disabled = true;
+              try {
+                await api(`/api/admin/users/${u.id}`, { method: "DELETE" });
+                refresh();
+              } catch (e) {
+                alert(e.message);
+                deleteBtn.disabled = false;
+              }
+            });
+            actionsCell.appendChild(deleteBtn);
+          }
+
+          tableWrap.appendChild(
+            el("div", { class: "admin-table-row manage" }, [
+              el("div", {}, [
+                el("div", { style: "font-weight:600;" }, u.name || u.email),
+                el("div", { style: "color:var(--muted-soft);font-size:12px;" }, u.email),
+              ]),
+              el("div", {}, [planSelect]),
+              verifiedCell,
+              statusCell,
+              actionsCell,
+            ])
+          );
+        });
+      })
+      .catch((e) => {
+        tableWrap.innerHTML = "";
+        tableWrap.appendChild(el("div", { class: "error-box" }, e.message || "Failed to load users."));
+      });
+  }
+
+  refresh();
+  return card;
 }
 
 // ---------------------------------------------------------------------------
