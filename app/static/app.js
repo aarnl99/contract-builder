@@ -288,7 +288,16 @@ function toggleNotifDropdown() {
           refreshNotifBadge();
         }
         dd.remove();
-        location.hash = "#/documents";
+        // Land on the documents page and jump straight into the specific
+        // document's redlines, instead of just dropping them on the list --
+        // the whole point of clicking a notification is to see what it's
+        // telling you about. Uses replaceState (not location.hash=...) so
+        // this doesn't fire a second hashchange -> router() cycle, which
+        // would otherwise immediately close the modal we're about to open --
+        // router() clears any open .modal-overlay as routine nav cleanup.
+        history.replaceState(null, "", "#/documents");
+        render(shell(DocumentsView()));
+        if (n.generated_contract_id) openRedlinesModal(n.generated_contract_id);
       });
       list.appendChild(item);
     });
@@ -1229,13 +1238,28 @@ function DocumentsView() {
   const listWrap = el("div", {});
   wrap.appendChild(listWrap);
 
+  // Small colored pill for a document's current step (drafted, shared,
+  // redlines submitted, response sent, applied) -- reuses the same
+  // .status-tag tones the folder view's "Redlines applied" badge already
+  // used, so draft/pending/final read consistently everywhere.
+  function statusTagEl(status) {
+    if (!status) return null;
+    return el("span", { class: "status-tag " + (status.tone || "draft") }, status.label);
+  }
+
+  function partiesLineEl(parties) {
+    if (!parties || !parties.length) return null;
+    return el("div", { class: "lineage" }, [el("span", { style: "font-weight:600;" }, "Parties: "), parties.join("  ·  ")]);
+  }
+
   function plainRow(d) {
     const row = el("div", { class: "output-row" + (d.archived ? " archived" : "") }, [
       el("div", { class: "left" }, [
         el("div", { class: "file-icon" }, "✓"),
         el("div", {}, [
-          el("div", { class: "name" }, d.name),
+          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status)]),
           el("div", { class: "lineage" }, ["Originated from ", el("span", { class: "tag" }, d.template_name)]),
+          partiesLineEl(d.parties),
         ]),
       ]),
       el("div", { class: "right" }, [
@@ -1305,9 +1329,6 @@ function DocumentsView() {
 
     const folder = el("div", { class: "doc-folder" });
     const chevron = el("span", { class: "chevron" }, "›");
-    const statusTag = latest.is_redline_result
-      ? el("span", { class: "status-tag final" }, "Redlines applied")
-      : null;
     const chainWrap = el("div", { class: "chain" });
     const head = el("div", { class: "folder-head" }, [
       el("div", { class: "left" }, [
@@ -1316,9 +1337,10 @@ function DocumentsView() {
           el("div", { class: "folder-name-row" }, [
             el("span", { class: "folder-name" }, latest.name),
             el("span", { class: "version-count" }, `${familyDocs.length} versions`),
-            statusTag,
+            statusTagEl(latest.status),
           ]),
           el("div", { class: "folder-sub" }, ["Originated from ", el("span", { class: "tag" }, latest.template_name)]),
+          partiesLineEl(latest.parties),
         ]),
       ]),
       el("div", { class: "right" }, [
@@ -1414,8 +1436,9 @@ function DocumentsView() {
       const panelOverlay = el("div", { class: "panel-overlay" });
       const panel = el("div", { class: "slide-panel" }, [
         el("button", { class: "close", onclick: () => panelOverlay.remove() }, "✕"),
-        el("h2", {}, full.name),
+        el("div", { class: "folder-name-row" }, [el("h2", { style: "margin:0;" }, full.name), statusTagEl(full.status)]),
         el("div", { class: "sub" }, `Drafted ${new Date(full.created_at).toLocaleString()}`),
+        partiesLineEl(full.parties),
         el("div", { class: "lineage-box" }, [
           el("div", { class: "txt" }, ["Originated from master document", el("br"), lineageLink]),
         ]),
