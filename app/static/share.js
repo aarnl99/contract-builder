@@ -594,7 +594,52 @@ function DocumentView(data) {
   );
   docCard.appendChild(errBox);
 
-  const sideCol = el("div", { class: "redline-side-col" }, [statsBar, el("h2", { class: "redline-list-heading" }, "Redlines"), redlineList]);
+  // ---- activity history: every time this document (and its revisions)
+  // was drafted, shared, viewed, or redlined -- in local time, every
+  // occurrence, not just the latest. Same lineage data the sender sees on
+  // their side, minus anything internal (no ids, no document names, and
+  // never redline threshold rules -- consistent with get_share_document
+  // never sending those either). ----
+  const historyList = el("div", { class: "chain", style: "display:block;border-top:none;background:transparent;padding:0;" });
+  function loadHistory() {
+    historyList.innerHTML = "";
+    historyList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "Loading..."));
+    api(`/api/share/${TOKEN}/history`).then((hist) => {
+      historyList.innerHTML = "";
+      if (!hist.timeline.length) {
+        historyList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "No activity yet."));
+        return;
+      }
+      const LABELS = {
+        drafted: ["•", "draft", "Drafted"],
+        redline_applied: ["✓", "final", "Redlines applied"],
+        shared: ["→", "pending", "Shared for review"],
+        viewed: ["○", "draft", "Viewed"],
+        redline_submitted: ["✎", "pending", "Redline submitted"],
+      };
+      hist.timeline.forEach((ev) => {
+        const [dot, cls, title] = LABELS[ev.type] || ["•", "draft", ev.type];
+        historyList.appendChild(
+          el("div", { class: "chain-item" }, [
+            el("div", { class: "chain-dot " + cls }, dot),
+            el("div", { class: "chain-body" }, [
+              el("div", { class: "chain-title-row" }, [el("span", { class: "chain-title" }, title)]),
+              el("div", { class: "chain-meta" }, [new Date(ev.at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })]),
+            ]),
+          ])
+        );
+      });
+    });
+  }
+  loadHistory();
+
+  const sideCol = el("div", { class: "redline-side-col" }, [
+    statsBar,
+    el("h2", { class: "redline-list-heading" }, "Redlines"),
+    redlineList,
+    el("h2", { class: "redline-list-heading", style: "margin-top:22px;" }, "Activity"),
+    historyList,
+  ]);
 
   shell.appendChild(el("div", { class: "redline-layout" }, [el("div", { class: "redline-doc-col" }, [docCard]), sideCol]));
 

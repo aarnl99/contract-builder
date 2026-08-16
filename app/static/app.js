@@ -920,6 +920,121 @@ function DocumentsView() {
   const listWrap = el("div", {});
   wrap.appendChild(listWrap);
 
+  function plainRow(d) {
+    const row = el("div", { class: "output-row" + (d.archived ? " archived" : "") }, [
+      el("div", { class: "left" }, [
+        el("div", { class: "file-icon" }, "✓"),
+        el("div", {}, [
+          el("div", { class: "name" }, d.name),
+          el("div", { class: "lineage" }, ["Originated from ", el("span", { class: "tag" }, d.template_name)]),
+        ]),
+      ]),
+      el("div", { class: "right" }, [
+        el("div", { class: "date" }, new Date(d.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
+        el("button", {
+          class: "btn secondary small",
+          onclick: (e) => { e.stopPropagation(); toggleArchive(d); },
+        }, d.archived ? "Unarchive" : "Archive"),
+        el("button", {
+          class: "btn danger small",
+          onclick: (e) => { e.stopPropagation(); deleteForever(d); },
+        }, "Delete"),
+      ]),
+    ]);
+    row.addEventListener("click", () => openDetail(d));
+    return row;
+  }
+
+  // One entry in a folder's expanded chain -- a document revision, a share,
+  // a client view, or a redline submission, all merged into one timeline by
+  // /api/generated/{id}/history and shown in the viewer's local time.
+  function chainItemFor(ev, docsById, latestId) {
+    let dotClass = "draft", dotLabel = "•", title = "", desc = "";
+    const doc = ev.document_id ? docsById[ev.document_id] : null;
+    if (ev.type === "drafted") {
+      dotClass = "draft"; dotLabel = "•"; title = "Original draft"; desc = "First generated from the master template.";
+    } else if (ev.type === "redline_applied") {
+      dotClass = "final"; dotLabel = "✓"; title = "Redlines applied"; desc = "Accepted redlines were applied into this new revision.";
+    } else if (ev.type === "shared") {
+      dotClass = "pending"; dotLabel = "→"; title = "Shared for review"; desc = "Sent to the client for review.";
+    } else if (ev.type === "viewed") {
+      dotClass = "draft"; dotLabel = "○"; title = "Client viewed"; desc = "The share link was opened.";
+    } else if (ev.type === "redline_submitted") {
+      dotClass = "pending"; dotLabel = "✎"; title = "Redline submitted"; desc = "The client sent proposed changes for review.";
+    }
+    const actions = [];
+    if (doc && (ev.type === "drafted" || ev.type === "redline_applied")) {
+      actions.push(el("a", { onclick: () => openDetail(doc) }, "View"));
+      actions.push(el("a", { href: `/api/generated/${doc.id}/download` }, "Download .docx"));
+    } else if (doc && ev.type === "redline_submitted") {
+      actions.push(el("a", { onclick: () => openRedlinesModal(doc.id) }, "View redlines"));
+    }
+    const isCurrent = !!(doc && ev.type === "redline_applied" && doc.id === latestId);
+    return el("div", { class: "chain-item" }, [
+      el("div", { class: "chain-dot " + dotClass }, dotLabel),
+      el("div", { class: "chain-body" }, [
+        el("div", { class: "chain-title-row" }, [
+          el("span", { class: "chain-title" }, title),
+          isCurrent ? el("span", { class: "chain-current" }, "Current version") : null,
+        ]),
+        el("div", { class: "chain-desc" }, desc),
+        el("div", { class: "chain-meta" }, [new Date(ev.at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })]),
+        actions.length ? el("div", { class: "chain-actions" }, actions) : null,
+      ]),
+    ]);
+  }
+
+  // A folder groups every revision connected through an actual redline
+  // round (share -> client edits -> owner applies) -- never just documents
+  // that happen to share a template. Collapsed by default; the full
+  // activity chain (views + submissions included, not just revisions) is
+  // fetched lazily on first expand.
+  function folderRow(familyDocs, docsById) {
+    const latest = familyDocs[0]; // docs arrive sorted desc by created_at
+    let open = false;
+    let historyLoaded = false;
+
+    const folder = el("div", { class: "doc-folder" });
+    const chevron = el("span", { class: "chevron" }, "›");
+    const statusTag = latest.is_redline_result
+      ? el("span", { class: "status-tag final" }, "Redlines applied")
+      : null;
+    const chainWrap = el("div", { class: "chain" });
+    const head = el("div", { class: "folder-head" }, [
+      el("div", { class: "left" }, [
+        el("div", { class: "folder-icon" }, "▸"),
+        el("div", {}, [
+          el("div", { class: "folder-name-row" }, [
+            el("span", { class: "folder-name" }, latest.name),
+            el("span", { class: "version-count" }, `${familyDocs.length} versions`),
+            statusTag,
+          ]),
+          el("div", { class: "folder-sub" }, ["Originated from ", el("span", { class: "tag" }, latest.template_name)]),
+        ]),
+      ]),
+      el("div", { class: "right" }, [
+        el("div", { class: "date" }, "Updated " + new Date(latest.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
+        chevron,
+      ]),
+    ]);
+    head.addEventListener("click", () => {
+      open = !open;
+      folder.classList.toggle("open", open);
+      if (open && !historyLoaded) {
+        historyLoaded = true;
+        chainWrap.innerHTML = "";
+        chainWrap.appendChild(el("div", { style: "padding:14px 4px;color:var(--muted);font-size:12.5px;" }, "Loading history..."));
+        api(`/api/generated/${latest.id}/history`).then((hist) => {
+          chainWrap.innerHTML = "";
+          hist.timeline.forEach((ev) => chainWrap.appendChild(chainItemFor(ev, docsById, latest.id)));
+        });
+      }
+    });
+    folder.appendChild(head);
+    folder.appendChild(chainWrap);
+    return folder;
+  }
+
   function load() {
     api(`/api/generated?archived=${showArchived}`).then((docs) => {
       listWrap.innerHTML = "";
@@ -932,6 +1047,9 @@ function DocumentsView() {
         );
         return;
       }
+      const docsById = {};
+      docs.forEach((d) => { docsById[d.id] = d; });
+
       const groups = {};
       docs.forEach((d) => {
         (groups[d.document_type] = groups[d.document_type] || []).push(d);
@@ -945,30 +1063,23 @@ function DocumentsView() {
           ])
         );
         const list = el("div", { class: "output-list" });
+
+        // Group this type's docs by lineage, preserving first-seen order --
+        // since docs arrive sorted desc by created_at, that's also
+        // most-recent-activity-first for the folders themselves.
+        const lineageOrder = [];
+        const lineageDocs = {};
         groups[type].forEach((d) => {
-          const row = el("div", { class: "output-row" + (d.archived ? " archived" : "") }, [
-            el("div", { class: "left" }, [
-              el("div", { class: "file-icon" }, "✓"),
-              el("div", {}, [
-                el("div", { class: "name" }, d.name),
-                el("div", { class: "lineage" }, ["Originated from ", el("span", { class: "tag" }, d.template_name)]),
-              ]),
-            ]),
-            el("div", { class: "right" }, [
-              el("div", { class: "date" }, new Date(d.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
-              el("button", {
-                class: "btn secondary small",
-                onclick: (e) => { e.stopPropagation(); toggleArchive(d); },
-              }, d.archived ? "Unarchive" : "Archive"),
-              el("button", {
-                class: "btn danger small",
-                onclick: (e) => { e.stopPropagation(); deleteForever(d); },
-              }, "Delete"),
-            ]),
-          ]);
-          row.addEventListener("click", () => openDetail(d));
-          list.appendChild(row);
+          const key = d.lineage_root_id;
+          if (!lineageDocs[key]) { lineageDocs[key] = []; lineageOrder.push(key); }
+          lineageDocs[key].push(d);
         });
+
+        lineageOrder.forEach((key) => {
+          const familyDocs = lineageDocs[key];
+          list.appendChild(familyDocs.length === 1 ? plainRow(familyDocs[0]) : folderRow(familyDocs, docsById));
+        });
+
         groupEl.appendChild(list);
         listWrap.appendChild(groupEl);
       });
