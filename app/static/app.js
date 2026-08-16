@@ -318,11 +318,31 @@ async function openShareModal(generatedId) {
     );
     const emailInput = el("input", { type: "email", placeholder: "client@company.com", value: share.client_email || "" });
     const emailSavedNote = el("span", { style: "font-size:12px;color:var(--success);margin-left:8px;display:none;" }, "Saved");
+    const senderInput = el("input", { type: "email", placeholder: "you@company.com (defaults to your login email)", value: share.sender_email || "" });
+    const senderSavedNote = el("span", { style: "font-size:12px;color:var(--success);margin-left:8px;display:none;" }, "Saved");
+    async function saveShareFields() {
+      await api(`/api/generated/${generatedId}/share`, {
+        method: "POST",
+        body: { client_email: emailInput.value.trim(), sender_email: senderInput.value.trim() },
+      });
+    }
     emailInput.addEventListener("change", async () => {
-      await api(`/api/generated/${generatedId}/share`, { method: "POST", body: { client_email: emailInput.value.trim() } });
+      await saveShareFields();
       emailSavedNote.style.display = "inline";
       setTimeout(() => (emailSavedNote.style.display = "none"), 1500);
     });
+    senderInput.addEventListener("change", async () => {
+      await saveShareFields();
+      senderSavedNote.style.display = "inline";
+      setTimeout(() => (senderSavedNote.style.display = "none"), 1500);
+    });
+    body.appendChild(
+      el("div", { class: "form-row", style: "margin-top:14px;" }, [
+        el("label", { class: "field-label" }, ["Your email (shown to the client)", senderSavedNote]),
+        senderInput,
+        el("div", { style: "font-size:12px;color:var(--muted);margin-top:4px;" }, "Shown to them as the document sender's contact. Leave blank to use your account login email."),
+      ])
+    );
     body.appendChild(
       el("div", { class: "form-row", style: "margin-top:14px;" }, [
         el("label", { class: "field-label" }, ["Client email (optional)", emailSavedNote]),
@@ -369,7 +389,7 @@ async function openRedlinesModal(generatedId) {
       const meta = [
         el("span", {}, data.header.document_type || "Document"),
         " · created ",
-        el("span", {}, new Date(data.header.created_at).toLocaleDateString()),
+        el("span", {}, new Date(data.header.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
       ];
       if (data.header.client) meta.push(" · ", el("span", {}, ["client: ", data.header.client]));
       box.appendChild(
@@ -821,7 +841,7 @@ function DocumentsView() {
               ]),
             ]),
             el("div", { class: "right" }, [
-              el("div", { class: "date" }, new Date(d.created_at).toLocaleDateString()),
+              el("div", { class: "date" }, new Date(d.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
               el("button", {
                 class: "btn secondary small",
                 onclick: (e) => { e.stopPropagation(); toggleArchive(d); },
