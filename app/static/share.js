@@ -257,6 +257,11 @@ function DocumentView(data) {
   if (data.client_email) {
     header.appendChild(el("div", { class: "rh-editing-as" }, `Editing as: ${data.client_email}`));
   }
+  if (data.owner_updated_since_last_view) {
+    header.appendChild(
+      el("div", { class: "rh-updated-notice" }, "The sender updated this document since your last visit — the text below reflects the latest version.")
+    );
+  }
   shell.appendChild(header);
 
   const pristineHtml = data.html || "<p>No preview available.</p>";
@@ -453,10 +458,39 @@ function DocumentView(data) {
   // "Suggest edit" action appears, THEN the popover opens ----
   let selectedEls = [];
   let actionChip = null;
+  // A free-text drag can cover only PART of a .run (e.g. one word inside a
+  // run that holds a whole clause) -- highlighting the whole run in that
+  // case would visually mark far more than was actually selected, even
+  // though the edit itself only ever targets the true start/end offsets.
+  // These small fixed-position overlays are drawn from the selection
+  // Range's own client rects instead, so the highlight always matches
+  // exactly what was dragged over, line-wraps and all, without touching
+  // the run's DOM (which whole-run .selected already relies on elsewhere).
+  let selectionHighlightEls = [];
+
+  function clearSelectionHighlight() {
+    selectionHighlightEls.forEach((elx) => elx.remove());
+    selectionHighlightEls = [];
+  }
+
+  function highlightRange(range) {
+    clearSelectionHighlight();
+    Array.from(range.getClientRects()).forEach((r) => {
+      if (r.width <= 0 || r.height <= 0) return;
+      const box = el("div", { class: "text-selection-highlight" });
+      box.style.top = r.top + "px";
+      box.style.left = r.left + "px";
+      box.style.width = r.width + "px";
+      box.style.height = r.height + "px";
+      document.body.appendChild(box);
+      selectionHighlightEls.push(box);
+    });
+  }
 
   function deselectField() {
     selectedEls.forEach((elx) => elx.classList.remove("selected"));
     selectedEls = [];
+    clearSelectionHighlight();
     if (actionChip) { actionChip.remove(); actionChip = null; }
   }
 
@@ -591,24 +625,17 @@ function DocumentView(data) {
     closePopover();
   }
 
-  function handleTextSelection(info, anchorRect) {
+  function handleTextSelection(info, anchorRect, range) {
     const loc = { table_path: info.table_path || "", paragraph_index: info.paragraph_index, segments: info.segments };
     const key = locKey(loc);
     const existing = edits[key];
     deselectField();
-    // Free-text drags span one or more .run elements -- highlight every run
-    // the selection actually covers, same as a single marked-field click does.
-    const paraEl = findParaEl(loc.table_path, loc.paragraph_index);
-    if (paraEl) {
-      const allRuns = Array.from(paraEl.querySelectorAll(".run"));
-      info.segments.forEach((seg) => {
-        const runEl = allRuns[seg.r];
-        if (runEl) {
-          runEl.classList.add("selected");
-          selectedEls.push(runEl);
-        }
-      });
-    }
+    // Highlight exactly the dragged-over text, not the whole run(s) it sits
+    // inside -- a run can hold an entire clause, so marking the full run
+    // here would visually cover far more than the person actually selected
+    // (the proposed edit itself has always correctly used just info's start/
+    // end offsets; only this highlight was overshooting).
+    if (range) highlightRange(range);
     showActionChip(anchorRect, existing ? "Edit suggestion ✎" : "Suggest edit ✎", () => {
       openEditPopover({
         key, location: loc, fieldKey: existing ? existing.field_key : "", label: existing ? existing.label : "",
@@ -645,7 +672,7 @@ function DocumentView(data) {
         alert("Please select text within a single paragraph.");
         return;
       }
-      handleTextSelection(info, rect);
+      handleTextSelection(info, rect, range);
     }, 0);
   }
 

@@ -135,6 +135,7 @@ function topbar() {
     window.__notifWrap = notifWrap;
     window.__notifBell = bell;
     ensureNotificationPolling();
+    ensureVersionPolling();
     refreshNotifBadge();
 
     const avatarWrap = el("div", { class: "avatar-menu" });
@@ -253,6 +254,36 @@ function ensureNotificationPolling() {
   if (window.__notifPollStarted) return;
   window.__notifPollStarted = true;
   setInterval(() => refreshNotifBadge(), 30000);
+}
+
+// ---------------------------------------------------------------------------
+// Stale-tab detection -- see APP_BOOT_ID in main.py. A tab left open across a
+// deploy keeps running the JS it loaded at page-open forever; this is what
+// tells the person instead of leaving them staring at old behavior.
+// ---------------------------------------------------------------------------
+
+function ensureVersionPolling() {
+  if (window.__versionPollStarted) return;
+  window.__versionPollStarted = true;
+  api("/api/version").then((d) => { window.__bootId = d.boot_id; }).catch(() => {});
+  setInterval(() => {
+    if (window.__versionBannerShown) return;
+    api("/api/version").then((d) => {
+      if (window.__bootId && d.boot_id !== window.__bootId) {
+        window.__versionBannerShown = true;
+        showUpdateBanner();
+      }
+    }).catch(() => {});
+  }, 3 * 60 * 1000);
+}
+
+function showUpdateBanner() {
+  document.body.appendChild(
+    el("div", { class: "version-banner" }, [
+      el("span", {}, "A new version is available."),
+      el("button", { class: "btn small", onclick: () => location.reload() }, "Refresh"),
+    ])
+  );
 }
 
 function toggleNotifDropdown() {
@@ -671,7 +702,7 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
           errBox.innerHTML = "";
           saveBtn.disabled = true;
           try {
-            await api(`/api/generated/${generatedId}/edit`, {
+            const editRes = await api(`/api/generated/${generatedId}/edit`, {
               method: "POST",
               body: {
                 table_path: info.table_path,
@@ -682,7 +713,7 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
             });
             closePop();
             overlay.remove();
-            if (typeof onEdited === "function") onEdited();
+            if (typeof onEdited === "function") onEdited(editRes);
           } catch (e) {
             errBox.appendChild(el("div", { class: "error-box" }, e.message));
             saveBtn.disabled = false;
@@ -939,19 +970,36 @@ async function openRedlinesModal(generatedId) {
         if (sub.status === "pending" && hasAcceptedSomewhere) {
           const applyBtn = el("button", { class: "btn secondary" }, "Apply accepted changes → new draft");
           applyBtn.addEventListener("click", async () => {
+            // Warn BEFORE applying if a newer round exists on this same link
+            // that hasn't been applied yet -- otherwise it's easy to apply an
+            // older round, not realize a newer one is sitting right above it,
+            // and end up thinking you're looking at the latest version when
+            // you're not.
+            const newerUnapplied = data.submissions.some(
+              (s) => s.id !== sub.id && s.status !== "reviewed" && new Date(s.submitted_at) > new Date(sub.submitted_at)
+            );
+            if (newerUnapplied) {
+              const proceed = confirm(
+                "There's a newer round of redlines on this document that hasn't been applied yet. " +
+                "Are you sure you want to apply this older round now?"
+              );
+              if (!proceed) return;
+            }
             applyBtn.disabled = true;
             applyBtn.textContent = "Applying...";
             try {
               const result = await api(`/api/redline-submissions/${sub.id}/apply`, { method: "POST" });
               overlay.remove();
               if (result.chained_from) {
-                // This share link had an earlier round already applied, so this
-                // apply built on top of that revision instead of the original --
-                // otherwise the earlier round's accepted changes would have been
-                // silently dropped. Tell the owner so it's never a silent merge.
+                // This document already had a newer state (an earlier applied
+                // redline round, or a direct edit) than the one this round was
+                // originally drafted against, so this apply built on top of
+                // that instead of the pristine original -- otherwise whatever
+                // changed since would have been silently dropped. Tell the
+                // owner so it's never a silent merge.
                 alert(
-                  `Applied on top of "${result.chained_from.name}", which already had earlier accepted redlines from this document. ` +
-                  `The new version includes both rounds.`
+                  `Applied on top of "${result.chained_from.name}", the most recent version of this document. ` +
+                  `The new version includes those changes plus this round's.`
                 );
               }
               location.hash = "#/documents";
@@ -987,10 +1035,11 @@ function openFillModal(tpl, prefill, onDone) {
   const overlay = el("div", { class: "modal-overlay" });
   const errBox = el("div");
   const inputs = {};
+  const prefillValues = (prefill && prefill.values) || {};
 
   const fieldRows = tpl.placeholders.map((p) => {
     let input;
-    const prefillVal = (prefill && prefill[p.field_key]) || "";
+    const prefillVal = prefillValues[p.field_key] || "";
     if (p.field_type === "clause_preset") {
       const options = p.preset_options || [];
       input = el(
@@ -1012,8 +1061,14 @@ function openFillModal(tpl, prefill, onDone) {
     ]);
   });
 
-  const partyAInput = el("input", { type: "text", placeholder: "Your organization", value: (state.user && (state.user.name || state.user.email)) || "" });
-  const partyBInput = el("input", { type: "text", placeholder: "The other party, e.g. Swift Enterprises" });
+  const partyAInput = el("input", {
+    type: "text", placeholder: "Your organization",
+    value: (prefill && prefill.party_a) || (state.user && (state.user.name || state.user.email)) || "",
+  });
+  const partyBInput = el("input", {
+    type: "text", placeholder: "The other party, e.g. Swift Enterprises",
+    value: (prefill && prefill.party_b) || "",
+  });
 
   const modal = el("div", { class: "modal" }, [
     el("h2", {}, tpl.name),
@@ -1034,12 +1089,18 @@ function openFillModal(tpl, prefill, onDone) {
     errBox.innerHTML = "";
     const values = {};
     Object.entries(inputs).forEach(([k, i]) => (values[k] = i.value));
-    const parties = [partyAInput.value.trim(), partyBInput.value.trim()].filter(Boolean);
+    const partyA = partyAInput.value.trim();
+    const partyB = partyBInput.value.trim();
+    const parties = [partyA, partyB].filter(Boolean);
     try {
       const res = await api(`/api/templates/${tpl.id}/generate`, { method: "POST", body: { values, parties } });
       state.plan = res.plan;
       overlay.remove();
-      onDone(res, values);
+      // Handed straight back to openFillModal as `prefill` if the caller
+      // reopens this same form (e.g. "Edit values") -- keeping the shape
+      // identical here is what makes round-tripping through it lossless
+      // instead of silently dropping whatever was just typed in.
+      onDone(res, { values, party_a: partyA, party_b: partyB });
     } catch (e) {
       errBox.appendChild(el("div", { class: "error-box" }, e.message));
     }
@@ -1092,18 +1153,18 @@ function DraftView(preselectId) {
 
   function startDraft(templateId) {
     api(`/api/templates/${templateId}`).then((tpl) => {
-      openFillModal(tpl, null, (result) => {
-        showResult(tpl, result, {});
+      openFillModal(tpl, null, (result, prefill) => {
+        showResult(tpl, result, prefill);
       });
     });
   }
 
-  function showResult(tpl, result, lastValues) {
+  function showResult(tpl, result, lastPrefill) {
     const editBtn = el("button", { class: "btn secondary" }, "Edit values");
     editBtn.addEventListener("click", () => {
       overlay.remove();
       api(`/api/templates/${tpl.id}`).then((freshTpl) => {
-        openFillModal(freshTpl, lastValues, (res2, values2) => showResult(freshTpl, res2, values2));
+        openFillModal(freshTpl, lastPrefill, (res2, prefill2) => showResult(freshTpl, res2, prefill2));
       });
     });
     const libBtn = el("button", { class: "btn secondary", onclick: () => { overlay.remove(); location.hash = "#/documents"; } }, "View in Documents");
@@ -1115,6 +1176,16 @@ function DraftView(preselectId) {
       html: result.html,
       generatedId: result.generated_id,
       extraButtons: [editBtn, libBtn, shareBtn, redlinesBtn],
+      editable: true,
+      onEdited: (editRes) => {
+        // A direct edit creates a new revision rather than modifying this one
+        // in place -- re-fetch it and re-render so the buttons above (Share,
+        // Redlines, further edits) all point at the document you're actually
+        // looking at now, not the superseded one.
+        api(`/api/generated/${editRes.id}`).then((fresh) => {
+          showResult(tpl, { generated_id: fresh.id, name: fresh.name, html: fresh.html }, lastPrefill);
+        });
+      },
     });
     refreshTopbarInPlace();
   }
@@ -1355,6 +1426,14 @@ function DocumentsView() {
       ]),
       el("div", { class: "right" }, [
         el("div", { class: "date" }, "Updated " + new Date(latest.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
+        el("button", {
+          class: "btn secondary small",
+          onclick: (e) => { e.stopPropagation(); toggleArchiveFamily(familyDocs); },
+        }, latest.archived ? "Unarchive" : "Archive"),
+        el("button", {
+          class: "btn danger small",
+          onclick: (e) => { e.stopPropagation(); deleteFamilyForever(familyDocs); },
+        }, "Delete"),
         chevron,
       ]),
     ]);
@@ -1436,6 +1515,25 @@ function DocumentsView() {
   async function deleteForever(d) {
     if (!confirm(`Permanently delete "${d.name}"? This cannot be undone.`)) return;
     await api(`/api/generated/${d.id}`, { method: "DELETE" });
+    load();
+  }
+
+  // A folder is every revision of one document -- archiving or deleting
+  // only the latest revision would leave the older ones stranded on
+  // whichever tab (Active/Archived) they happened to already be on, since
+  // that filter is applied per-document before grouping into folders. So
+  // both actions here always apply to every version in the family at once,
+  // keeping the whole folder together on one tab.
+  async function toggleArchiveFamily(familyDocs) {
+    const nextArchived = !familyDocs[0].archived;
+    await Promise.all(familyDocs.map((d) => api(`/api/generated/${d.id}/archive`, { method: "POST", body: { archived: nextArchived } })));
+    load();
+  }
+
+  async function deleteFamilyForever(familyDocs) {
+    const label = familyDocs.length > 1 ? `all ${familyDocs.length} versions of "${familyDocs[0].name}"` : `"${familyDocs[0].name}"`;
+    if (!confirm(`Permanently delete ${label}? This cannot be undone.`)) return;
+    await Promise.all(familyDocs.map((d) => api(`/api/generated/${d.id}`, { method: "DELETE" })));
     load();
   }
 

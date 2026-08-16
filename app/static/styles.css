@@ -589,6 +589,15 @@ a.link:hover { text-decoration: underline; }
   background: var(--accent-soft-border) !important; box-shadow: 0 0 0 2px var(--accent) inset !important;
   border-radius: 3px; padding: 0 2px;
 }
+/* Precise highlight for a free-text drag-selection, drawn from the Range's
+   own client rects (see share.js's highlightRange) instead of shading a
+   whole .run -- a run can span an entire clause, so this is what keeps the
+   highlight matching exactly what was dragged over, including selections
+   that wrap across lines. */
+.text-selection-highlight {
+  position: fixed; z-index: 40; pointer-events: none;
+  background: var(--accent-soft-border); border-radius: 2px;
+}
 .field-action-chip {
   position: fixed; z-index: 55; background: var(--ink); color: white; border: none; border-radius: 20px;
   padding: 7px 14px; font-size: 12.5px; font-weight: 700; cursor: pointer; box-shadow: var(--shadow-md);
@@ -725,3 +734,12 @@ a.link:hover { text-decoration: underline; }
   .stats-row { grid-template-columns: repeat(2, 1fr); }
   .charts-row, .admin-lower-row { grid-template-columns: 1fr; }
 }
+
+/* ---- stale-tab "new version" banner (see ensureVersionPolling in app.js) ---- */
+.version-banner {
+  position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+  background: var(--ink); color: white; padding: 11px 14px 11px 18px;
+  border-radius: 12px; display: flex; align-items: center; gap: 14px;
+  font-size: 13px; font-weight: 500; z-index: 300; box-shadow: var(--shadow-md);
+}
+.version-banner .btn { padding: 5px 12px; font-size: 12.5px; }
