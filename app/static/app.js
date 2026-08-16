@@ -1382,7 +1382,7 @@ function DocumentsView() {
         ]),
       ]),
       el("div", { class: "right" }, [
-        el("div", { class: "date" }, new Date(d.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
+        el("div", { class: "date" }, "Updated " + new Date(d.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
         el("button", {
           class: "btn secondary small",
           onclick: (e) => { e.stopPropagation(); toggleArchive(d); },
@@ -1391,6 +1391,12 @@ function DocumentsView() {
           class: "btn danger small",
           onclick: (e) => { e.stopPropagation(); deleteForever(d); },
         }, "Delete"),
+        // Invisible placeholder matching folderRow's trailing chevron so the
+        // Archive/Delete buttons land at the same x-position whether or not
+        // this particular row happens to be expandable -- a single-version
+        // row has nothing to expand, but it should still look aligned with
+        // its multi-version neighbors in the same list.
+        el("span", { class: "chevron", style: "visibility:hidden;" }, "›"),
       ]),
     ]);
     row.addEventListener("click", () => openDetail(d));
@@ -1847,7 +1853,7 @@ function EditorView(templateId) {
       modalChildren.push(
         el("label", { class: "field-label", style: "margin-bottom:10px;" }, "This text is..."),
         fieldSelect,
-        el("div", { style: "font-size:12px;color:var(--muted);margin:-6px 0 12px;" }, "Pick an existing field if this is another spot for something you already marked (e.g. a name that appears twice) — filling it once fills every spot."),
+        el("div", { style: "font-size:12px;color:var(--muted);margin:8px 0 14px;" }, "Pick an existing field if this is another spot for something you already marked (e.g. a name that appears twice) — filling it once fills every spot."),
         newFieldBlock
       );
     } else {
