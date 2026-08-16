@@ -374,7 +374,7 @@ function AuthView(mode) {
 // Shared: document preview overlay
 // ---------------------------------------------------------------------------
 
-function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons }) {
+function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, editable, onEdited }) {
   const overlay = el("div", { class: "modal-overlay" });
   const box = el("div", { class: "modal", style: "width:720px;" });
 
@@ -384,9 +384,70 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons }
   ]);
   box.appendChild(headerRow);
 
+  if (editable && generatedId) {
+    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:-8px 0 10px;" }, "Select any text below to edit it directly -- saved instantly as a new revision, no approval needed."));
+  }
+
   const preview = el("div", { class: "contract-view compact", style: "max-height:52vh;overflow-y:auto;" });
   preview.innerHTML = html || "<p style='color:var(--muted);'>No preview available.</p>";
   box.appendChild(preview);
+
+  if (editable && generatedId) {
+    let activePopover = null;
+    const closePop = () => { if (activePopover) { activePopover.remove(); activePopover = null; } };
+    preview.addEventListener("mouseup", () => {
+      setTimeout(() => {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+        const range = sel.getRangeAt(0);
+        if (!preview.contains(range.commonAncestorContainer)) return;
+        const rect = range.getBoundingClientRect();
+        const info = computeSelectionSegments(preview);
+        sel.removeAllRanges();
+        if (!info) return;
+        if (info.error === "cross-paragraph") { alert("Please select text within a single paragraph."); return; }
+        closePop();
+        const input = el("textarea", { rows: "2" }, info.text);
+        const errBox = el("div");
+        const saveBtn = el("button", { class: "btn" }, "Save as new revision");
+        saveBtn.addEventListener("click", async () => {
+          errBox.innerHTML = "";
+          saveBtn.disabled = true;
+          try {
+            await api(`/api/generated/${generatedId}/edit`, {
+              method: "POST",
+              body: {
+                table_path: info.table_path,
+                paragraph_index: info.paragraph_index,
+                segments: info.segments,
+                new_text: input.value,
+              },
+            });
+            closePop();
+            overlay.remove();
+            if (typeof onEdited === "function") onEdited();
+          } catch (e) {
+            errBox.appendChild(el("div", { class: "error-box" }, e.message));
+            saveBtn.disabled = false;
+          }
+        });
+        const pop = el("div", { class: "redline-popover" }, [
+          el("div", { class: "rp-label" }, "Edit text"),
+          input,
+          errBox,
+          el("div", { class: "rp-actions" }, [
+            el("button", { class: "btn secondary", onclick: closePop }, "Cancel"),
+            saveBtn,
+          ]),
+        ]);
+        document.body.appendChild(pop);
+        pop.style.top = Math.min(window.innerHeight - 220, rect.bottom + 8) + "px";
+        pop.style.left = Math.min(window.innerWidth - 300, Math.max(8, rect.left)) + "px";
+        activePopover = pop;
+        input.focus();
+      }, 0);
+    });
+  }
 
   const actions = el("div", { class: "panel-actions" });
   if (generatedId) {
@@ -1115,7 +1176,16 @@ function DocumentsView() {
           el("a", { class: "btn", href: `/api/generated/${d.id}/download` }, "Download .docx"),
           el("button", { class: "btn secondary", onclick: () => openShareModal(d.id) }, "Share for review"),
           el("button", { class: "btn secondary", onclick: () => openRedlinesModal(d.id) }, "Redlines"),
-          el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); showPreviewOverlay({ title: full.name, subtitle: full.document_type, html: full.html, generatedId: full.id }); } }, "Preview document"),
+          el("button", {
+            class: "btn secondary",
+            onclick: () => {
+              panelOverlay.remove();
+              showPreviewOverlay({
+                title: full.name, subtitle: full.document_type, html: full.html, generatedId: full.id,
+                editable: true, onEdited: () => load(),
+              });
+            },
+          }, "Preview document"),
         ]),
       ]);
       panelOverlay.appendChild(panel);
