@@ -1107,6 +1107,7 @@ def list_generated(
     if template_id is not None:
         q = q.where(GeneratedContract.template_id == template_id)
     rows = session.exec(q.order_by(GeneratedContract.created_at.desc())).all()
+    status_by_doc = _document_statuses(session, [g.id for g in rows])
     return [
         {
             "id": g.id,
@@ -1119,9 +1120,57 @@ def list_generated(
             "values": json.loads(g.values_json),
             "lineage_root_id": lineage_roots.get(g.id, g.id),
             "is_redline_result": g.source_submission_id is not None,
+            "parties": json.loads(g.parties_json or "[]"),
+            "status": status_by_doc.get(g.id, {"key": "draft", "label": "Draft", "tone": "draft"}),
         }
         for g in rows
     ]
+
+
+def _document_statuses(session: Session, doc_ids: list) -> dict:
+    """Bulk-computes a human status label per generated document id from its
+    most recent share link and redline submission (if any): draft (never
+    shared) -> shared, awaiting review -> redlines submitted -> response
+    sent, awaiting client -> client reviewing your response -> redlines
+    applied. Two queries total (not one per document) so this stays fast as
+    a library grows -- called from the documents list, which can return
+    dozens of rows at once."""
+    if not doc_ids:
+        return {}
+    links = session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(doc_ids))).all()
+    if not links:
+        return {}
+    link_ids = [l.id for l in links]
+    subs = session.exec(select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(link_ids))).all()
+    subs_by_link = {}
+    for s in subs:
+        if s.status == "draft":
+            continue  # an in-progress "Save progress" draft isn't visible to the owner yet
+        subs_by_link.setdefault(s.share_link_id, []).append(s)
+
+    out = {}
+    for link in links:
+        # A generated doc can pick up more than one share link over time
+        # (re-shared); keep the most recently created one's status.
+        if link.generated_contract_id in out and link.created_at <= out[link.generated_contract_id]["_link_created_at"]:
+            continue
+        doc_subs = sorted(subs_by_link.get(link.id, []), key=lambda s: s.submitted_at, reverse=True)
+        latest_sub = doc_subs[0] if doc_subs else None
+        if latest_sub is None:
+            status = {"key": "shared", "label": "Shared, awaiting review", "tone": "pending"}
+        elif latest_sub.status == "reviewed":
+            status = {"key": "applied", "label": "Redlines applied", "tone": "final"}
+        elif latest_sub.responded_at and not latest_sub.client_ack_at:
+            status = {"key": "response_sent", "label": "Response sent, awaiting client", "tone": "pending"}
+        elif latest_sub.responded_at and latest_sub.client_ack_at:
+            status = {"key": "client_reviewing", "label": "Client reviewing your response", "tone": "pending"}
+        else:
+            status = {"key": "submitted", "label": "Redlines submitted, awaiting your review", "tone": "pending"}
+        status["_link_created_at"] = link.created_at
+        out[link.generated_contract_id] = status
+    for status in out.values():
+        del status["_link_created_at"]
+    return out
 
 
 @app.get("/api/generated/{generated_id}")
@@ -1130,6 +1179,7 @@ def get_generated(generated_id: int, user: User = Depends(get_current_user), ses
     html = None
     if os.path.exists(gc.file_path):
         html = de.render_paragraphs_html(de.load(gc.file_path))
+    status = _document_statuses(session, [gc.id]).get(gc.id, {"key": "draft", "label": "Draft", "tone": "draft"})
     return {
         "id": gc.id,
         "name": gc.name,
@@ -1140,6 +1190,8 @@ def get_generated(generated_id: int, user: User = Depends(get_current_user), ses
         "created_at": gc.created_at.isoformat(),
         "values": json.loads(gc.values_json),
         "html": html,
+        "parties": json.loads(gc.parties_json or "[]"),
+        "status": status,
     }
 
 
