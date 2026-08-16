@@ -1845,7 +1845,7 @@ function EditorView(templateId) {
         newFieldBlock.style.display = fieldSelect.value ? "none" : "";
       });
       modalChildren.push(
-        el("label", { class: "field-label" }, "This text is..."),
+        el("label", { class: "field-label", style: "margin-bottom:10px;" }, "This text is..."),
         fieldSelect,
         el("div", { style: "font-size:12px;color:var(--muted);margin:-6px 0 12px;" }, "Pick an existing field if this is another spot for something you already marked (e.g. a name that appears twice) — filling it once fills every spot."),
         newFieldBlock

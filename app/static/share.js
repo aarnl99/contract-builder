@@ -57,7 +57,7 @@ function render(view) {
 
 function topbar() {
   return el("div", { class: "share-topbar" }, [
-    el("div", { class: "brand" }, [el("div", { class: "word" }, ["Rotely", el("span", { class: "dot" }, ".ai")])]),
+    el("a", { class: "brand", href: "https://rotely.ai", style: "text-decoration:none;color:inherit;" }, [el("div", { class: "word" }, ["Rotely", el("span", { class: "dot" }, ".ai")])]),
   ]);
 }
 
@@ -101,7 +101,7 @@ function GateView() {
 function ThanksView() {
   return el("div", { class: "share-main" }, [
     el("div", { class: "card thanks-card" }, [
-      el("h1", {}, "Thanks — your changes were sent"),
+      el("h1", {}, "Thanks! Your changes were sent"),
       el("p", { class: "subtitle" }, "The sender has been notified and will review what you proposed. You can close this page."),
     ]),
   ]);
@@ -146,7 +146,7 @@ function JoinCta() {
   return el("div", { class: "join-cta" }, [
     el("div", { class: "join-cta-inner" }, [
       el("div", { class: "jc-eyebrow" }, "Like how this felt?"),
-      el("h2", {}, "Want to remove friction from your contract process?"),
+      el("h2", {}, "Close the Friction. Get signatures faster."),
       el("p", {}, "Rotely turns a contract you already know into a reusable template, drafts finished copies in seconds, and lets people redline it right here, no other tools involved."),
       el("div", { class: "jc-actions" }, [
         el("a", { class: "btn on-dark", href: "/" }, "Create an account"),
