@@ -15,6 +15,23 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+// Copies text to the clipboard and flashes the clicked button green with
+// "Copied!" for a moment, so clicking Copy actually feels like it did
+// something instead of silently succeeding.
+function copyToClipboard(text, btn) {
+  navigator.clipboard.writeText(text);
+  if (!btn) return;
+  if (btn._copyTimeout) clearTimeout(btn._copyTimeout);
+  const original = btn._copyOriginalLabel || btn.textContent;
+  btn._copyOriginalLabel = original;
+  btn.textContent = "Copied!";
+  btn.classList.add("copied");
+  btn._copyTimeout = setTimeout(() => {
+    btn.textContent = original;
+    btn.classList.remove("copied");
+  }, 1400);
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     method: opts.method || "GET",
@@ -180,7 +197,7 @@ function toggleAvatarMenu() {
       el("div", { style: "font-family:monospace;font-size:11px;word-break:break-all;line-height:1.5;" }, address)
     );
     const btnRow = el("div", { style: "display:flex;gap:6px;margin-top:6px;" });
-    btnRow.appendChild(el("button", { class: "btn secondary small", onclick: () => navigator.clipboard.writeText(address) }, "Copy"));
+    btnRow.appendChild(el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(address, e.currentTarget) }, "Copy"));
     btnRow.appendChild(
       el("button", {
         class: "btn ghost small",
@@ -714,11 +731,11 @@ async function openShareModal(generatedId) {
       el("div", { class: "share-info-box" }, [
         el("div", { class: "row" }, [
           el("div", { style: "min-width:0;" }, [el("div", { class: "k" }, "Review link"), el("div", { class: "v" }, linkUrl)]),
-          el("button", { class: "btn secondary small copy-btn", onclick: () => navigator.clipboard.writeText(linkUrl) }, "Copy"),
+          el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(linkUrl, e.currentTarget) }, "Copy"),
         ]),
         el("div", { class: "row" }, [
           el("div", {}, [el("div", { class: "k" }, "Access code"), el("div", { class: "v" }, share.access_code)]),
-          el("button", { class: "btn secondary small copy-btn", onclick: () => navigator.clipboard.writeText(share.access_code) }, "Copy"),
+          el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(share.access_code, e.currentTarget) }, "Copy"),
         ]),
       ])
     );
@@ -857,10 +874,10 @@ async function openRedlinesModal(generatedId) {
             function setStage(d) {
               stage.decision = stage.decision === d ? "pending" : d;
               counterInput.style.display = stage.decision === "countered" ? "" : "none";
-              [rejectBtn, counterBtn, acceptBtn].forEach((b) => b.classList.remove("staged-active"));
-              if (stage.decision === "rejected") rejectBtn.classList.add("staged-active");
-              if (stage.decision === "countered") { counterBtn.classList.add("staged-active"); counterInput.focus(); }
-              if (stage.decision === "accepted") acceptBtn.classList.add("staged-active");
+              [rejectBtn, counterBtn, acceptBtn].forEach((b) => b.classList.remove("staged-active", "stage-accepted", "stage-rejected", "stage-countered"));
+              if (stage.decision === "rejected") rejectBtn.classList.add("staged-active", "stage-rejected");
+              if (stage.decision === "countered") { counterBtn.classList.add("staged-active", "stage-countered"); counterInput.focus(); }
+              if (stage.decision === "accepted") acceptBtn.classList.add("staged-active", "stage-accepted");
             }
             rejectBtn.addEventListener("click", () => setStage("rejected"));
             counterBtn.addEventListener("click", () => setStage("countered"));
@@ -2049,7 +2066,7 @@ function showTempPasswordModal(user, password, emailed) {
     el("div", { class: "share-info-box" }, [
       el("div", { class: "row" }, [
         el("div", { style: "min-width:0;" }, [el("div", { class: "k" }, "Temporary password"), el("div", { class: "v mono" }, password)]),
-        el("button", { class: "btn secondary small copy-btn", onclick: () => navigator.clipboard.writeText(password) }, "Copy"),
+        el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(password, e.currentTarget) }, "Copy"),
       ]),
     ]),
     el("div", { style: "font-size:12px;color:var(--muted);margin-top:10px;" }, "This won't be shown again — copy it now if you need it."),

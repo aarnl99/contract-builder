@@ -268,7 +268,12 @@ function DocumentView(data) {
   const fieldByKey = {};
   (data.fields || []).forEach((f) => { fieldByKey[f.field_key] = f; });
 
-  // locKey(location) -> { field_key, label, location, original_text, value, comment }
+  // locKey(location) -> { field_key, label, location, original_text, value, comment,
+  // counterPending, clientOriginalValue }. counterPending marks a spot the
+  // sender just countered that the client hasn't explicitly accepted,
+  // rejected, or re-suggested yet -- see handleRunClick / renderList below,
+  // where those get a 3-way Accept/Reject/Suggest chip instead of the
+  // normal single "Edit suggestion" one.
   const edits = {};
 
   if (data.draft && data.draft.edits) {
@@ -278,6 +283,7 @@ function DocumentView(data) {
       edits[locKey(loc)] = {
         field_key: e.field_key || "", label: e.label || "", location: loc,
         original_text: e.original_value || "", value: e.proposed_value, comment: e.comment || "",
+        counterPending: !!e.is_counter, clientOriginalValue: e.client_original_value || "",
       };
     });
   }
@@ -321,15 +327,54 @@ function DocumentView(data) {
         ]),
       ];
       if (e.comment) rows.push(el("div", { class: "rl-comment" }, [`"${e.comment}"`]));
+      let topRight;
+      if (e.counterPending) {
+        rows.unshift(el("div", { class: "rl-counter-note" }, "The sender countered this — accept it, reject it, or suggest something else."));
+        topRight = el("div", { class: "rl-counter-actions" }, [
+          el("button", { class: "rl-mini-btn accept", onclick: () => acceptCounter(key) }, "Accept"),
+          el("button", { class: "rl-mini-btn reject", onclick: () => rejectCounter(key) }, "Reject"),
+          el("button", { class: "rl-mini-btn", onclick: (ev) => openSuggestPopoverForKey(key, ev.currentTarget.getBoundingClientRect()) }, "Suggest edit"),
+        ]);
+      } else {
+        topRight = el("div", { class: "rl-remove", onclick: () => removeSuggestion(key) }, "Remove");
+      }
       redlineList.appendChild(
-        el("div", { class: "redline-list-item" }, [
+        el("div", { class: "redline-list-item" + (e.counterPending ? " counter-pending" : "") }, [
           el("div", { class: "rl-top" }, [
             el("div", { class: "rl-label" }, e.label || "Custom edit"),
-            el("div", { class: "rl-remove", onclick: () => removeSuggestion(key) }, "Remove"),
+            topRight,
           ]),
           ...rows,
         ])
       );
+    });
+  }
+
+  function acceptCounter(key) {
+    if (!edits[key]) return;
+    edits[key].counterPending = false;
+    closePopover();
+    deselectField();
+    repaint();
+  }
+
+  function rejectCounter(key) {
+    if (!edits[key]) return;
+    edits[key].value = edits[key].clientOriginalValue;
+    edits[key].counterPending = false;
+    closePopover();
+    deselectField();
+    repaint();
+  }
+
+  function openSuggestPopoverForKey(key, anchorRect) {
+    const e = edits[key];
+    if (!e) return;
+    const f = fieldByKey[e.field_key];
+    openEditPopover({
+      key, location: e.location, fieldKey: e.field_key, label: e.label,
+      originalText: e.original_text, currentValue: e.value, currentComment: e.comment,
+      fieldType: f ? f.field_type : "", anchorRect,
     });
   }
 
@@ -375,6 +420,7 @@ function DocumentView(data) {
         });
         if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
         runEl.classList.add("has-suggestion");
+        if (segEdits.some(({ edit }) => edit.counterPending)) runEl.classList.add("has-counter-pending");
         runEl.innerHTML = "";
         runEl.appendChild(frag);
       });
@@ -423,12 +469,30 @@ function DocumentView(data) {
     actionChip.style.left = Math.min(window.innerWidth - 200, Math.max(8, anchorRect.left)) + "px";
   }
 
+  // Same floating placement as showActionChip, but for a spot the sender
+  // just countered -- offers all three real responses (accept the counter,
+  // reject it back to what the client originally asked for, or suggest
+  // something else) instead of a single generic "edit" action.
+  function showDecisionChip(anchorRect, { onAccept, onReject, onSuggest }) {
+    if (actionChip) actionChip.remove();
+    const acceptBtn = el("button", { class: "fdc-btn fdc-accept" }, "Accept");
+    const rejectBtn = el("button", { class: "fdc-btn fdc-reject" }, "Reject");
+    const suggestBtn = el("button", { class: "fdc-btn fdc-suggest" }, "Suggest edit ✎");
+    acceptBtn.addEventListener("click", (e) => { e.stopPropagation(); onAccept(); });
+    rejectBtn.addEventListener("click", (e) => { e.stopPropagation(); onReject(); });
+    suggestBtn.addEventListener("click", (e) => { e.stopPropagation(); onSuggest(); });
+    actionChip = el("div", { class: "field-decision-chip" }, [acceptBtn, rejectBtn, suggestBtn]);
+    document.body.appendChild(actionChip);
+    actionChip.style.top = Math.min(window.innerHeight - 60, anchorRect.bottom + 8) + "px";
+    actionChip.style.left = Math.min(window.innerWidth - 270, Math.max(8, anchorRect.left)) + "px";
+  }
+
   let activePopover = null;
   function closePopover() {
     if (activePopover) { activePopover.remove(); activePopover = null; }
   }
   document.addEventListener("click", (e) => {
-    if (e.target.closest(".run") || e.target.closest(".field-action-chip") || e.target.closest(".redline-popover")) return;
+    if (e.target.closest(".run") || e.target.closest(".field-action-chip") || e.target.closest(".field-decision-chip") || e.target.closest(".redline-popover")) return;
     closePopover();
     deselectField();
   });
@@ -489,13 +553,16 @@ function DocumentView(data) {
       deselectField();
       runEl.classList.add("selected");
       selectedEls = [runEl];
-      showActionChip(runEl.getBoundingClientRect(), "Edit suggestion ✎", () => {
-        const f = fieldByKey[e.field_key];
-        openEditPopover({
-          key, location: e.location, fieldKey: e.field_key, label: e.label,
-          originalText: e.original_text, currentValue: e.value, currentComment: e.comment,
-          fieldType: f ? f.field_type : "", anchorRect: runEl.getBoundingClientRect(),
+      if (e.counterPending) {
+        showDecisionChip(runEl.getBoundingClientRect(), {
+          onAccept: () => acceptCounter(key),
+          onReject: () => rejectCounter(key),
+          onSuggest: () => openSuggestPopoverForKey(key, runEl.getBoundingClientRect()),
         });
+        return;
+      }
+      showActionChip(runEl.getBoundingClientRect(), "Edit suggestion ✎", () => {
+        openSuggestPopoverForKey(key, runEl.getBoundingClientRect());
       });
       return;
     }
@@ -742,7 +809,10 @@ async function loadDocument() {
         // DocumentView itself requires to resume a draft edit.
         const seeded = data.response.edits
           .filter((e) => e.decision === "countered" && e.location && e.location.segments && e.location.segments.length)
-          .map((e) => ({ field_key: e.field_key, label: e.label, proposed_value: e.counter_value, comment: "", location: e.location }));
+          .map((e) => ({
+            field_key: e.field_key, label: e.label, proposed_value: e.counter_value, comment: "", location: e.location,
+            original_value: e.original_value, is_counter: true, client_original_value: e.proposed_value,
+          }));
         const fresh = await api(`/api/share/${TOKEN}`);
         if (seeded.length) {
           fresh.draft = fresh.draft || { note: "", edits: [] };
