@@ -151,7 +151,7 @@ function toggleAvatarMenu() {
     const opt = el(
       "div",
       { class: "plan-option" + (state.plan && state.plan.plan === p.key ? " current" : "") },
-      [el("span", {}, p.label), el("span", { style: "color:var(--muted-soft);font-size:11.5px;" }, p.detail)]
+      [el("span", { class: "plan-option-label" }, p.label), el("span", { class: "plan-option-detail" }, p.detail)]
     );
     opt.addEventListener("click", async () => {
       await api("/api/account/plan", { method: "POST", body: { plan: p.key } });

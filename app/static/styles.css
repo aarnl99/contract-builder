@@ -92,10 +92,12 @@ body {
 .avatar-dropdown .plan-row { padding: 8px 10px; }
 .avatar-dropdown .plan-row .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted-soft); font-weight: 700; margin-bottom: 6px; }
 .plan-option {
-  display: flex; justify-content: space-between; align-items: center; padding: 7px 8px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 7px 8px; border-radius: 6px; cursor: pointer; font-size: 13px;
 }
 .plan-option:hover { background: var(--bg); }
 .plan-option.current { background: var(--accent-soft); color: var(--accent-dark); font-weight: 600; }
+.plan-option-label { font-weight: 600; }
+.plan-option-detail { color: var(--muted-soft); font-size: 11.5px; font-weight: 400; }
 .avatar-dropdown .logout-row { border-top: 1px solid var(--border-soft); margin-top: 4px; padding-top: 4px; }
 .avatar-dropdown .logout-row button {
   width: 100%; text-align: left; background: none; border: none; padding: 8px 10px; font-size: 13px;
