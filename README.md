@@ -1,0 +1,251 @@
+# Rotely
+
+Rotely turns a Word contract into a reusable master document: upload a
+`.docx`, select the parts that change from contract to contract (client
+name, dates, dollar amounts, and so on), and draft a finished, formatted
+`.docx` any time by filling in a short form.
+
+## How it works
+
+1. **Upload a master document.** Give it a name and a document type (NDA,
+   Services Agreement, Lease, and so on) and upload a `.docx`.
+2. **Mark placeholders.** Select any text in the rendered contract and click
+   "Mark as placeholder." Give it a label and a type (text, date, number, or
+   long text). The selected text is replaced with a token inside the working
+   copy of the document, and the surrounding text and formatting (bold,
+   italic, underline) are preserved exactly.
+3. **Draft.** Pick a master document from the Draft tab, fill in the blanks
+   in the popup, and click Generate. You get a live preview of the finished
+   contract plus a real `.docx` download, ready to open in Word or import
+   into Google Docs.
+4. **Library.** Every drafted contract is saved in the Documents tab,
+   grouped by document type, and always traceable back to the master
+   document it came from. Archive a copy to hide it without deleting it, or
+   delete it forever.
+5. **Share for review.** From any drafted contract, click "Share for
+   review" to get a link and a one-time access code. Send both to your
+   client separately (a text, a call). They open the link, enter the code,
+   and can propose new values for any field you marked, no account needed
+   on their end.
+6. **Redline rules.** On any placeholder in the editor, click "Set redline
+   rule" to define what counts as an acceptable change: a numeric range
+   (payment terms, dollar amounts), an approved list of exact values
+   (governing law, jurisdictions), or "always flag." When a client submits
+   changes through their share link, each one is automatically sorted into
+   auto-approved or needs-review before you ever look at it. These rules
+   are never shown to the client.
+7. **Draft by email.** Each account gets one drafting email address (see
+   "Email drafting" below). Send or forward a request to it with the
+   document name in the subject line, and a draft is generated
+   automatically, saved to your library, and emailed back to you.
+
+Each account has its own master documents and drafted documents. Plans
+(starter, pro, unlimited) cap how many contracts can be drafted per month.
+There is no real payment processor wired up yet, an account's plan can be
+changed from the account menu for testing, and upgrading it does not charge
+a card.
+
+## Project layout
+
+```
+app/
+  main.py            FastAPI app: auth, master documents, marking, drafting, library, plans,
+                      redlining/sharing, email drafting
+  docx_engine.py      Core .docx manipulation (render, split runs, fill tokens)
+  redline_engine.py   Auto-approval evaluation for client-proposed field edits
+  email_engine.py     Drafting-alias parsing, outbound mail (SendGrid), AI field extraction (Anthropic)
+  models.py           Database tables (User, Template, Placeholder, GeneratedContract,
+                      ShareLink, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest)
+  auth.py             Password hashing and session-based auth
+  db.py               SQLite engine/session setup
+  static/
+    app.js, styles.css, index.html   Main app (accounts, editor, draft, library, redline review)
+    share.html, share.js             Standalone client redlining page (no account, /share/{token})
+tests/
+  test_docx_engine.py     Unit tests for the docx engine
+  test_redline_engine.py  Unit tests for redline auto-approval evaluation
+  test_email_engine.py    Unit tests for alias parsing/generation and template matching
+render.yaml       Render Blueprint (see Deploying below)
+requirements.txt
+```
+
+## Running it locally
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+Then open http://localhost:8000, create an account, and upload a `.docx`
+file.
+
+The first run creates `app/data.db` (SQLite) and `app/secret.key` (session
+signing key) automatically. Uploaded master documents and drafted contracts
+are stored under `app/uploads/<user_id>/<template_id>/`.
+
+## Running the tests
+
+```bash
+source venv/bin/activate
+pip install pytest
+pytest tests/
+```
+
+Several browser end-to-end tests (register, upload, mark placeholders,
+draft, archive, delete, switch plans, reuse an existing field, set a
+redline rule and walk a full share → verify → propose → review → apply
+cycle) were written with Playwright and run during development. They are
+not included here to keep the deliverable small, but the three files under
+`tests/` cover the engine logic underneath all of it, which is the part
+most worth guarding with automated tests.
+
+## Deploying
+
+This build was put together overnight in a sandboxed environment that can
+reach GitHub for git operations but cannot reach hosting provider APIs
+(Render, Vercel, Railway, and similar were all unreachable). So the code is
+committed locally and ready to push, but it has not been pushed or deployed
+anywhere yet. Two steps get it live:
+
+1. **Create an empty GitHub repository** (no README, no `.gitignore`, no
+   license, so the first push is clean), then push this code to it:
+   ```bash
+   git remote add origin https://github.com/<you>/<repo>.git
+   git push -u origin main
+   ```
+2. **Deploy on Render** (or any host that runs a Python web process): go to
+   Render's dashboard, choose New, then Blueprint, and point it at the repo.
+   `render.yaml` in this project tells Render exactly how to build and run
+   it, including generating a session secret automatically, so this step
+   does not require filling in any fields by hand. If you would rather use
+   a different host, the equivalent manual settings are:
+   - Build command: `pip install -r requirements.txt`
+   - Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+   - Environment variable: `SESSION_SECRET_KEY` set to any random string
+
+**A note on the free tier:** most hosts' free web service tiers do not
+include persistent disk storage, so the SQLite database and uploaded files
+will reset on redeploys and sometimes on restarts after inactivity. That is
+fine for trying the app out, but before real users rely on it, either
+attach a persistent disk (a paid tier on most hosts) or move the database to
+a hosted Postgres instance (the SQLModel models will work unchanged, only
+`db.py`'s connection string needs to change).
+
+## Setting up email drafting
+
+Redlining and sharing work out of the box, nothing to configure. Email
+drafting needs a few external accounts, since receiving and sending real
+mail isn't something this app can do by itself. None of this is required
+to use the rest of the app; until it's configured, the app still assigns
+every account a drafting address, it just won't do anything yet.
+
+1. **Get a SendGrid account** (or Postmark/Mailgun, adjust `email_engine.py`
+   accordingly if so). You'll use it for both directions: SendGrid's
+   **Inbound Parse** to receive drafting emails, and its **Mail Send API**
+   to send the "still need a few things" and "your draft is ready" emails.
+2. **Verify the `rotely.ai` domain** in SendGrid's sender authentication
+   settings (adds a few DNS records) so outbound mail doesn't get flagged
+   as spam.
+3. **Point a subdomain's MX record at SendGrid's Inbound Parse**, something
+   like `parse.rotely.ai`, not the whole domain, since `rotely.ai` itself
+   should keep receiving normal mail in your Gmail. In SendGrid, add an
+   Inbound Parse route for that subdomain pointing at:
+   `https://<your-render-url>/api/email/inbound/<INBOUND_WEBHOOK_SECRET>`
+   (parsed fields, not raw MIME).
+4. **Add a Gmail filter** on the mailbox that actually receives
+   `@rotely.ai` mail: match `to: (drafts+*@rotely.ai)`, action "Forward to"
+   `intake@parse.rotely.ai` (you'll need to verify that forwarding address
+   in Gmail once, SendGrid will show you the confirmation code/link it
+   receives).
+5. **Get an Anthropic API key** for the agent that reads each email and
+   extracts field values.
+6. **Set these environment variables** on Render (or wherever it's
+   deployed):
+   - `SENDGRID_API_KEY`
+   - `SENDGRID_FROM_EMAIL` (e.g. `drafts@rotely.ai`)
+   - `ANTHROPIC_API_KEY`
+   - `INBOUND_WEBHOOK_SECRET` (any long random string, used to keep the
+     inbound webhook URL from being guessable, put the same value in the
+     SendGrid Inbound Parse URL from step 3)
+   - `EMAIL_DOMAIN` (defaults to `rotely.ai`)
+
+Once those are set, every account's drafting address (shown in the account
+menu) works end to end: send a request, get asked for anything missing,
+reply, and the finished draft lands in the portal and in your inbox.
+
+## What is built and what is not
+
+**Built and working:** accounts, master documents with a name and document
+type, click-to-mark placeholder editing that preserves formatting, the
+draft flow (pick a template, fill in a popup, get a live preview and a
+`.docx` download), the documents library grouped by type with archive and
+permanent delete, real usage limits tied to a plan, per-field redline
+auto-approval rules, share-for-review links with a passcode gate, the
+client-facing redline page, the owner-side review/accept/reject/apply
+flow, and the full email-drafting pipeline (alias, inbound webhook,
+AI field extraction, missing-info reply loop, ready notification with the
+file attached).
+
+**Not built yet, on purpose:**
+- **Real billing.** Plans can be switched from the account menu for testing
+  the limits, but no payment processor is connected, so nothing is actually
+  charged.
+- **Slack drafting.** Explicitly deferred, redlining and email drafting
+  came first. Needs a registered Slack app (OAuth scopes, event
+  subscriptions or a slash command) before any of the backend logic for it
+  is worth writing.
+- **Full document-wide redlining.** Clients can propose new values for any
+  field you originally marked as a placeholder, not freeform track-changes
+  across the whole document. That's a much bigger feature (a real diffing
+  and merge model) and marked fields cover the actual negotiation surface
+  of most contracts (dollar amounts, dates, terms, governing law) without
+  it.
+- **A UI for in-flight email requests.** `EmailDraftRequest` rows exist and
+  drive the reply-and-wait loop correctly, but there's no screen yet
+  listing "awaiting more info" requests, someone re-reads their own email
+  thread to see the state today.
+- **In-document editing.** "Manually edit" currently means reopening the
+  fill-in popup with your previous answers and changing them, which creates
+  a new saved draft. Freeform editing of the generated document's text
+  inside the browser is a bigger feature on its own and was deliberately
+  left out of this build.
+
+## Known limitations (v1)
+
+- **Headers and footers.** These live in separate document parts and are
+  not rendered or markable yet. Body content and table content (including
+  signature blocks, which are commonly built as tables) are both fully
+  supported.
+- **One paragraph per placeholder.** A selection cannot span two
+  paragraphs (or a paragraph and a table cell), the editor will ask you to
+  select within a single paragraph.
+- **Merged table cells** render as a single cell without recomputing
+  colspan/rowspan, so a merged region may look slightly narrower/shorter in
+  the marking view than it does in Word. The content itself is still fully
+  present and markable.
+- **No PDF export.** Output is always `.docx`.
+- **Removing a placeholder** replaces its token with the label text rather
+  than perfectly restoring the original wording. Use "Start over" on a
+  master document to fully revert to the original upload.
+- **Email template matching is subject-line only.** The inbound agent
+  matches a master document by name/type appearing in the subject line; it
+  won't infer the right template purely from body content. If two
+  templates have very similar names, the longer/more specific name wins.
+- **The share-link access code isn't rate-limited.** It's an 8-character
+  random code (huge guess space), but there's currently no lockout after
+  repeated wrong attempts. Worth adding before this handles anything truly
+  sensitive at scale.
+
+## Ideas for v2
+
+- Header/footer support in the renderer and marker.
+- Team or organization sharing of master documents.
+- PDF export alongside `.docx`.
+- Real in-document editing (or a Google Docs handoff for editing only, kept
+  separate from the primary `.docx` delivery).
+- Slack drafting once a Slack app is registered.
+- A dashboard/list view for in-flight email drafting requests.
+- Rate-limiting on the share-link access code.
+- Real billing.

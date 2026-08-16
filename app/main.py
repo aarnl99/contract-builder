@@ -1,0 +1,1517 @@
+import os
+import re
+import json
+import shutil
+import secrets
+import string
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+from sqlmodel import Session, select
+from pydantic import BaseModel
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
+from .db import init_db, get_session, UPLOADS_DIR
+from .models import (
+    User, Template, Placeholder, GeneratedContract, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
+    ShareLink, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest,
+)
+from .auth import hash_password, verify_password, get_current_user, get_optional_user
+from . import docx_engine as de
+from . import redline_engine as rl
+from . import email_engine as ee
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SECRET_KEY_PATH = os.path.join(BASE_DIR, "secret.key")
+
+
+def _load_or_create_secret() -> str:
+    # In production, set SESSION_SECRET_KEY as an environment variable so all
+    # processes share it and sessions survive redeploys. Falls back to a
+    # file on disk for local development.
+    env_key = os.environ.get("SESSION_SECRET_KEY")
+    if env_key:
+        return env_key
+    if os.path.exists(SECRET_KEY_PATH):
+        return open(SECRET_KEY_PATH).read().strip()
+    key = secrets.token_hex(32)
+    with open(SECRET_KEY_PATH, "w") as f:
+        f.write(key)
+    return key
+
+
+SECRET_KEY = _load_or_create_secret()
+INBOUND_WEBHOOK_SECRET = os.environ.get("INBOUND_WEBHOOK_SECRET", "")
+
+app = FastAPI(title="Rotely")
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
+
+# Short-lived signed tokens proving a share-link visitor entered the right
+# access code. Not stored server-side -- just a signed, timestamped blob the
+# browser holds for the rest of that visit. max_age enforces "you re-enter
+# the code on your next visit" without needing a database row per session.
+SHARE_SESSION_MAX_AGE = 2 * 60 * 60  # 2 hours
+_share_serializer = URLSafeTimedSerializer(SECRET_KEY, salt="share-session")
+
+
+def _issue_share_session(share_link_id: int) -> str:
+    return _share_serializer.dumps({"share_link_id": share_link_id})
+
+
+def _verify_share_session(token: str, share_link_id: int) -> bool:
+    try:
+        data = _share_serializer.loads(token, max_age=SHARE_SESSION_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return False
+    return data.get("share_link_id") == share_link_id
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
+class RegisterBody(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+
+
+class LoginBody(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/register")
+def register(body: RegisterBody, request: Request, session: Session = Depends(get_session)):
+    email = body.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Please provide a valid email address")
+    if len(body.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    existing = session.exec(select(User).where(User.email == email)).first()
+    if existing:
+        raise HTTPException(400, "An account with that email already exists")
+    user = User(email=email, password_hash=hash_password(body.password), name=body.name.strip())
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    request.session["user_id"] = user.id
+    return {"id": user.id, "email": user.email, "name": user.name}
+
+
+@app.post("/api/login")
+def login(body: LoginBody, request: Request, session: Session = Depends(get_session)):
+    email = body.email.strip().lower()
+    user = session.exec(select(User).where(User.email == email)).first()
+    if not user or not verify_password(body.password, user.password_hash):
+        raise HTTPException(401, "Invalid email or password")
+    request.session["user_id"] = user.id
+    return {"id": user.id, "email": user.email, "name": user.name}
+
+
+@app.post("/api/logout")
+def logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
+
+
+def _month_start() -> datetime:
+    now = datetime.utcnow()
+    return datetime(now.year, now.month, 1)
+
+
+def _usage_this_month(session: Session, user_id: int) -> int:
+    rows = session.exec(
+        select(GeneratedContract).where(
+            GeneratedContract.owner_id == user_id,
+            GeneratedContract.created_at >= _month_start(),
+        )
+    ).all()
+    return len(rows)
+
+
+def _plan_info(session: Session, user: User) -> dict:
+    limit = PLAN_LIMITS.get(user.plan, PLAN_LIMITS[DEFAULT_PLAN])
+    used = _usage_this_month(session, user.id)
+    return {
+        "plan": user.plan,
+        "limit": limit,
+        "used": used,
+        "remaining": None if limit is None else max(0, limit - used),
+    }
+
+
+@app.get("/api/me")
+def me(user: Optional[User] = Depends(get_optional_user), session: Session = Depends(get_session)):
+    if not user:
+        return {"user": None}
+    return {
+        "user": {"id": user.id, "email": user.email, "name": user.name},
+        "plan": _plan_info(session, user),
+    }
+
+
+class PlanBody(BaseModel):
+    plan: str
+
+
+@app.post("/api/account/plan")
+def set_plan(body: PlanBody, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    if body.plan not in PLAN_LIMITS:
+        raise HTTPException(400, f"Unknown plan. Choose one of: {', '.join(PLAN_LIMITS)}")
+    user.plan = body.plan
+    session.add(user)
+    session.commit()
+    return {"plan": _plan_info(session, user)}
+
+
+# ---------------------------------------------------------------------------
+# Template endpoints
+# ---------------------------------------------------------------------------
+
+def _template_dir(user_id: int, template_id: int) -> str:
+    return os.path.join(UPLOADS_DIR, str(user_id), str(template_id))
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", text.strip().lower()).strip("_")
+    if not slug:
+        slug = "field"
+    if slug[0].isdigit():
+        slug = f"f_{slug}"
+    return slug
+
+
+def _unique_field_key(session: Session, template_id: int, base: str) -> str:
+    existing_keys = {
+        p.field_key
+        for p in session.exec(select(Placeholder).where(Placeholder.template_id == template_id)).all()
+    }
+    if base not in existing_keys:
+        return base
+    n = 2
+    while f"{base}_{n}" in existing_keys:
+        n += 1
+    return f"{base}_{n}"
+
+
+def _get_owned_template(session: Session, user: User, template_id: int) -> Template:
+    tpl = session.get(Template, template_id)
+    if not tpl or tpl.owner_id != user.id:
+        raise HTTPException(404, "Template not found")
+    return tpl
+
+
+@app.get("/api/document-types")
+def get_document_types():
+    return {"types": DOCUMENT_TYPES}
+
+
+@app.post("/api/templates")
+def upload_template(
+    name: str = Form(...),
+    document_type: str = Form("Other"),
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    if not file.filename.lower().endswith(".docx"):
+        raise HTTPException(400, "Please upload a .docx file (Word format).")
+
+    tpl = Template(
+        owner_id=user.id,
+        name=name.strip() or file.filename,
+        document_type=(document_type.strip() or "Other"),
+        original_filename=file.filename,
+        working_path="",
+    )
+    session.add(tpl)
+    session.commit()
+    session.refresh(tpl)
+
+    tpl_dir = _template_dir(user.id, tpl.id)
+    os.makedirs(tpl_dir, exist_ok=True)
+    original_path = os.path.join(tpl_dir, "original.docx")
+    working_path = os.path.join(tpl_dir, "working.docx")
+    with open(original_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    shutil.copyfile(original_path, working_path)
+
+    # Validate it actually opens as a docx
+    try:
+        de.load(working_path)
+    except Exception:
+        shutil.rmtree(tpl_dir, ignore_errors=True)
+        session.delete(tpl)
+        session.commit()
+        raise HTTPException(400, "That file couldn't be read as a Word (.docx) document.")
+
+    tpl.working_path = working_path
+    session.add(tpl)
+    session.commit()
+    session.refresh(tpl)
+    return {"id": tpl.id, "name": tpl.name}
+
+
+class UpdateTemplateBody(BaseModel):
+    name: Optional[str] = None
+    document_type: Optional[str] = None
+
+
+@app.patch("/api/templates/{template_id}")
+def update_template(
+    template_id: int,
+    body: UpdateTemplateBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    tpl = _get_owned_template(session, user, template_id)
+    if body.name is not None and body.name.strip():
+        tpl.name = body.name.strip()
+    if body.document_type is not None and body.document_type.strip():
+        tpl.document_type = body.document_type.strip()
+    tpl.updated_at = datetime.utcnow()
+    session.add(tpl)
+    session.commit()
+    return {"id": tpl.id, "name": tpl.name, "document_type": tpl.document_type}
+
+
+def _generated_count(session: Session, template_id: int) -> int:
+    rows = session.exec(select(GeneratedContract).where(GeneratedContract.template_id == template_id)).all()
+    return len(rows)
+
+
+@app.get("/api/templates")
+def list_templates(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    tpls = session.exec(select(Template).where(Template.owner_id == user.id).order_by(Template.created_at.desc())).all()
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "document_type": t.document_type,
+            "created_at": t.created_at.isoformat(),
+            "placeholder_count": len(t.placeholders),
+            "status": "ready" if len(t.placeholders) > 0 else "draft",
+            "generated_count": _generated_count(session, t.id),
+        }
+        for t in tpls
+    ]
+
+
+@app.get("/api/templates/{template_id}")
+def get_template(template_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    tpl = _get_owned_template(session, user, template_id)
+    return {
+        "id": tpl.id,
+        "name": tpl.name,
+        "document_type": tpl.document_type,
+        "original_filename": tpl.original_filename,
+        "status": "ready" if len(tpl.placeholders) > 0 else "draft",
+        "generated_count": _generated_count(session, tpl.id),
+        "placeholders": [
+            {
+                "id": p.id, "field_key": p.field_key, "label": p.label, "field_type": p.field_type,
+                "required": p.required, "order": p.order,
+                "threshold_type": p.threshold_type, "threshold_config": json.loads(p.threshold_config or "{}"),
+                "preset_options": json.loads(p.preset_options_json or "[]"),
+            }
+            for p in tpl.placeholders
+        ],
+    }
+
+
+@app.get("/api/templates/{template_id}/html")
+def get_template_html(template_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    tpl = _get_owned_template(session, user, template_id)
+    doc = de.load(tpl.working_path)
+    return {"html": de.render_paragraphs_html(doc)}
+
+
+class MarkSegment(BaseModel):
+    r: int
+    start: int
+    end: int
+
+
+class PresetOption(BaseModel):
+    name: str
+    text: str
+
+
+class MarkBody(BaseModel):
+    paragraph_index: int
+    segments: list[MarkSegment]
+    label: str = ""
+    field_type: str = "text"
+    required: bool = True
+    table_path: str = ""
+    existing_field_key: str = ""
+    # Only used when field_type == "clause_preset" -- the named whole-clause
+    # variants to offer on the draft form for this field.
+    preset_options: list[PresetOption] = []
+
+
+def _parse_table_path(path_str: str) -> list[list[int]]:
+    """Parse the "t,r,c;t,r,c" container path string sent by the browser
+    (see docx_engine module docstring) back into [[t, r, c], ...]. Empty
+    string means the top-level document body."""
+    if not path_str:
+        return []
+    try:
+        return [[int(x) for x in step.split(",")] for step in path_str.split(";") if step]
+    except ValueError:
+        raise HTTPException(400, "Invalid table path")
+
+
+@app.post("/api/templates/{template_id}/mark")
+def mark_placeholder(
+    template_id: int,
+    body: MarkBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    tpl = _get_owned_template(session, user, template_id)
+    if not body.segments:
+        raise HTTPException(400, "No text was selected.")
+
+    reuse_key = body.existing_field_key.strip()
+    existing_placeholder = None
+    if reuse_key:
+        existing_placeholder = next((p for p in tpl.placeholders if p.field_key == reuse_key), None)
+        if existing_placeholder is None:
+            raise HTTPException(400, "That field no longer exists on this document.")
+        field_key = existing_placeholder.field_key
+    else:
+        label = body.label.strip()
+        if not label:
+            raise HTTPException(400, "Please provide a label for this field.")
+        field_key = _unique_field_key(session, tpl.id, _slugify(label))
+
+    container_path = _parse_table_path(body.table_path)
+
+    doc = de.load(tpl.working_path)
+    try:
+        de.mark_placeholder(
+            doc, body.paragraph_index, [s.dict() for s in body.segments], field_key,
+            container_path=container_path,
+        )
+    except de.MarkError as e:
+        raise HTTPException(400, str(e))
+    de.save(doc, tpl.working_path)
+
+    if existing_placeholder is not None:
+        # Reusing an existing field: same placeholder now appears in one
+        # more spot in the document, but it's still one field -- filling
+        # it once fills every location it was marked in. No new row.
+        placeholder = existing_placeholder
+    else:
+        max_order = max([p.order for p in tpl.placeholders], default=-1)
+        preset_options_json = "[]"
+        if body.field_type == "clause_preset" and body.preset_options:
+            preset_options_json = json.dumps([o.dict() for o in body.preset_options])
+        placeholder = Placeholder(
+            template_id=tpl.id,
+            field_key=field_key,
+            label=label,
+            field_type=body.field_type,
+            required=body.required,
+            order=max_order + 1,
+            preset_options_json=preset_options_json,
+        )
+        session.add(placeholder)
+        session.commit()
+        session.refresh(placeholder)
+
+    doc2 = de.load(tpl.working_path)
+    return {
+        "placeholder": {
+            "id": placeholder.id, "field_key": placeholder.field_key, "label": placeholder.label,
+            "field_type": placeholder.field_type, "required": placeholder.required,
+            "preset_options": json.loads(placeholder.preset_options_json or "[]"),
+        },
+        "html": de.render_paragraphs_html(doc2),
+    }
+
+
+class PresetOptionsBody(BaseModel):
+    preset_options: list[PresetOption]
+
+
+@app.patch("/api/templates/{template_id}/placeholders/{placeholder_id}/presets")
+def set_placeholder_presets(
+    template_id: int,
+    placeholder_id: int,
+    body: PresetOptionsBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Add/edit the named clause variants for a clause_preset field after
+    it's been marked (e.g. adding a new state's version later)."""
+    tpl = _get_owned_template(session, user, template_id)
+    ph = session.get(Placeholder, placeholder_id)
+    if not ph or ph.template_id != tpl.id:
+        raise HTTPException(404, "Field not found")
+    if ph.field_type != "clause_preset":
+        raise HTTPException(400, "This field isn't a clause preset field.")
+    ph.preset_options_json = json.dumps([o.dict() for o in body.preset_options])
+    session.add(ph)
+    session.commit()
+    return {"preset_options": json.loads(ph.preset_options_json)}
+
+
+class ThresholdBody(BaseModel):
+    threshold_type: str
+    threshold_config: dict = {}
+
+
+@app.patch("/api/templates/{template_id}/placeholders/{placeholder_id}/threshold")
+def set_placeholder_threshold(
+    template_id: int,
+    placeholder_id: int,
+    body: ThresholdBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Set the redline auto-approval rule for a field -- see redline_engine
+    for what each threshold_type means. This rule is never shown to the
+    client on the share page, only used server-side to sort their proposed
+    edits into "auto-approved" vs "needs review"."""
+    tpl = _get_owned_template(session, user, template_id)
+    ph = session.get(Placeholder, placeholder_id)
+    if not ph or ph.template_id != tpl.id:
+        raise HTTPException(404, "Placeholder not found")
+    try:
+        normalized = rl.validate_threshold_config(body.threshold_type, body.threshold_config)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    ph.threshold_type = body.threshold_type
+    ph.threshold_config = json.dumps(normalized)
+    session.add(ph)
+    session.commit()
+    return {"id": ph.id, "threshold_type": ph.threshold_type, "threshold_config": normalized}
+
+
+@app.delete("/api/templates/{template_id}/placeholders/{placeholder_id}")
+def delete_placeholder(
+    template_id: int,
+    placeholder_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    tpl = _get_owned_template(session, user, template_id)
+    ph = session.get(Placeholder, placeholder_id)
+    if not ph or ph.template_id != tpl.id:
+        raise HTTPException(404, "Placeholder not found")
+
+    doc = de.load(tpl.working_path)
+    de.fill_template(doc, {ph.field_key: ph.label})
+    de.save(doc, tpl.working_path)
+
+    session.delete(ph)
+    session.commit()
+
+    doc2 = de.load(tpl.working_path)
+    return {"html": de.render_paragraphs_html(doc2)}
+
+
+@app.post("/api/templates/{template_id}/reset")
+def reset_template(template_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    tpl = _get_owned_template(session, user, template_id)
+    original_path = os.path.join(_template_dir(user.id, tpl.id), "original.docx")
+    shutil.copyfile(original_path, tpl.working_path)
+    for ph in list(tpl.placeholders):
+        session.delete(ph)
+    session.commit()
+    doc = de.load(tpl.working_path)
+    return {"html": de.render_paragraphs_html(doc)}
+
+
+@app.delete("/api/templates/{template_id}")
+def delete_template(template_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    tpl = _get_owned_template(session, user, template_id)
+    shutil.rmtree(_template_dir(user.id, tpl.id), ignore_errors=True)
+    for ph in list(tpl.placeholders):
+        session.delete(ph)
+    session.delete(tpl)
+    session.commit()
+    return {"ok": True}
+
+
+class GenerateBody(BaseModel):
+    values: dict[str, str]
+    parties: list[str] = []  # who this contract is between, e.g. ["Rotely AI", "Swift Enterprises"]
+
+
+@app.post("/api/templates/{template_id}/generate")
+def generate_contract(
+    template_id: int,
+    body: GenerateBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    tpl = _get_owned_template(session, user, template_id)
+
+    if not tpl.placeholders:
+        raise HTTPException(400, "This template has no placeholders yet. Mark some fields before drafting from it.")
+
+    plan = _plan_info(session, user)
+    if plan["limit"] is not None and plan["used"] >= plan["limit"]:
+        raise HTTPException(
+            402,
+            f"You have used all {plan['limit']} contracts included in your {user.plan} plan this month. "
+            f"Upgrade your plan to draft more.",
+        )
+
+    missing = [p.label for p in tpl.placeholders if p.required and not (body.values.get(p.field_key) or "").strip()]
+    if missing:
+        raise HTTPException(400, f"Missing required fields: {', '.join(missing)}")
+
+    doc = de.load(tpl.working_path)
+    field_positions = de.fill_template_tracked(doc, body.values)
+
+    gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
+    os.makedirs(gen_dir, exist_ok=True)
+    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
+    de.save(doc, out_path)
+
+    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
+    display_name = f"{safe_name} - {datetime.utcnow().strftime('%b %d, %Y')}"
+
+    values_snapshot = [
+        {"label": p.label, "field_key": p.field_key, "value": body.values.get(p.field_key, "")}
+        for p in tpl.placeholders
+    ]
+    parties = [p.strip() for p in body.parties if p.strip()][:6]
+    gc = GeneratedContract(
+        owner_id=user.id,
+        template_id=tpl.id,
+        template_name=tpl.name,
+        document_type=tpl.document_type,
+        name=display_name,
+        file_path=out_path,
+        values_json=json.dumps(values_snapshot),
+        field_positions_json=json.dumps(field_positions),
+        parties_json=json.dumps(parties),
+    )
+    session.add(gc)
+    session.commit()
+    session.refresh(gc)
+
+    preview_doc = de.load(out_path)
+    return {
+        "generated_id": gc.id,
+        "name": gc.name,
+        "document_type": gc.document_type,
+        "html": de.render_paragraphs_html(preview_doc),
+        "plan": _plan_info(session, user),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Generated contract library (archive, delete forever, download, re-view)
+# ---------------------------------------------------------------------------
+
+def _get_owned_generated(session: Session, user: User, generated_id: int) -> GeneratedContract:
+    gc = session.get(GeneratedContract, generated_id)
+    if not gc or gc.owner_id != user.id:
+        raise HTTPException(404, "Document not found")
+    return gc
+
+
+@app.get("/api/generated")
+def list_generated(
+    archived: Optional[bool] = None,
+    template_id: Optional[int] = None,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    q = select(GeneratedContract).where(GeneratedContract.owner_id == user.id)
+    if archived is not None:
+        q = q.where(GeneratedContract.archived == archived)
+    if template_id is not None:
+        q = q.where(GeneratedContract.template_id == template_id)
+    rows = session.exec(q.order_by(GeneratedContract.created_at.desc())).all()
+    return [
+        {
+            "id": g.id,
+            "name": g.name,
+            "template_id": g.template_id,
+            "template_name": g.template_name,
+            "document_type": g.document_type,
+            "archived": g.archived,
+            "created_at": g.created_at.isoformat(),
+            "values": json.loads(g.values_json),
+        }
+        for g in rows
+    ]
+
+
+@app.get("/api/generated/{generated_id}")
+def get_generated(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    gc = _get_owned_generated(session, user, generated_id)
+    html = None
+    if os.path.exists(gc.file_path):
+        html = de.render_paragraphs_html(de.load(gc.file_path))
+    return {
+        "id": gc.id,
+        "name": gc.name,
+        "template_id": gc.template_id,
+        "template_name": gc.template_name,
+        "document_type": gc.document_type,
+        "archived": gc.archived,
+        "created_at": gc.created_at.isoformat(),
+        "values": json.loads(gc.values_json),
+        "html": html,
+    }
+
+
+@app.get("/api/generated/{generated_id}/download")
+def download_generated(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    gc = _get_owned_generated(session, user, generated_id)
+    if not os.path.exists(gc.file_path):
+        raise HTTPException(410, "This file is no longer available.")
+    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", gc.name).strip() or "contract"
+    return FileResponse(
+        gc.file_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=f"{safe_name}.docx",
+    )
+
+
+class ArchiveBody(BaseModel):
+    archived: bool
+
+
+@app.post("/api/generated/{generated_id}/archive")
+def set_archived(
+    generated_id: int,
+    body: ArchiveBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    gc = _get_owned_generated(session, user, generated_id)
+    gc.archived = body.archived
+    session.add(gc)
+    session.commit()
+    return {"id": gc.id, "archived": gc.archived}
+
+
+@app.delete("/api/generated/{generated_id}")
+def delete_generated_forever(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    gc = _get_owned_generated(session, user, generated_id)
+    if gc.file_path and os.path.exists(gc.file_path):
+        try:
+            os.remove(gc.file_path)
+        except OSError:
+            pass
+    session.delete(gc)
+    session.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Redlining: share a generated contract for client review
+# ---------------------------------------------------------------------------
+
+def _share_link_payload(link: ShareLink) -> dict:
+    return {
+        "token": link.token,
+        "access_code": link.access_code,
+        "client_email": link.client_email,
+        "url": f"/share/{link.token}",
+        "status": link.status,
+        "created_at": link.created_at.isoformat(),
+        "last_viewed_at": link.last_viewed_at.isoformat() if link.last_viewed_at else None,
+    }
+
+
+def _generate_access_code() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+class CreateShareBody(BaseModel):
+    client_email: str = ""  # optional -- shown to the client as "Editing as"
+
+
+@app.post("/api/generated/{generated_id}/share")
+def create_share_link(
+    generated_id: int,
+    body: CreateShareBody = CreateShareBody(),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Returns the account's existing open share link for this document if
+    there is one, otherwise creates a new one with a fresh access code."""
+    gc = _get_owned_generated(session, user, generated_id)
+    client_email = body.client_email.strip()[:200]
+    existing = session.exec(
+        select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
+    ).first()
+    if existing:
+        if client_email and client_email != existing.client_email:
+            existing.client_email = client_email
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
+        return _share_link_payload(existing)
+    link = ShareLink(
+        generated_contract_id=gc.id, token=secrets.token_urlsafe(16), access_code=_generate_access_code(),
+        client_email=client_email,
+    )
+    session.add(link)
+    session.commit()
+    session.refresh(link)
+    return _share_link_payload(link)
+
+
+@app.post("/api/generated/{generated_id}/share/close")
+def close_share_link(
+    generated_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    gc = _get_owned_generated(session, user, generated_id)
+    link = session.exec(
+        select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
+    ).first()
+    if not link:
+        raise HTTPException(404, "No open review link for this document.")
+    link.status = "closed"
+    session.add(link)
+    session.commit()
+    return {"ok": True}
+
+
+@app.get("/api/generated/{generated_id}/redlines")
+def get_redlines(
+    generated_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Owner-side review data: a case-file header identifying the document,
+    the share link (if any), and every submission received through it, each
+    edit tagged with its auto-evaluation, its threshold in plain language,
+    and the owner's decision so far."""
+    gc = _get_owned_generated(session, user, generated_id)
+    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    ph_by_key = {p.field_key: p for p in tpl.placeholders} if tpl else {}
+    parties = json.loads(gc.parties_json or "[]")
+
+    link = session.exec(
+        select(ShareLink).where(ShareLink.generated_contract_id == gc.id).order_by(ShareLink.created_at.desc())
+    ).first()
+
+    header = {
+        "name": gc.name,
+        "document_type": gc.document_type,
+        "created_at": gc.created_at.isoformat(),
+        "parties": parties,
+        # The party the owner is negotiating with -- best guess is the
+        # second party entered at draft time (Party B), falling back to
+        # whatever email the share link is addressed to.
+        "client": (parties[1] if len(parties) > 1 else (link.client_email if link else "")) or "",
+    }
+
+    if not link:
+        return {"header": header, "share": None, "submissions": []}
+
+    # "draft" submissions are just the client's in-progress "Save progress"
+    # state -- not a real submission yet, so the owner never sees them here.
+    submissions = session.exec(
+        select(RedlineSubmission)
+        .where(RedlineSubmission.share_link_id == link.id, RedlineSubmission.status != "draft")
+        .order_by(RedlineSubmission.submitted_at.desc())
+    ).all()
+    out = []
+    for s in submissions:
+        edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all()
+        edit_rows = []
+        for e in edits:
+            ph = ph_by_key.get(e.field_key)
+            threshold_desc = rl.describe_threshold(ph.threshold_type, ph.threshold_config) if ph else None
+            inside_threshold = None  # None = no rule to compare against (none/locked or field since removed)
+            if ph and ph.threshold_type in ("numeric_range", "approved_list"):
+                inside_threshold = e.evaluation == "auto_approved"
+            edit_rows.append({
+                "id": e.id, "field_key": e.field_key, "label": e.label,
+                "original_value": e.original_value, "proposed_value": e.proposed_value,
+                "comment": e.comment,
+                "evaluation": e.evaluation, "decision": e.decision, "counter_value": e.counter_value,
+                "threshold_desc": threshold_desc, "inside_threshold": inside_threshold,
+            })
+        out.append({
+            "id": s.id,
+            "note": s.note,
+            "submitted_at": s.submitted_at.isoformat(),
+            "status": s.status,
+            "responded_at": s.responded_at.isoformat() if s.responded_at else None,
+            "edits": edit_rows,
+        })
+    return {"header": header, "share": _share_link_payload(link), "submissions": out}
+
+
+class DecisionBody(BaseModel):
+    decision: str  # accepted | rejected
+
+
+@app.post("/api/redline-edits/{edit_id}/decision")
+def decide_redline_edit(
+    edit_id: int,
+    body: DecisionBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    if body.decision not in ("accepted", "rejected"):
+        raise HTTPException(400, "decision must be 'accepted' or 'rejected'")
+    edit = session.get(RedlineEdit, edit_id)
+    if not edit:
+        raise HTTPException(404, "Edit not found")
+    submission = session.get(RedlineSubmission, edit.submission_id)
+    link = session.get(ShareLink, submission.share_link_id) if submission else None
+    gc = session.get(GeneratedContract, link.generated_contract_id) if link else None
+    if not gc or gc.owner_id != user.id:
+        raise HTTPException(404, "Edit not found")
+    edit.decision = body.decision
+    session.add(edit)
+    session.commit()
+    return {"id": edit.id, "decision": edit.decision}
+
+
+class RedlineDecisionItem(BaseModel):
+    edit_id: int
+    decision: str  # accepted | rejected | countered
+    counter_value: str = ""
+
+
+class RespondBody(BaseModel):
+    decisions: list[RedlineDecisionItem]
+
+
+@app.post("/api/redline-submissions/{submission_id}/respond")
+def respond_to_submission(
+    submission_id: int,
+    body: RespondBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Batches the owner's accept/reject/counter calls for a whole
+    submission into one response, sent back to the client as a single next
+    round instead of one ping per edit."""
+    submission = session.get(RedlineSubmission, submission_id)
+    if not submission:
+        raise HTTPException(404, "Submission not found")
+    link = session.get(ShareLink, submission.share_link_id)
+    gc = session.get(GeneratedContract, link.generated_contract_id) if link else None
+    if not gc or gc.owner_id != user.id:
+        raise HTTPException(404, "Submission not found")
+
+    edits_by_id = {e.id: e for e in session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == submission.id)).all()}
+    if not body.decisions:
+        raise HTTPException(400, "Decide on at least one redline before sending a response.")
+
+    for item in body.decisions:
+        if item.decision not in ("accepted", "rejected", "countered"):
+            raise HTTPException(400, "decision must be 'accepted', 'rejected', or 'countered'")
+        edit = edits_by_id.get(item.edit_id)
+        if not edit:
+            raise HTTPException(400, "One of those redlines no longer exists.")
+        if item.decision == "countered" and not item.counter_value.strip():
+            raise HTTPException(400, f"Enter a counter value for \"{edit.label}\" or choose accept/reject instead.")
+        edit.decision = item.decision
+        edit.counter_value = item.counter_value.strip() if item.decision == "countered" else ""
+        session.add(edit)
+
+    submission.responded_at = datetime.utcnow()
+    submission.client_ack_at = None  # a new response always needs a fresh look from the client
+    session.add(submission)
+    session.commit()
+    return {"id": submission.id, "responded_at": submission.responded_at.isoformat()}
+
+
+@app.post("/api/redline-submissions/{submission_id}/apply")
+def apply_redline_submission(
+    submission_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Regenerates the contract with every accepted edit applied (anything
+    explicitly accepted, plus anything auto-approved that the owner hasn't
+    overridden by rejecting it). Produces a new GeneratedContract row, same
+    as a normal draft, so the version history stays intact. Not counted
+    against the monthly plan limit -- this is finishing a document already
+    in progress, not starting a new one."""
+    submission = session.get(RedlineSubmission, submission_id)
+    if not submission:
+        raise HTTPException(404, "Submission not found")
+    link = session.get(ShareLink, submission.share_link_id)
+    gc = session.get(GeneratedContract, link.generated_contract_id) if link else None
+    if not gc or gc.owner_id != user.id:
+        raise HTTPException(404, "Submission not found")
+    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    if not tpl:
+        raise HTTPException(400, "The master document this was drafted from no longer exists.")
+
+    edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == submission.id)).all()
+    to_apply = [e for e in edits if e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved")]
+    if not to_apply:
+        raise HTTPException(400, "No accepted edits to apply yet.")
+
+    base_values = {v["field_key"]: v["value"] for v in json.loads(gc.values_json)}
+    for e in to_apply:
+        base_values[e.field_key] = e.proposed_value
+
+    doc = de.load(tpl.working_path)
+    field_positions = de.fill_template_tracked(doc, base_values)
+    gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
+    os.makedirs(gen_dir, exist_ok=True)
+    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
+    de.save(doc, out_path)
+
+    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
+    display_name = f"{safe_name} (redlined) - {datetime.utcnow().strftime('%b %d, %Y')}"
+    values_snapshot = [{"label": p.label, "field_key": p.field_key, "value": base_values.get(p.field_key, "")} for p in tpl.placeholders]
+    new_gc = GeneratedContract(
+        owner_id=user.id, template_id=tpl.id, template_name=tpl.name, document_type=tpl.document_type,
+        name=display_name, file_path=out_path, values_json=json.dumps(values_snapshot),
+        field_positions_json=json.dumps(field_positions),
+        parties_json=gc.parties_json,  # carry the parties forward from the original draft
+        source_submission_id=submission.id,
+    )
+    session.add(new_gc)
+
+    for e in to_apply:
+        if e.decision == "pending":
+            e.decision = "accepted"
+        session.add(e)
+    submission.status = "reviewed"
+    session.add(submission)
+    session.commit()
+    session.refresh(new_gc)
+
+    preview_doc = de.load(out_path)
+    return {"generated_id": new_gc.id, "name": new_gc.name, "html": de.render_paragraphs_html(preview_doc)}
+
+
+# ---------------------------------------------------------------------------
+# Public share page (no account needed) -- the client's redlining view
+# ---------------------------------------------------------------------------
+
+def _get_share_link_or_404(session: Session, token: str) -> ShareLink:
+    link = session.exec(select(ShareLink).where(ShareLink.token == token)).first()
+    if not link:
+        raise HTTPException(404, "This review link doesn't exist or is no longer active.")
+    return link
+
+
+class ShareVerifyBody(BaseModel):
+    access_code: str
+
+
+@app.post("/api/share/{token}/verify")
+def verify_share_access(token: str, body: ShareVerifyBody, session: Session = Depends(get_session)):
+    link = _get_share_link_or_404(session, token)
+    if link.status != "open":
+        raise HTTPException(410, "This review link has been closed by the sender.")
+    entered = (body.access_code or "").strip().upper()
+    if not entered or not secrets.compare_digest(entered, link.access_code):
+        raise HTTPException(401, "That code doesn't match. Double check with whoever sent you this link.")
+    return {"session_token": _issue_share_session(link.id)}
+
+
+def _require_share_session(request: Request, token: str, session: Session) -> ShareLink:
+    link = _get_share_link_or_404(session, token)
+    if link.status != "open":
+        raise HTTPException(410, "This review link has been closed by the sender.")
+    header = request.headers.get("x-share-session", "")
+    if not header or not _verify_share_session(header, link.id):
+        raise HTTPException(401, "Please enter the access code first.")
+    return link
+
+
+@app.get("/api/share/{token}")
+def get_share_document(token: str, request: Request, session: Session = Depends(get_session)):
+    link = _require_share_session(request, token, session)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    if not gc or not os.path.exists(gc.file_path):
+        raise HTTPException(410, "This document is no longer available.")
+    link.last_viewed_at = datetime.utcnow()
+    session.add(link)
+    session.commit()
+
+    fields = []
+    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    if tpl:
+        values = {v["field_key"]: v["value"] for v in json.loads(gc.values_json)}
+        # Threshold rules are deliberately never sent here -- showing the
+        # client your acceptable range would defeat the entire point.
+        fields = [
+            {"field_key": p.field_key, "label": p.label, "field_type": p.field_type, "current_value": values.get(p.field_key, "")}
+            for p in tpl.placeholders
+        ]
+
+    doc = de.load(gc.file_path)
+    field_positions = json.loads(gc.field_positions_json or "[]")
+    html = de.render_paragraphs_html(doc, field_positions)
+
+    sender = session.get(User, gc.owner_id)
+
+    # If the client saved progress on an earlier visit, hand it back so the
+    # page can resume exactly where they left off instead of starting over.
+    draft = session.exec(
+        select(RedlineSubmission).where(RedlineSubmission.share_link_id == link.id, RedlineSubmission.status == "draft")
+    ).first()
+    draft_payload = None
+    if draft:
+        draft_edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == draft.id)).all()
+        draft_payload = {
+            "note": draft.note,
+            "edits": [{"field_key": e.field_key, "proposed_value": e.proposed_value, "comment": e.comment} for e in draft_edits],
+        }
+
+    # If the owner has sent a batched response (accept/reject/counter) to a
+    # submitted round that the client hasn't seen yet, hand that back too so
+    # the page can show it before returning to normal redlining.
+    responded = session.exec(
+        select(RedlineSubmission)
+        .where(
+            RedlineSubmission.share_link_id == link.id,
+            RedlineSubmission.responded_at != None,  # noqa: E711
+            RedlineSubmission.client_ack_at == None,  # noqa: E711
+        )
+        .order_by(RedlineSubmission.submitted_at.desc())
+    ).first()
+    response_payload = None
+    if responded:
+        responded_edits = session.exec(
+            select(RedlineEdit).where(RedlineEdit.submission_id == responded.id, RedlineEdit.decision != "pending")
+        ).all()
+        response_payload = {
+            "submission_id": responded.id,
+            "responded_at": responded.responded_at.isoformat(),
+            "edits": [
+                {
+                    "field_key": e.field_key, "label": e.label,
+                    "proposed_value": e.proposed_value, "decision": e.decision, "counter_value": e.counter_value,
+                }
+                for e in responded_edits
+            ],
+        }
+
+    return {
+        "name": gc.name,
+        "document_type": gc.document_type,
+        "html": html,
+        "fields": fields,
+        "parties": json.loads(gc.parties_json or "[]"),
+        "client_email": link.client_email,
+        "sender_email": sender.email if sender else "",
+        "draft": draft_payload,
+        "response": response_payload,
+    }
+
+
+class ShareEditBody(BaseModel):
+    field_key: str
+    proposed_value: str
+    comment: str = ""
+
+
+class ShareSubmitBody(BaseModel):
+    edits: list[ShareEditBody]
+    note: str = ""
+
+
+def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[ShareEditBody]):
+    """Shared between save-progress and submit: validates proposed edits
+    against the template's real fields and computes each one's threshold
+    evaluation. Returns a list of kwargs dicts ready for RedlineEdit(...)."""
+    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    placeholders_by_key = {p.field_key: p for p in (tpl.placeholders if tpl else [])}
+    current_values = {v["field_key"]: v["value"] for v in json.loads(gc.values_json)}
+
+    out = []
+    for e in edits_in:
+        ph = placeholders_by_key.get(e.field_key)
+        if not ph:
+            continue  # not a real, editable field on this document -- ignore rather than trust the client
+        proposed = e.proposed_value.strip()
+        if proposed == current_values.get(e.field_key, "").strip():
+            continue  # not actually a change
+        evaluation = rl.evaluate_edit(ph.threshold_type, ph.threshold_config, proposed)
+        out.append(dict(
+            field_key=e.field_key,
+            label=ph.label,
+            original_value=current_values.get(e.field_key, ""),
+            proposed_value=proposed,
+            comment=e.comment.strip()[:1000],
+            evaluation=evaluation,
+        ))
+    return out
+
+
+def _existing_draft(session: Session, share_link_id: int) -> Optional[RedlineSubmission]:
+    return session.exec(
+        select(RedlineSubmission).where(RedlineSubmission.share_link_id == share_link_id, RedlineSubmission.status == "draft")
+    ).first()
+
+
+@app.post("/api/share/{token}/save-progress")
+def save_share_progress(token: str, body: ShareSubmitBody, request: Request, session: Session = Depends(get_session)):
+    """Persists the client's in-progress redlines and comments server-side
+    (not in the browser) so re-entering the access code on a later visit
+    picks up right where they left off. Does not notify the owner and
+    never shows up on their review screen -- only "Finalize and submit"
+    does that."""
+    link = _require_share_session(request, token, session)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    if not gc:
+        raise HTTPException(410, "This document is no longer available.")
+
+    resolved = _resolve_edits(session, gc, body.edits)
+
+    draft = _existing_draft(session, link.id)
+    if draft:
+        for old_edit in session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == draft.id)).all():
+            session.delete(old_edit)
+        draft.note = body.note.strip()[:2000]
+        draft.submitted_at = datetime.utcnow()
+        session.add(draft)
+    else:
+        draft = RedlineSubmission(share_link_id=link.id, note=body.note.strip()[:2000], status="draft")
+        session.add(draft)
+    session.commit()
+    session.refresh(draft)
+
+    for kwargs in resolved:
+        session.add(RedlineEdit(submission_id=draft.id, **kwargs))
+    session.commit()
+    return {"ok": True, "saved_changes": len(resolved)}
+
+
+@app.post("/api/share/{token}/submit")
+def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session: Session = Depends(get_session)):
+    link = _require_share_session(request, token, session)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    if not gc:
+        raise HTTPException(410, "This document is no longer available.")
+    if not body.edits and not body.note.strip():
+        raise HTTPException(400, "No changes or comments were provided.")
+
+    resolved = _resolve_edits(session, gc, body.edits)
+
+    # Finalizing replaces any in-progress "Save progress" draft -- it's now
+    # a real submission, not a draft anymore.
+    draft = _existing_draft(session, link.id)
+    if draft:
+        for old_edit in session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == draft.id)).all():
+            session.delete(old_edit)
+        session.delete(draft)
+        session.commit()
+
+    submission = RedlineSubmission(share_link_id=link.id, note=body.note.strip()[:2000], status="pending")
+    session.add(submission)
+    session.commit()
+    session.refresh(submission)
+
+    for kwargs in resolved:
+        session.add(RedlineEdit(submission_id=submission.id, **kwargs))
+    session.commit()
+    return {"ok": True}
+
+
+@app.get("/api/share/{token}/download")
+def download_share_document(token: str, request: Request, session: Session = Depends(get_session)):
+    link = _require_share_session(request, token, session)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    if not gc or not os.path.exists(gc.file_path):
+        raise HTTPException(410, "This document is no longer available.")
+    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", gc.name).strip() or "Contract"
+    return FileResponse(gc.file_path, filename=f"{safe_name}.docx", media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+
+class AckResponseBody(BaseModel):
+    submission_id: int
+
+
+@app.post("/api/share/{token}/acknowledge-response")
+def acknowledge_response(token: str, body: AckResponseBody, request: Request, session: Session = Depends(get_session)):
+    """Marks the owner's batched response as seen, so it doesn't keep
+    reappearing on later visits once the client has continued past it."""
+    link = _require_share_session(request, token, session)
+    submission = session.get(RedlineSubmission, body.submission_id)
+    if not submission or submission.share_link_id != link.id:
+        raise HTTPException(404, "Response not found.")
+    submission.client_ack_at = datetime.utcnow()
+    session.add(submission)
+    session.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Email drafting: per-account alias, inbound webhook, AI extraction
+# ---------------------------------------------------------------------------
+
+_EMAIL_ADDR_RE = re.compile(r"[\w\.\+\-]+@[\w\-]+\.[\w\.\-]+")
+
+
+def _extract_email_address(header_value: str) -> str:
+    m = _EMAIL_ADDR_RE.search(header_value or "")
+    return m.group(0) if m else (header_value or "").strip()
+
+
+def _get_or_create_alias(session: Session, user: User) -> EmailAlias:
+    alias = session.exec(select(EmailAlias).where(EmailAlias.user_id == user.id)).first()
+    if alias:
+        return alias
+    company_slug = ee.slugify_company(user.name or user.email.split("@")[0])
+    alias = EmailAlias(user_id=user.id, company_slug=company_slug, number=ee.generate_alias_number())
+    session.add(alias)
+    session.commit()
+    session.refresh(alias)
+    return alias
+
+
+@app.get("/api/account/email-alias")
+def get_email_alias(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    alias = _get_or_create_alias(session, user)
+    return {"address": ee.alias_address(alias.company_slug, alias.number)}
+
+
+@app.post("/api/account/email-alias/regenerate")
+def regenerate_email_alias(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Issues a new random number, invalidating the old address. Use this
+    if the address ever leaks somewhere it shouldn't have."""
+    alias = _get_or_create_alias(session, user)
+    alias.number = ee.generate_alias_number()
+    session.add(alias)
+    session.commit()
+    return {"address": ee.alias_address(alias.company_slug, alias.number)}
+
+
+def _send_missing_info_reply(req: EmailDraftRequest, alias: Optional[EmailAlias], missing_labels: list, no_template: bool):
+    reply_to = ee.continuation_address(alias.company_slug, alias.number, req.id) if alias else None
+    if no_template:
+        body = (
+            "Hi,\n\n"
+            "I couldn't tell which master document you want drafted. Reply to this email with the document "
+            "name or type somewhere in the subject line (for example, Subject: \"Draft: Freelance Services "
+            "Agreement\") and I'll pick it up from there.\n\n"
+            "- Rotely"
+        )
+    else:
+        lines = "\n".join(f"- {label}" for label in missing_labels)
+        body = (
+            "Hi,\n\n"
+            f"Almost there. I still need the following to finish this draft:\n\n{lines}\n\n"
+            "Just reply to this email with those details and I'll generate it right away.\n\n"
+            "- Rotely"
+        )
+    try:
+        ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body, reply_to=reply_to)
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- request is still recorded, just no email goes out
+
+
+def _send_no_such_template_email(req: EmailDraftRequest):
+    body = (
+        "Hi,\n\n"
+        "I couldn't match that to any of your ready master documents (ones with fields already marked). "
+        "Reply with the exact document name or document type and I'll try again.\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body)
+    except RuntimeError:
+        pass
+
+
+def _send_plan_limit_email(user: User, req: EmailDraftRequest):
+    body = (
+        "Hi,\n\n"
+        "This would put you over your plan's monthly drafting limit, so I held off generating it. "
+        "Upgrade your plan from your account menu in Rotely and reply to this email to try again.\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body)
+    except RuntimeError:
+        pass
+
+
+def _send_ready_notification(user: User, gc: GeneratedContract, file_path: str):
+    body = (
+        f'Hi,\n\nYour draft "{gc.name}" is ready and saved in your Rotely documents library. '
+        "It's attached here as well.\n\n- Rotely"
+    )
+    attachments = None
+    try:
+        with open(file_path, "rb") as f:
+            attachments = [{
+                "filename": f"{gc.name}.docx",
+                "content_bytes": f.read(),
+                "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            }]
+    except OSError:
+        attachments = None
+    try:
+        ee.send_email(user.email, f"Your draft is ready: {gc.name}", body, attachments=attachments)
+    except RuntimeError:
+        pass
+
+
+def _process_draft_request(session: Session, user: User, req: EmailDraftRequest, subject: str, body_text: str):
+    alias = session.exec(select(EmailAlias).where(EmailAlias.user_id == user.id)).first()
+
+    if not req.template_id:
+        templates = session.exec(select(Template).where(Template.owner_id == user.id)).all()
+        candidates = [{"id": t.id, "name": t.name, "document_type": t.document_type} for t in templates if t.placeholders]
+        match = ee.match_template_from_subject(subject, candidates)
+        if not match:
+            req.status = "awaiting_template"
+            session.add(req)
+            session.commit()
+            _send_missing_info_reply(req, alias, [], no_template=True)
+            return
+        req.template_id = match["id"]
+
+    tpl = session.get(Template, req.template_id)
+    if not tpl:
+        req.status = "failed"
+        session.add(req)
+        session.commit()
+        _send_no_such_template_email(req)
+        return
+    placeholders = [
+        {"field_key": p.field_key, "label": p.label, "field_type": p.field_type, "required": p.required}
+        for p in tpl.placeholders
+    ]
+
+    known_values = json.loads(req.values_json or "{}")
+    try:
+        new_values = ee.extract_field_values(body_text, placeholders)
+    except RuntimeError:
+        new_values = {}  # ANTHROPIC_API_KEY not configured -- fall back to asking for everything by name
+    known_values.update(new_values)
+    req.values_json = json.dumps(known_values)
+
+    missing = ee.compute_missing_required(placeholders, known_values)
+    req.missing_fields_json = json.dumps(missing)
+    req.updated_at = datetime.utcnow()
+
+    if missing:
+        req.status = "awaiting_info"
+        session.add(req)
+        session.commit()
+        labels = [p["label"] for p in placeholders if p["field_key"] in missing]
+        _send_missing_info_reply(req, alias, labels, no_template=False)
+        return
+
+    plan = _plan_info(session, user)
+    if plan["limit"] is not None and plan["used"] >= plan["limit"]:
+        req.status = "failed"
+        session.add(req)
+        session.commit()
+        _send_plan_limit_email(user, req)
+        return
+
+    doc = de.load(tpl.working_path)
+    field_positions = de.fill_template_tracked(doc, known_values)
+    gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
+    os.makedirs(gen_dir, exist_ok=True)
+    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
+    de.save(doc, out_path)
+
+    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
+    display_name = f"{safe_name} - {datetime.utcnow().strftime('%b %d, %Y')}"
+    values_snapshot = [{"label": p.label, "field_key": p.field_key, "value": known_values.get(p.field_key, "")} for p in tpl.placeholders]
+    gc = GeneratedContract(
+        owner_id=user.id, template_id=tpl.id, template_name=tpl.name, document_type=tpl.document_type,
+        name=display_name, file_path=out_path, values_json=json.dumps(values_snapshot),
+        field_positions_json=json.dumps(field_positions),
+    )
+    session.add(gc)
+    req.status = "done"
+    session.add(req)
+    session.commit()
+    session.refresh(gc)
+    req.generated_contract_id = gc.id
+    session.add(req)
+    session.commit()
+
+    _send_ready_notification(user, gc, out_path)
+
+
+@app.post("/api/email/inbound/{webhook_secret}")
+async def inbound_email(webhook_secret: str, request: Request, session: Session = Depends(get_session)):
+    """Target for SendGrid's Inbound Parse webhook (configured to POST
+    parsed fields, not raw MIME). The path secret stands in for signature
+    verification -- keep it out of source control in real deployments (set
+    it via the INBOUND_WEBHOOK_SECRET env var and use that exact value when
+    configuring the SendGrid route)."""
+    if not INBOUND_WEBHOOK_SECRET or not secrets.compare_digest(webhook_secret, INBOUND_WEBHOOK_SECRET):
+        raise HTTPException(404)
+
+    form = await request.form()
+    to_header = str(form.get("to", "") or form.get("envelope", ""))
+    from_header = str(form.get("from", ""))
+    subject = str(form.get("subject", ""))
+    body_text = str(form.get("text", "") or "")
+
+    parsed = ee.parse_alias(to_header)
+    if not parsed:
+        return {"ok": False, "reason": "no matching drafting alias in the To: address"}
+
+    alias = session.exec(select(EmailAlias).where(
+        EmailAlias.company_slug == parsed["company_slug"],
+        EmailAlias.number == parsed["number"],
+        EmailAlias.active == True,  # noqa: E712
+    )).first()
+    if not alias:
+        return {"ok": False, "reason": "unknown or deactivated alias"}
+    user = session.get(User, alias.user_id)
+    if not user:
+        return {"ok": False, "reason": "account not found"}
+
+    from_address = _extract_email_address(from_header)
+
+    req = None
+    if parsed["continue_request_id"]:
+        candidate = session.get(EmailDraftRequest, parsed["continue_request_id"])
+        if candidate and candidate.user_id == user.id and candidate.status in ("awaiting_template", "awaiting_info"):
+            req = candidate
+    if req is None:
+        req = EmailDraftRequest(user_id=user.id, from_address=from_address, subject=subject, status="awaiting_template")
+        session.add(req)
+        session.commit()
+        session.refresh(req)
+
+    _process_draft_request(session, user, req, subject, body_text)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Static frontend
+# ---------------------------------------------------------------------------
+
+static_dir = os.path.join(BASE_DIR, "static")
+
+
+@app.get("/share/{token}")
+def share_page(token: str):
+    """Serves the standalone (no-login) client redlining page. A real path
+    on the server, not a hash route, since this link goes to someone with
+    no Rotely account of their own."""
+    return FileResponse(os.path.join(static_dir, "share.html"))
+
+
+app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
