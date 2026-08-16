@@ -727,6 +727,7 @@ def _share_link_payload(link: ShareLink) -> dict:
         "token": link.token,
         "access_code": link.access_code,
         "client_email": link.client_email,
+        "sender_email": link.sender_email,
         "url": f"/share/{link.token}",
         "status": link.status,
         "created_at": link.created_at.isoformat(),
@@ -741,6 +742,9 @@ def _generate_access_code() -> str:
 
 class CreateShareBody(BaseModel):
     client_email: str = ""  # optional -- shown to the client as "Editing as"
+    # Optional override for what the client sees as the sender's contact
+    # email -- falls back to the account's own login email when blank.
+    sender_email: str = ""
 
 
 @app.post("/api/generated/{generated_id}/share")
@@ -754,19 +758,26 @@ def create_share_link(
     there is one, otherwise creates a new one with a fresh access code."""
     gc = _get_owned_generated(session, user, generated_id)
     client_email = body.client_email.strip()[:200]
+    sender_email = body.sender_email.strip()[:200]
     existing = session.exec(
         select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
     ).first()
     if existing:
+        changed = False
         if client_email and client_email != existing.client_email:
             existing.client_email = client_email
+            changed = True
+        if sender_email != existing.sender_email:
+            existing.sender_email = sender_email
+            changed = True
+        if changed:
             session.add(existing)
             session.commit()
             session.refresh(existing)
         return _share_link_payload(existing)
     link = ShareLink(
         generated_contract_id=gc.id, token=secrets.token_urlsafe(16), access_code=_generate_access_code(),
-        client_email=client_email,
+        client_email=client_email, sender_email=sender_email,
     )
     session.add(link)
     session.commit()
@@ -944,12 +955,17 @@ def apply_redline_submission(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    """Regenerates the contract with every accepted edit applied (anything
-    explicitly accepted, plus anything auto-approved that the owner hasn't
-    overridden by rejecting it). Produces a new GeneratedContract row, same
-    as a normal draft, so the version history stays intact. Not counted
-    against the monthly plan limit -- this is finishing a document already
-    in progress, not starting a new one."""
+    """Applies every accepted edit (anything explicitly accepted, plus
+    anything auto-approved that the owner hasn't overridden by rejecting
+    it) directly onto the exact document that was shared -- splicing each
+    edit's new text in at its recorded location, rather than regenerating
+    the whole document from the master template with a field_key -> value
+    map. That's what makes redlining two occurrences of the same field
+    independently correct: each occurrence has its own location, so
+    changing one never touches the other. Produces a new GeneratedContract
+    row, same as a normal draft, so the version history stays intact. Not
+    counted against the monthly plan limit -- this is finishing a document
+    already in progress, not starting a new one."""
     submission = session.get(RedlineSubmission, submission_id)
     if not submission:
         raise HTTPException(404, "Submission not found")
@@ -960,18 +976,36 @@ def apply_redline_submission(
     tpl = session.get(Template, gc.template_id) if gc.template_id else None
     if not tpl:
         raise HTTPException(400, "The master document this was drafted from no longer exists.")
+    if not os.path.exists(gc.file_path):
+        raise HTTPException(410, "This document is no longer available.")
 
     edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == submission.id)).all()
     to_apply = [e for e in edits if e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved")]
     if not to_apply:
         raise HTTPException(400, "No accepted edits to apply yet.")
 
-    base_values = {v["field_key"]: v["value"] for v in json.loads(gc.values_json)}
+    edit_targets = []  # (RedlineEdit, location dict) -- only edits with a still-usable recorded location
     for e in to_apply:
-        base_values[e.field_key] = e.proposed_value
+        loc = json.loads(e.location_json or "{}")
+        if loc.get("segments"):
+            edit_targets.append((e, loc))
+    if not edit_targets:
+        raise HTTPException(400, "None of the accepted edits have a usable location to apply anymore.")
 
-    doc = de.load(tpl.working_path)
-    field_positions = de.fill_template_tracked(doc, base_values)
+    doc = de.load(gc.file_path)
+    try:
+        de.apply_text_edits(doc, [
+            {
+                "container_path": loc["container_path"],
+                "paragraph_index": loc["paragraph_index"],
+                "segments": loc["segments"],
+                "new_text": e.proposed_value,
+            }
+            for e, loc in edit_targets
+        ])
+    except de.MarkError as err:
+        raise HTTPException(400, f"Couldn't apply those redlines: {err}")
+
     gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
     os.makedirs(gen_dir, exist_ok=True)
     out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
@@ -979,20 +1013,38 @@ def apply_redline_submission(
 
     safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
     display_name = f"{safe_name} (redlined) - {datetime.utcnow().strftime('%b %d, %Y')}"
+    # Best-effort summary of field values for the detail view: carries the
+    # prior snapshot forward, overwritten by whichever applied edit(s)
+    # targeted each field_key. A field redlined differently at two separate
+    # occurrences only shows the last one applied here -- the document
+    # itself (not this summary) is the source of truth for what each spot
+    # actually says.
+    base_values = {v["field_key"]: v["value"] for v in json.loads(gc.values_json)}
+    for e, _ in edit_targets:
+        if e.field_key:
+            base_values[e.field_key] = e.proposed_value
     values_snapshot = [{"label": p.label, "field_key": p.field_key, "value": base_values.get(p.field_key, "")} for p in tpl.placeholders]
+    # field_positions carry forward from the source document: applying a
+    # single-run whole-value edit (the common case for a field) leaves that
+    # run's position unchanged, just with new text, so untouched fields'
+    # highlighted positions stay valid. A free-text edit that splits or
+    # merges runs within a paragraph that also holds an untouched field can
+    # shift that field's run index -- a known, narrow limitation of
+    # carrying positions forward this way rather than recomputing them.
     new_gc = GeneratedContract(
         owner_id=user.id, template_id=tpl.id, template_name=tpl.name, document_type=tpl.document_type,
         name=display_name, file_path=out_path, values_json=json.dumps(values_snapshot),
-        field_positions_json=json.dumps(field_positions),
+        field_positions_json=gc.field_positions_json,
         parties_json=gc.parties_json,  # carry the parties forward from the original draft
         source_submission_id=submission.id,
     )
     session.add(new_gc)
 
+    applied_ids = {e.id for e, _ in edit_targets}
     for e in to_apply:
-        if e.decision == "pending":
+        if e.id in applied_ids and e.decision == "pending":
             e.decision = "accepted"
-        session.add(e)
+            session.add(e)
     submission.status = "reviewed"
     session.add(submission)
     session.commit()
@@ -1064,6 +1116,7 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
     html = de.render_paragraphs_html(doc, field_positions)
 
     sender = session.get(User, gc.owner_id)
+    sender_email = link.sender_email or (sender.email if sender else "")
 
     # If the client saved progress on an earlier visit, hand it back so the
     # page can resume exactly where they left off instead of starting over.
@@ -1075,7 +1128,14 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
         draft_edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == draft.id)).all()
         draft_payload = {
             "note": draft.note,
-            "edits": [{"field_key": e.field_key, "proposed_value": e.proposed_value, "comment": e.comment} for e in draft_edits],
+            "edits": [
+                {
+                    "field_key": e.field_key, "label": e.label, "proposed_value": e.proposed_value,
+                    "original_value": e.original_value, "comment": e.comment,
+                    "location": json.loads(e.location_json or "{}") or None,
+                }
+                for e in draft_edits
+            ],
         }
 
     # If the owner has sent a batched response (accept/reject/counter) to a
@@ -1102,6 +1162,7 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
                 {
                     "field_key": e.field_key, "label": e.label,
                     "proposed_value": e.proposed_value, "decision": e.decision, "counter_value": e.counter_value,
+                    "location": json.loads(e.location_json or "{}") or None,
                 }
                 for e in responded_edits
             ],
@@ -1114,16 +1175,35 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
         "fields": fields,
         "parties": json.loads(gc.parties_json or "[]"),
         "client_email": link.client_email,
-        "sender_email": sender.email if sender else "",
+        "sender_email": sender_email,
         "draft": draft_payload,
         "response": response_payload,
     }
 
 
+class EditLocationBody(BaseModel):
+    """Where in the document this edit applies -- same shape the browser
+    already computes for template authoring (see computeSelectionSegments /
+    the /mark endpoint), just captured against a generated document's
+    current text instead of a template's tokens. table_path uses the same
+    "t,r,c;t,r,c" encoding _parse_table_path expects; empty means the
+    top-level document body."""
+    table_path: str = ""
+    paragraph_index: int
+    segments: list[MarkSegment]
+
+
 class ShareEditBody(BaseModel):
-    field_key: str
+    # "" for a free-text edit not tied to a known placeholder field.
+    field_key: str = ""
     proposed_value: str
     comment: str = ""
+    # Fallback label shown in the owner's review list when this isn't a
+    # known placeholder (e.g. a short excerpt of the selected text). Ignored
+    # when field_key matches a real placeholder -- that field's own label
+    # is used instead.
+    label: str = ""
+    location: Optional[EditLocationBody] = None
 
 
 class ShareSubmitBody(BaseModel):
@@ -1132,29 +1212,60 @@ class ShareSubmitBody(BaseModel):
 
 
 def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[ShareEditBody]):
-    """Shared between save-progress and submit: validates proposed edits
-    against the template's real fields and computes each one's threshold
-    evaluation. Returns a list of kwargs dicts ready for RedlineEdit(...)."""
+    """Shared between save-progress and submit: re-reads each proposed
+    edit's *current* text directly from the generated document at its exact
+    recorded location (rather than trusting whatever the browser sent) so a
+    stale or malformed selection is rejected here, and computes each field
+    edit's threshold evaluation. Returns a list of kwargs dicts ready for
+    RedlineEdit(...)."""
     tpl = session.get(Template, gc.template_id) if gc.template_id else None
     placeholders_by_key = {p.field_key: p for p in (tpl.placeholders if tpl else [])}
-    current_values = {v["field_key"]: v["value"] for v in json.loads(gc.values_json)}
+
+    doc = None
+    if any(e.location for e in edits_in):
+        if not os.path.exists(gc.file_path):
+            raise HTTPException(410, "This document is no longer available.")
+        doc = de.load(gc.file_path)
 
     out = []
     for e in edits_in:
-        ph = placeholders_by_key.get(e.field_key)
-        if not ph:
-            continue  # not a real, editable field on this document -- ignore rather than trust the client
+        if not e.location:
+            continue  # no location captured -- can't be applied, so don't accept it
+        container_path = _parse_table_path(e.location.table_path)
+        segments = [s.dict() for s in e.location.segments]
+        if not segments:
+            continue
+        try:
+            original_text = de.extract_text_at(doc, container_path, e.location.paragraph_index, segments)
+        except de.MarkError as err:
+            raise HTTPException(400, f"That selection is no longer valid: {err}")
+
         proposed = e.proposed_value.strip()
-        if proposed == current_values.get(e.field_key, "").strip():
+        if proposed == original_text.strip():
             continue  # not actually a change
-        evaluation = rl.evaluate_edit(ph.threshold_type, ph.threshold_config, proposed)
+
+        ph = placeholders_by_key.get(e.field_key) if e.field_key else None
+        evaluation = rl.evaluate_edit(ph.threshold_type, ph.threshold_config, proposed) if ph else rl.NEEDS_REVIEW
+        if ph:
+            label = ph.label
+        else:
+            label = e.label.strip()[:80]
+            if not label:
+                excerpt = original_text.strip()
+                label = (excerpt[:57] + "…") if len(excerpt) > 57 else (excerpt or "Custom edit")
+
         out.append(dict(
-            field_key=e.field_key,
-            label=ph.label,
-            original_value=current_values.get(e.field_key, ""),
+            field_key=e.field_key if ph else "",
+            label=label,
+            original_value=original_text,
             proposed_value=proposed,
             comment=e.comment.strip()[:1000],
             evaluation=evaluation,
+            location_json=json.dumps({
+                "container_path": container_path,
+                "paragraph_index": e.location.paragraph_index,
+                "segments": segments,
+            }),
         ))
     return out
 
@@ -1226,6 +1337,10 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     for kwargs in resolved:
         session.add(RedlineEdit(submission_id=submission.id, **kwargs))
     session.commit()
+
+    owner = session.get(User, gc.owner_id)
+    if owner:
+        _send_redlines_submitted_notification(owner, gc, link, len(resolved), body.note.strip())
     return {"ok": True}
 
 
@@ -1346,6 +1461,28 @@ def _send_plan_limit_email(user: User, req: EmailDraftRequest):
         ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body)
     except RuntimeError:
         pass
+
+
+def _send_redlines_submitted_notification(owner: User, gc: GeneratedContract, link: ShareLink, edit_count: int, note: str):
+    """Lets the account owner know redlines came back on a document they
+    shared, without them having to think to go check. Reply-To is the
+    client's email (if the sender collected one) so replying goes straight
+    back to whoever submitted them."""
+    who = link.client_email.strip() or "The reviewer"
+    lines = [f'{who} sent back redlines on "{gc.name}".']
+    if edit_count:
+        lines.append(f"{edit_count} change{'s' if edit_count != 1 else ''} proposed.")
+    if note:
+        lines.append(f'\nTheir note: "{note}"')
+    lines.append("\nLog in to your Rotely documents library to review and respond.")
+    body = "\n".join(lines) + "\n\n- Rotely"
+    try:
+        ee.send_email(
+            owner.email, f'New redlines on "{gc.name}"', body,
+            reply_to=(link.client_email.strip() or None),
+        )
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the submission is still recorded, just no email goes out
 
 
 def _send_ready_notification(user: User, gc: GeneratedContract, file_path: str):
