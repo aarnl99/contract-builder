@@ -109,6 +109,17 @@ function topbar() {
     pill.addEventListener("click", () => toggleAvatarMenu());
     right.appendChild(pill);
 
+    const notifWrap = el("div", { class: "notif-bell-wrap" });
+    const bell = el("div", { class: "notif-bell", onclick: () => toggleNotifDropdown() }, [
+      el("span", { html: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>' }),
+    ]);
+    notifWrap.appendChild(bell);
+    right.appendChild(notifWrap);
+    window.__notifWrap = notifWrap;
+    window.__notifBell = bell;
+    ensureNotificationPolling();
+    refreshNotifBadge();
+
     const avatarWrap = el("div", { class: "avatar-menu" });
     const avatar = el("div", { class: "avatar", onclick: () => toggleAvatarMenu() }, initials(state.user));
     avatarWrap.appendChild(avatar);
@@ -191,6 +202,101 @@ function toggleAvatarMenu() {
   setTimeout(() => {
     document.addEventListener("click", function onDocClick(e) {
       if (!dd.contains(e.target) && e.target !== window.__avatarWrap) {
+        dd.remove();
+        document.removeEventListener("click", onDocClick);
+      }
+    });
+  }, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Notification bell -- fires on exactly two events (see main.py's _notify
+// call sites): a client submits redlines for review, and a client
+// acknowledges the owner's response. Nothing else lights up the bell.
+// ---------------------------------------------------------------------------
+
+const NOTIF_TYPE_LABELS = { redline_submitted: "Redlines submitted", response_acknowledged: "Response seen" };
+
+function refreshNotifBadge() {
+  if (!state.user) return;
+  api("/api/notifications")
+    .then((data) => {
+      const bell = window.__notifBell;
+      if (!bell) return;
+      const existing = bell.querySelector(".notif-badge");
+      if (existing) existing.remove();
+      if (data.unread_count > 0) {
+        bell.appendChild(el("span", { class: "notif-badge" }, data.unread_count > 9 ? "9+" : String(data.unread_count)));
+      }
+    })
+    .catch(() => {});
+}
+
+function ensureNotificationPolling() {
+  if (window.__notifPollStarted) return;
+  window.__notifPollStarted = true;
+  setInterval(() => refreshNotifBadge(), 30000);
+}
+
+function toggleNotifDropdown() {
+  const wrap = window.__notifWrap;
+  if (!wrap) return;
+  const existing = wrap.querySelector(".notif-dropdown");
+  if (existing) { existing.remove(); return; }
+
+  const dd = el("div", { class: "notif-dropdown" });
+  const head = el("div", { class: "notif-dropdown-head" }, [el("span", { class: "title" }, "Notifications")]);
+  const markAllBtn = el("button", {}, "Mark all read");
+  head.appendChild(markAllBtn);
+  dd.appendChild(head);
+
+  const list = el("div", {}, [el("div", { class: "notif-empty" }, "Loading...")]);
+  dd.appendChild(list);
+
+  function paint(notifications) {
+    list.innerHTML = "";
+    if (!notifications.length) {
+      list.appendChild(el("div", { class: "notif-empty" }, "No notifications yet."));
+      return;
+    }
+    notifications.forEach((n) => {
+      const item = el("button", { class: "notif-item" + (n.read ? "" : " unread") }, [
+        el("div", { class: "notif-title" }, n.title),
+        n.body ? el("div", { class: "notif-body" }, n.body) : null,
+        el("div", { class: "notif-time" }, fmtRelativeTime(n.created_at)),
+      ]);
+      item.addEventListener("click", async () => {
+        if (!n.read) {
+          try { await api(`/api/notifications/${n.id}/read`, { method: "POST" }); } catch (e) {}
+          refreshNotifBadge();
+        }
+        dd.remove();
+        location.hash = "#/documents";
+      });
+      list.appendChild(item);
+    });
+  }
+
+  markAllBtn.addEventListener("click", async () => {
+    try {
+      await api("/api/notifications/read-all", { method: "POST" });
+      const res = await api("/api/notifications");
+      paint(res.notifications);
+      refreshNotifBadge();
+    } catch (e) {}
+  });
+
+  api("/api/notifications")
+    .then((res) => paint(res.notifications))
+    .catch((e) => {
+      list.innerHTML = "";
+      list.appendChild(el("div", { class: "notif-empty" }, e.message || "Failed to load notifications."));
+    });
+
+  window.__notifWrap.appendChild(dd);
+  setTimeout(() => {
+    document.addEventListener("click", function onDocClick(e) {
+      if (!dd.contains(e.target) && e.target !== window.__notifWrap && !window.__notifWrap.contains(e.target)) {
         dd.remove();
         document.removeEventListener("click", onDocClick);
       }
@@ -1631,6 +1737,18 @@ function fmtBytes(n) {
 
 function fmtShortDate(iso) {
   return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function fmtRelativeTime(iso) {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return fmtShortDate(iso);
 }
 
 function statTile(label, value, hint) {
