@@ -4,7 +4,8 @@ import json
 import shutil
 import secrets
 import string
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
@@ -15,7 +16,7 @@ from sqlmodel import Session, select
 from pydantic import BaseModel
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
-from .db import init_db, get_session, UPLOADS_DIR
+from .db import init_db, get_session, UPLOADS_DIR, DATA_DIR
 from .models import (
     User, Template, Placeholder, GeneratedContract, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
     ShareLink, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest,
@@ -46,6 +47,10 @@ def _load_or_create_secret() -> str:
 
 SECRET_KEY = _load_or_create_secret()
 INBOUND_WEBHOOK_SECRET = os.environ.get("INBOUND_WEBHOOK_SECRET", "")
+# The one account that can see /api/admin/* and the #/admin page. Not a DB
+# column -- just an email compared at request time -- so promoting the
+# owner never needs a migration against the already-live database.
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "aaronkluan@gmail.com").strip().lower()
 
 app = FastAPI(title="Rotely")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
@@ -226,6 +231,20 @@ def _plan_info(session: Session, user: User) -> dict:
     }
 
 
+def _is_admin(user: Optional[User]) -> bool:
+    return bool(user) and user.email.strip().lower() == ADMIN_EMAIL
+
+
+def get_admin_user(user: User = Depends(get_current_user)) -> User:
+    """Same 401-if-logged-out behavior as get_current_user, plus a 403 for
+    every account except the owner's. Kept separate from get_current_user
+    (rather than an is_admin flag checked ad hoc) so every /api/admin/*
+    route gets the same gate from one place."""
+    if not _is_admin(user):
+        raise HTTPException(403, "Not authorized")
+    return user
+
+
 @app.get("/api/me")
 def me(user: Optional[User] = Depends(get_optional_user), session: Session = Depends(get_session)):
     if not user:
@@ -233,6 +252,7 @@ def me(user: Optional[User] = Depends(get_optional_user), session: Session = Dep
     return {
         "user": {"id": user.id, "email": user.email, "name": user.name},
         "plan": _plan_info(session, user),
+        "is_admin": _is_admin(user),
     }
 
 
@@ -1710,6 +1730,107 @@ async def inbound_email(webhook_secret: str, request: Request, session: Session 
 
     _process_draft_request(session, user, req, subject, body_text)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard (owner-only, see ADMIN_EMAIL / get_admin_user above)
+# ---------------------------------------------------------------------------
+
+def _daily_series(dates: list, days: int = 30) -> list:
+    """Buckets a list of datetimes into a fixed-length series of the last
+    `days` calendar days (UTC), oldest first, zero-filled where nothing
+    happened that day -- what a sparkline/bar chart needs, rather than a
+    sparse list that skips empty days."""
+    start = (datetime.utcnow() - timedelta(days=days - 1)).date()
+    counts = Counter(d.date() for d in dates if d and d.date() >= start)
+    return [
+        {"date": (start + timedelta(days=i)).isoformat(), "count": counts.get(start + timedelta(days=i), 0)}
+        for i in range(days)
+    ]
+
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _user_summary(u: User, tpl_counts: dict, gen_counts: dict) -> dict:
+    return {
+        "id": u.id,
+        "email": u.email,
+        "name": u.name,
+        "plan": u.plan,
+        "created_at": u.created_at.isoformat(),
+        "email_verified": u.email_verified,
+        "template_count": tpl_counts.get(u.id, 0),
+        "contract_count": gen_counts.get(u.id, 0),
+    }
+
+
+@app.get("/api/admin/overview")
+def admin_overview(admin: User = Depends(get_admin_user), session: Session = Depends(get_session)):
+    now = datetime.utcnow()
+    users = session.exec(select(User)).all()
+    templates = session.exec(select(Template)).all()
+    generated = session.exec(select(GeneratedContract)).all()
+    share_links_open = len(session.exec(select(ShareLink).where(ShareLink.status == "open")).all())
+    redline_pending = len(session.exec(select(RedlineSubmission).where(RedlineSubmission.status == "pending")).all())
+
+    tpl_counts = Counter(t.owner_id for t in templates)
+    gen_counts = Counter(g.owner_id for g in generated)
+    recent_users = sorted(users, key=lambda u: u.created_at, reverse=True)[:12]
+
+    try:
+        disk_total, _disk_used_os, disk_free = shutil.disk_usage(DATA_DIR)
+        disk_used = _dir_size_bytes(DATA_DIR)  # actual bytes this app owns, not the whole volume's OS usage
+    except OSError:
+        disk_total = disk_used = disk_free = 0
+
+    return {
+        "totals": {
+            "users": len(users),
+            "verified_users": sum(1 for u in users if u.email_verified),
+            "users_last_7d": sum(1 for u in users if (now - u.created_at).days < 7),
+            "users_last_30d": sum(1 for u in users if (now - u.created_at).days < 30),
+            "templates": len(templates),
+            "generated_contracts": len(generated),
+            "generated_last_7d": sum(1 for g in generated if (now - g.created_at).days < 7),
+            "generated_last_30d": sum(1 for g in generated if (now - g.created_at).days < 30),
+            "share_links_open": share_links_open,
+            "redline_pending": redline_pending,
+        },
+        "users_by_plan": dict(Counter(u.plan for u in users)),
+        "signups_series": _daily_series([u.created_at for u in users]),
+        "contracts_series": _daily_series([g.created_at for g in generated]),
+        "recent_users": [_user_summary(u, tpl_counts, gen_counts) for u in recent_users],
+        "system": {
+            "disk_used_bytes": disk_used,
+            "disk_total_bytes": disk_total,
+            "disk_pct": round(disk_used / disk_total * 100, 1) if disk_total else 0,
+            "sendgrid_configured": bool(ee.SENDGRID_API_KEY),
+            "anthropic_configured": bool(ee.ANTHROPIC_API_KEY),
+            "git_commit": (os.environ.get("RENDER_GIT_COMMIT", "") or "local")[:7],
+            "render_service": os.environ.get("RENDER_SERVICE_NAME", "local"),
+        },
+    }
+
+
+@app.get("/api/admin/users")
+def admin_users(admin: User = Depends(get_admin_user), session: Session = Depends(get_session)):
+    users = session.exec(select(User).order_by(User.created_at.desc())).all()
+    tpl_counts = Counter(
+        t.owner_id for t in session.exec(select(Template)).all()
+    )
+    gen_counts = Counter(
+        g.owner_id for g in session.exec(select(GeneratedContract)).all()
+    )
+    return {"users": [_user_summary(u, tpl_counts, gen_counts) for u in users]}
 
 
 # ---------------------------------------------------------------------------
