@@ -162,6 +162,18 @@ class ShareLink(SQLModel, table=True):
     last_viewed_at: Optional[datetime] = None
 
 
+class ShareLinkView(SQLModel, table=True):
+    """One instance of a client opening a share link (after passing the
+    access-code gate). Logged every time, not just the latest -- unlike
+    ShareLink.last_viewed_at, which only ever holds the most recent visit --
+    so a document's revision-history trail can show every view, in the
+    viewer's local time, not just whether it's been seen at all."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    share_link_id: int = Field(foreign_key="sharelink.id", index=True)
+    viewed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class RedlineSubmission(SQLModel, table=True):
     """One batch of proposed edits a client submitted through a share link."""
 

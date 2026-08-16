@@ -19,7 +19,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from .db import init_db, get_session, UPLOADS_DIR, DATA_DIR
 from .models import (
     User, Template, Placeholder, GeneratedContract, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
-    ShareLink, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest,
+    ShareLink, ShareLinkView, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest,
 )
 from .auth import hash_password, verify_password, validate_password_strength, get_current_user, get_optional_user
 from . import docx_engine as de
@@ -723,6 +723,127 @@ def _get_owned_generated(session: Session, user: User, generated_id: int) -> Gen
     return gc
 
 
+# ---- lineage: group generated documents into a "folder" only when they're
+# actually connected through a real redline round (share -> client edits ->
+# owner applies), never just because they came from the same master
+# template -- see GeneratedContract.source_submission_id. ----
+
+def _lineage_roots_for(rows: list, session: Session) -> dict:
+    """Map generated_contract_id -> lineage root id for a set of
+    GeneratedContract rows all belonging to the same owner. A document with
+    no source_submission_id is its own root; a redlined-and-applied
+    document's root is found by walking source_submission_id ->
+    RedlineSubmission.share_link_id -> ShareLink.generated_contract_id (its
+    parent document) back until a document with no source_submission_id is
+    reached. Defensive about broken chains (a deleted parent, etc.) -- those
+    just fall back to being their own root rather than erroring."""
+    by_id = {g.id: g for g in rows}
+    sub_ids = {g.source_submission_id for g in rows if g.source_submission_id}
+    subs = {}
+    if sub_ids:
+        subs = {s.id: s for s in session.exec(select(RedlineSubmission).where(RedlineSubmission.id.in_(sub_ids))).all()}
+    link_ids = {s.share_link_id for s in subs.values()}
+    links = {}
+    if link_ids:
+        links = {l.id: l for l in session.exec(select(ShareLink).where(ShareLink.id.in_(link_ids))).all()}
+
+    roots: dict = {}
+
+    def resolve(gc_id, _seen=None):
+        if gc_id in roots:
+            return roots[gc_id]
+        _seen = _seen or set()
+        if gc_id in _seen:  # cycle guard -- should never happen, but don't hang if it does
+            roots[gc_id] = gc_id
+            return gc_id
+        _seen.add(gc_id)
+        gc = by_id.get(gc_id)
+        sub = subs.get(gc.source_submission_id) if gc and gc.source_submission_id else None
+        link = links.get(sub.share_link_id) if sub else None
+        parent_id = link.generated_contract_id if link else None
+        if not gc or parent_id is None or parent_id == gc_id or parent_id not in by_id:
+            roots[gc_id] = gc_id
+            return gc_id
+        root = resolve(parent_id, _seen)
+        roots[gc_id] = root
+        return root
+
+    for g in rows:
+        resolve(g.id)
+    return roots
+
+
+def _lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
+    """Every document in the same lineage as gc, oldest first, plus a merged
+    activity timeline: every draft/redline-applied revision, every time the
+    document was shared, every time the client viewed it (every visit, not
+    just the latest), and every redline round they submitted. Owner-only --
+    includes everything, no redaction (contrast with the client-facing
+    history view, which must never show threshold rules)."""
+    all_docs = session.exec(select(GeneratedContract).where(GeneratedContract.owner_id == gc.owner_id)).all()
+    roots = _lineage_roots_for(all_docs, session)
+    root_id = roots.get(gc.id, gc.id)
+    lineage_docs = sorted((g for g in all_docs if roots.get(g.id) == root_id), key=lambda g: g.created_at)
+    lineage_ids = {g.id for g in lineage_docs}
+    if not lineage_ids:
+        return {"root_id": root_id, "documents": [], "timeline": []}
+
+    links = session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(lineage_ids))).all()
+    link_ids = [l.id for l in links]
+    link_by_id = {l.id: l for l in links}
+    submissions = (
+        session.exec(select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(link_ids))).all()
+        if link_ids else []
+    )
+    views = (
+        session.exec(select(ShareLinkView).where(ShareLinkView.share_link_id.in_(link_ids))).all()
+        if link_ids else []
+    )
+
+    events = []
+    for g in lineage_docs:
+        events.append({
+            "type": "redline_applied" if g.source_submission_id else "drafted",
+            "at": g.created_at.isoformat() + "Z",
+            "document_id": g.id,
+            "document_name": g.name,
+        })
+    for l in links:
+        events.append({
+            "type": "shared", "at": l.created_at.isoformat() + "Z",
+            "document_id": l.generated_contract_id, "share_link_id": l.id,
+        })
+    for v in views:
+        link = link_by_id.get(v.share_link_id)
+        events.append({
+            "type": "viewed", "at": v.viewed_at.isoformat() + "Z",
+            "document_id": link.generated_contract_id if link else None, "share_link_id": v.share_link_id,
+        })
+    for s in submissions:
+        if s.status == "draft":
+            continue  # only saved-in-progress, never actually sent -- nothing happened yet
+        link = link_by_id.get(s.share_link_id)
+        events.append({
+            "type": "redline_submitted", "at": s.submitted_at.isoformat() + "Z",
+            "document_id": link.generated_contract_id if link else None,
+            "share_link_id": s.share_link_id, "submission_id": s.id,
+        })
+    events.sort(key=lambda e: e["at"])
+
+    return {
+        "root_id": root_id,
+        "documents": [
+            {
+                "id": g.id, "name": g.name, "document_type": g.document_type,
+                "created_at": g.created_at.isoformat() + "Z", "archived": g.archived,
+                "is_redline_result": g.source_submission_id is not None,
+            }
+            for g in lineage_docs
+        ],
+        "timeline": events,
+    }
+
+
 @app.get("/api/generated")
 def list_generated(
     archived: Optional[bool] = None,
@@ -730,6 +851,12 @@ def list_generated(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
+    # Lineage roots are computed against ALL of the owner's documents,
+    # unfiltered, so a folder groups correctly even when one revision in it
+    # is archived and this call is asking for only non-archived rows.
+    all_rows = session.exec(select(GeneratedContract).where(GeneratedContract.owner_id == user.id)).all()
+    lineage_roots = _lineage_roots_for(all_rows, session)
+
     q = select(GeneratedContract).where(GeneratedContract.owner_id == user.id)
     if archived is not None:
         q = q.where(GeneratedContract.archived == archived)
@@ -746,6 +873,8 @@ def list_generated(
             "archived": g.archived,
             "created_at": g.created_at.isoformat(),
             "values": json.loads(g.values_json),
+            "lineage_root_id": lineage_roots.get(g.id, g.id),
+            "is_redline_result": g.source_submission_id is not None,
         }
         for g in rows
     ]
@@ -767,6 +896,25 @@ def get_generated(generated_id: int, user: User = Depends(get_current_user), ses
         "created_at": gc.created_at.isoformat(),
         "values": json.loads(gc.values_json),
         "html": html,
+    }
+
+
+@app.get("/api/generated/{generated_id}/history")
+def get_generated_history(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    gc = _get_owned_generated(session, user, generated_id)
+    return _lineage_timeline(gc, session)
+
+
+def _client_lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
+    """The client-facing cut of the same lineage timeline: what happened and
+    when, in plain terms, with none of the owner's internal identifiers
+    (document/share-link/submission ids, document names) or anything
+    threshold-related -- consistent with get_share_document, which likewise
+    never sends redline threshold rules to the client."""
+    full = _lineage_timeline(gc, session)
+    return {
+        "revision_count": len(full["documents"]),
+        "timeline": [{"type": e["type"], "at": e["at"]} for e in full["timeline"]],
     }
 
 
@@ -1194,6 +1342,10 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
         raise HTTPException(410, "This document is no longer available.")
     link.last_viewed_at = datetime.utcnow()
     session.add(link)
+    # Log this exact view as its own row -- last_viewed_at above only ever
+    # holds the most recent visit, but the revision-history trail needs
+    # every single view, timestamped, not just whether it's been seen.
+    session.add(ShareLinkView(share_link_id=link.id))
     session.commit()
 
     fields = []
@@ -1438,6 +1590,15 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     if owner:
         _send_redlines_submitted_notification(owner, gc, link, len(resolved), body.note.strip())
     return {"ok": True}
+
+
+@app.get("/api/share/{token}/history")
+def get_share_history(token: str, request: Request, session: Session = Depends(get_session)):
+    link = _require_share_session(request, token, session)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    if not gc:
+        raise HTTPException(410, "This document is no longer available.")
+    return _client_lineage_timeline(gc, session)
 
 
 @app.get("/api/share/{token}/download")
