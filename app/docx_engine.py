@@ -252,6 +252,122 @@ def _remove_range_from_run(run, start: int, end: int) -> None:
         parent_el.remove(r_element)
 
 
+def extract_text_at(doc: Document, container_path: Optional[List[List[int]]], paragraph_index: int, segments: List[dict]) -> str:
+    """Read back the exact text currently at a given (container, paragraph,
+    run-segments) location. Used server-side to derive a redline edit's
+    "original text" from the live document instead of trusting whatever the
+    browser sent, and to reject a stale/invalid selection (the document
+    changed shape since the client loaded it) as a MarkError up front rather
+    than reading garbage or silently misapplying it later."""
+    container = _resolve_container(doc, container_path or [])
+    paragraphs = container.paragraphs
+    if paragraph_index < 0 or paragraph_index >= len(paragraphs):
+        raise MarkError("Invalid paragraph index")
+    runs = paragraphs[paragraph_index].runs
+    parts = []
+    for seg in sorted(segments, key=lambda s: (s["r"], s["start"])):
+        r_idx = seg["r"]
+        if r_idx < 0 or r_idx >= len(runs):
+            raise MarkError(f"Invalid run index {r_idx}")
+        text = runs[r_idx].text or ""
+        if not (0 <= seg["start"] <= seg["end"] <= len(text)):
+            raise MarkError(f"Invalid offsets for run {r_idx}")
+        parts.append(text[seg["start"]:seg["end"]])
+    return "".join(parts)
+
+
+def _apply_paragraph_group(paragraph: Paragraph, group: List[dict]) -> None:
+    """Rebuild one paragraph's runs, applying every edit in `group` (each
+    {"segments": [...], "new_text": str}) in a single pass over the
+    paragraph's ORIGINAL run list. All edits' segments were captured by the
+    browser against that same original layout, so this must not re-query
+    paragraph.runs between edits -- doing so one at a time would shift run
+    indices out from under any edit sharing this paragraph."""
+    original_runs = list(paragraph.runs)
+
+    tagged = []  # (run_index, start, end, group_index)
+    for g_idx, e in enumerate(group):
+        for seg in e["segments"]:
+            r_idx = seg["r"]
+            if r_idx < 0 or r_idx >= len(original_runs):
+                raise MarkError(f"Invalid run index {r_idx}")
+            run_len = len(original_runs[r_idx].text or "")
+            if not (0 <= seg["start"] <= seg["end"] <= run_len):
+                raise MarkError(f"Invalid offsets for run {r_idx}")
+            tagged.append((r_idx, seg["start"], seg["end"], g_idx))
+    tagged.sort(key=lambda x: (x[0], x[1]))
+
+    for i in range(1, len(tagged)):
+        pr, _, pe, _ = tagged[i - 1]
+        r, s, _, _ = tagged[i]
+        if r == pr and s < pe:
+            raise MarkError("Overlapping redline selections can't be applied together")
+
+    segs_by_run: Dict[int, List[tuple]] = {}
+    for r_idx, s, e, g_idx in tagged:
+        segs_by_run.setdefault(r_idx, []).append((s, e, g_idx))
+
+    emitted = set()  # group indices whose new_text has already been written once
+    for r_idx, run in enumerate(original_runs):
+        segs = segs_by_run.get(r_idx)
+        if not segs:
+            continue
+        segs.sort(key=lambda x: x[0])
+        text = run.text or ""
+        pieces = []
+        cursor = 0
+        for s, e, g_idx in segs:
+            if s > cursor:
+                pieces.append(text[cursor:s])
+            if g_idx not in emitted:
+                pieces.append(group[g_idx]["new_text"])
+                emitted.add(g_idx)
+            cursor = e
+        if cursor < len(text):
+            pieces.append(text[cursor:])
+
+        r_element = run._r
+        first = pieces[0] if pieces else ""
+        run.text = first
+        anchor = r_element
+        for piece in pieces[1:]:
+            if not piece:
+                continue
+            new_run = _clone_run_with_text(run, piece)
+            anchor.addnext(new_run._r)
+            anchor = new_run._r
+        if not first:
+            parent_el = r_element.getparent()
+            parent_el.remove(r_element)
+
+
+def apply_text_edits(doc: Document, edits: List[dict]) -> None:
+    """Apply a batch of redline text replacements directly onto an
+    already-generated document -- unlike mark_placeholder, which inserts a
+    {{token}} into a *template*, this writes literal replacement text in
+    place. Each edit is {"container_path", "paragraph_index",
+    "segments": [{"r","start","end"}, ...], "new_text"}. Edits are grouped
+    by paragraph so multiple edits landing in the same paragraph are applied
+    together in one pass (see _apply_paragraph_group) instead of
+    invalidating each other's recorded run indices."""
+    groups: Dict[tuple, List[dict]] = {}
+    path_by_key: Dict[tuple, List[List[int]]] = {}
+    for e in edits:
+        cp = e.get("container_path") or []
+        key = (_path_str(cp), e["paragraph_index"])
+        path_by_key[key] = cp
+        groups.setdefault(key, []).append(e)
+
+    for key, group in groups.items():
+        container_path = path_by_key[key]
+        container = _resolve_container(doc, container_path)
+        paragraphs = container.paragraphs
+        p_idx = key[1]
+        if p_idx < 0 or p_idx >= len(paragraphs):
+            raise MarkError("Invalid paragraph index")
+        _apply_paragraph_group(paragraphs[p_idx], group)
+
+
 def mark_placeholder(
     doc: Document,
     paragraph_index: int,
