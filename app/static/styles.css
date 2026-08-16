@@ -400,12 +400,17 @@ label.field-label .req { color: var(--danger); }
 a.link { color: var(--accent); cursor: pointer; text-decoration: none; font-weight: 600; font-size: 13px; }
 a.link:hover { text-decoration: underline; }
 
-.auth-shell { max-width: 420px; margin: 60px auto; }
-.auth-shell .card { padding: 30px 32px; }
-.auth-logo { display: flex; align-items: center; gap: 9px; justify-content: center; margin-bottom: 22px; }
-.auth-logo .word { font-weight: 700; font-size: 19px; letter-spacing: -0.015em; }
-.auth-shell h1 { text-align: center; font-size: 19px; }
+.auth-shell { max-width: 440px; margin: 64px auto; }
+.auth-shell .card { padding: 34px 36px; border-radius: 16px; }
+.auth-logo { display: flex; align-items: center; gap: 9px; justify-content: center; margin-bottom: 24px; }
+.auth-logo .word { font-weight: 700; font-size: 20px; letter-spacing: -0.015em; }
+.auth-shell h1 { text-align: center; font-size: 20px; }
 .auth-shell p.subtitle { text-align: center; }
+.forgot-link { color: var(--accent); font-size: 12px; font-weight: 600; text-decoration: none; }
+.forgot-link:hover { text-decoration: underline; }
+.auth-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0; color: var(--muted-soft); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+.auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: var(--border-soft); }
+.google-btn { display: flex; align-items: center; justify-content: center; gap: 10px; }
 
 /* ---------- Threshold (redline rule) editor ---------- */
 

@@ -336,17 +336,22 @@ function AuthView(mode) {
   const card = el("div", { class: "card" });
   wrap.appendChild(card);
 
-  // If we just landed here from the verify-email link (a real, non-hash
-  // redirect from main.py's /verify-email/{token}), surface a banner once
+  // If we just landed here from a real (non-hash) redirect -- the
+  // verify-email link, the Google OAuth callback erroring out, or a
+  // reset-password link that had already expired -- surface a banner once
   // and strip the query off the hash so it doesn't linger through reloads.
   const hashQuery = new URLSearchParams(location.hash.split("?")[1] || "");
   const justVerified = hashQuery.get("verified") === "1";
   const verifyError = hashQuery.get("verify_error") === "1";
-  if (justVerified || verifyError) {
+  const googleError = hashQuery.get("google_error") === "1";
+  const resetError = hashQuery.get("reset_error") === "1";
+  if (justVerified || verifyError || googleError || resetError) {
     history.replaceState(null, "", location.pathname + "#/login");
   }
 
   let registeredEmail = null; // set right after a successful register -- swaps the card to "check your email"
+  let forgotMode = false; // true while showing the "reset your password" mini-form instead of login/register
+  let forgotSent = false;
 
   function draw() {
     card.innerHTML = "";
@@ -387,11 +392,57 @@ function AuthView(mode) {
       return;
     }
 
+    if (forgotMode) {
+      const fEmail = el("input", { type: "email", placeholder: "you@example.com" });
+      const fError = el("div");
+      const fBack = el("button", { class: "btn ghost block", style: "margin-top:8px;", onclick: () => { forgotMode = false; forgotSent = false; draw(); } }, "Back to log in");
+
+      card.appendChild(el("h1", {}, "Reset your password"));
+      if (forgotSent) {
+        card.appendChild(
+          el("p", { class: "subtitle" }, [
+            "If an account exists for ",
+            el("strong", {}, fEmail.value || "that address"),
+            ", we sent a link to reset the password. It works for the next hour.",
+          ])
+        );
+        card.appendChild(fBack);
+        return;
+      }
+      card.appendChild(el("p", { class: "subtitle" }, "Enter your account email and we'll send you a link to set a new password."));
+      card.appendChild(fError);
+      card.appendChild(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Email"), fEmail]));
+      const fSubmit = el("button", { class: "btn block" }, "Send reset link");
+      fSubmit.addEventListener("click", async () => {
+        fError.innerHTML = "";
+        if (!fEmail.value.trim()) {
+          fError.appendChild(el("div", { class: "error-box" }, "Please enter your email."));
+          return;
+        }
+        fSubmit.disabled = true;
+        try {
+          await api("/api/forgot-password", { method: "POST", body: { email: fEmail.value.trim() } });
+          forgotSent = true;
+          draw();
+        } catch (e) {
+          fError.appendChild(el("div", { class: "error-box" }, e.message || "Something went wrong. Try again."));
+          fSubmit.disabled = false;
+        }
+      });
+      card.appendChild(fSubmit);
+      card.appendChild(fBack);
+      return;
+    }
+
     const errorBox = el("div");
     if (tab === "login" && justVerified) {
       errorBox.appendChild(el("div", { class: "notice-box" }, "Email verified — you can log in now."));
     } else if (tab === "login" && verifyError) {
       errorBox.appendChild(el("div", { class: "error-box" }, "That verification link is invalid or expired. Request a new one below."));
+    } else if (tab === "login" && googleError) {
+      errorBox.appendChild(el("div", { class: "error-box" }, "Couldn't sign in with Google. Try again, or log in with your email and password."));
+    } else if (tab === "login" && resetError) {
+      errorBox.appendChild(el("div", { class: "error-box" }, "That reset link is invalid or expired. Request a new one below."));
     }
 
     const tabs = el("div", { class: "auth-tabs", style: "justify-content:center;" }, [
@@ -410,7 +461,13 @@ function AuthView(mode) {
         el("div", { class: "form-row" }, [el("label", { class: "field-label" }, ["Full name", el("span", { class: "req" }, " *")]), nameInput])
       );
     }
-    fields.push(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Password"), passInput]));
+    const passwordLabelRow = tab === "login"
+      ? el("div", { style: "display:flex;justify-content:space-between;align-items:baseline;" }, [
+          el("label", { class: "field-label", style: "margin:0;" }, "Password"),
+          el("a", { href: "#", class: "forgot-link", onclick: (e) => { e.preventDefault(); forgotMode = true; draw(); } }, "Forgot password?"),
+        ])
+      : el("label", { class: "field-label" }, "Password");
+    fields.push(el("div", { class: "form-row" }, [passwordLabelRow, passInput]));
     if (tab === "register") {
       fields.push(
         el("div", { style: "font-size:12px;color:var(--muted);margin:-8px 0 2px;" }, "At least 8 characters, with an uppercase letter, a lowercase letter, and a number.")
@@ -471,8 +528,76 @@ function AuthView(mode) {
     card.appendChild(errorBox);
     fields.forEach((f) => card.appendChild(f));
     card.appendChild(submitBtn);
+
+    card.appendChild(el("div", { class: "auth-divider" }, [el("span", {}, "or")]));
+    card.appendChild(
+      el("a", { href: "/api/auth/google/start", class: "btn secondary block google-btn" }, [
+        el("span", { html: '<svg width="16" height="16" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.9 32.6 29.4 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.1 5.1 29.3 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.2-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.5 19 12 24 12c3.1 0 5.8 1.1 8 3l6-6C34.1 5.1 29.3 3 24 3 16.3 3 9.6 7.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 45c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 36.4 26.7 37 24 37c-5.3 0-9.8-3.4-11.4-8.1l-6.5 5C9.5 40.6 16.2 45 24 45z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1.1 3-3.4 5.4-6.3 6.7l6.2 5.2C38.9 37.4 42 31.2 42 24c0-1.2-.1-2.4-.4-3.5z"/></svg>' }),
+        el("span", {}, "Continue with Google"),
+      ])
+    );
   }
   draw();
+  return wrap;
+}
+
+function ResetPasswordView() {
+  const wrap = el("div", { class: "auth-shell" });
+  const card = el("div", { class: "card" });
+  wrap.appendChild(card);
+
+  const hashQuery = new URLSearchParams(location.hash.split("?")[1] || "");
+  const token = hashQuery.get("token") || "";
+
+  card.appendChild(el("div", { class: "auth-logo" }, [el("div", { class: "word" }, "Rotely.ai")]));
+
+  if (!token) {
+    card.appendChild(el("h1", {}, "Invalid link"));
+    card.appendChild(el("p", { class: "subtitle" }, "That reset link is missing its token. Request a new one from the login page."));
+    card.appendChild(el("a", { href: "#/login", class: "btn block" }, "Back to log in"));
+    return wrap;
+  }
+
+  const errorBox = el("div");
+  const passInput = el("input", { type: "password", placeholder: "At least 8 characters" });
+  const confirmInput = el("input", { type: "password", placeholder: "Re-enter your new password" });
+
+  const submitBtn = el("button", { class: "btn block" }, "Set new password");
+  submitBtn.addEventListener("click", async () => {
+    errorBox.innerHTML = "";
+    if (passInput.value !== confirmInput.value) {
+      errorBox.appendChild(el("div", { class: "error-box" }, "Passwords don't match."));
+      return;
+    }
+    submitBtn.disabled = true;
+    try {
+      const res = await api("/api/reset-password", { method: "POST", body: { token, password: passInput.value } });
+      if (res.logged_in) {
+        const meRes = await api("/api/me");
+        state.user = meRes.user;
+        state.plan = meRes.plan;
+        state.isAdmin = !!meRes.is_admin;
+        location.hash = "#/draft";
+      } else {
+        history.replaceState(null, "", location.pathname + "#/login");
+        location.hash = "#/login";
+      }
+    } catch (e) {
+      errorBox.appendChild(el("div", { class: "error-box" }, e.message || "Something went wrong. Try again."));
+      submitBtn.disabled = false;
+    }
+  });
+
+  card.appendChild(el("h1", {}, "Set a new password"));
+  card.appendChild(el("p", { class: "subtitle" }, "Choose a new password for your account."));
+  card.appendChild(errorBox);
+  card.appendChild(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "New password"), passInput]));
+  card.appendChild(
+    el("div", { style: "font-size:12px;color:var(--muted);margin:-8px 0 2px;" }, "At least 8 characters, with an uppercase letter, a lowercase letter, and a number.")
+  );
+  card.appendChild(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Confirm new password"), confirmInput]));
+  card.appendChild(submitBtn);
+
   return wrap;
 }
 
@@ -2099,7 +2224,7 @@ async function router() {
   state.plan = meRes.plan;
   state.isAdmin = !!meRes.is_admin;
 
-  if (!state.user && !hash.startsWith("#/login") && !hash.startsWith("#/register")) {
+  if (!state.user && !hash.startsWith("#/login") && !hash.startsWith("#/register") && !hash.startsWith("#/reset-password")) {
     render(shell(AuthView("login")));
     return;
   }
@@ -2108,6 +2233,7 @@ async function router() {
     return;
   }
 
+  if (hash.startsWith("#/reset-password")) return render(shell(ResetPasswordView()));
   if (hash.startsWith("#/login")) return render(shell(AuthView("login")));
   if (hash.startsWith("#/register")) return render(shell(AuthView("register")));
   if (hash.startsWith("#/masters")) return render(shell(MastersView()));
