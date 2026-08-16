@@ -155,7 +155,7 @@ function toggleAvatarMenu() {
 
   const emailRow = el("div", { class: "plan-row" });
   emailRow.appendChild(el("div", { class: "label" }, "Drafting email"));
-  const emailValueRow = el("div", { style: "display:flex;align-items:center;gap:6px;" }, [
+  const emailValueRow = el("div", { style: "display:block;" }, [
     el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."),
   ]);
   emailRow.appendChild(emailValueRow);
@@ -165,9 +165,12 @@ function toggleAvatarMenu() {
 
   function paintAliasRow(address) {
     emailValueRow.innerHTML = "";
-    emailValueRow.appendChild(el("span", { style: "font-family:monospace;font-size:11px;word-break:break-all;flex:1;" }, address));
-    emailValueRow.appendChild(el("button", { class: "btn secondary small", onclick: () => navigator.clipboard.writeText(address) }, "Copy"));
     emailValueRow.appendChild(
+      el("div", { style: "font-family:monospace;font-size:11px;word-break:break-all;line-height:1.5;" }, address)
+    );
+    const btnRow = el("div", { style: "display:flex;gap:6px;margin-top:6px;" });
+    btnRow.appendChild(el("button", { class: "btn secondary small", onclick: () => navigator.clipboard.writeText(address) }, "Copy"));
+    btnRow.appendChild(
       el("button", {
         class: "btn ghost small",
         onclick: async () => {
@@ -177,6 +180,7 @@ function toggleAvatarMenu() {
         },
       }, "Regenerate")
     );
+    emailValueRow.appendChild(btnRow);
   }
   api("/api/account/email-alias").then((res) => paintAliasRow(res.address));
 
@@ -251,7 +255,7 @@ function AuthView(mode) {
         resendBtn.disabled = true;
         try {
           await api("/api/resend-verification", { method: "POST", body: { email: registeredEmail } });
-          resendNote.textContent = "Sent -- check your inbox (and spam folder).";
+          resendNote.textContent = "Sent — check your inbox (and spam folder).";
         } catch (e) {
           resendNote.textContent = e.message;
         } finally {
@@ -279,7 +283,7 @@ function AuthView(mode) {
 
     const errorBox = el("div");
     if (tab === "login" && justVerified) {
-      errorBox.appendChild(el("div", { class: "notice-box" }, "Email verified -- you can log in now."));
+      errorBox.appendChild(el("div", { class: "notice-box" }, "Email verified — you can log in now."));
     } else if (tab === "login" && verifyError) {
       errorBox.appendChild(el("div", { class: "error-box" }, "That verification link is invalid or expired. Request a new one below."));
     }
@@ -344,7 +348,7 @@ function AuthView(mode) {
             resendBtn.textContent = "Sending...";
             try {
               await api("/api/resend-verification", { method: "POST", body: { email: emailInput.value } });
-              resendBtn.textContent = "Sent -- check your inbox";
+              resendBtn.textContent = "Sent — check your inbox";
             } catch (e2) {
               resendBtn.disabled = false;
               resendBtn.textContent = "Resend verification email";
@@ -993,7 +997,6 @@ function DocumentsView() {
         el("h2", {}, full.name),
         el("div", { class: "sub" }, `Drafted ${new Date(full.created_at).toLocaleString()}`),
         el("div", { class: "lineage-box" }, [
-          el("div", { class: "icon" }, "📄"),
           el("div", { class: "txt" }, ["Originated from master document", el("br"), lineageLink]),
         ]),
         el("div", {}, valuesHtml ? el("div", { html: valuesHtml }) : el("div", { style: "color:var(--muted);font-size:13px;" }, "No field values recorded.")),
@@ -1509,7 +1512,7 @@ function statusRow(label, ok, okText, badText) {
 function AdminView() {
   const wrap = el("div", { class: "admin-view" });
   wrap.appendChild(el("h1", {}, "Admin"));
-  wrap.appendChild(el("p", { class: "subtitle" }, "Owner-only view of how Rotely itself is doing -- not visible to any other account."));
+  wrap.appendChild(el("p", { class: "subtitle" }, "Owner-only view of how Rotely itself is doing — not visible to any other account."));
 
   const body = el("div", {}, [el("div", { class: "empty-state card" }, "Loading...")]);
   wrap.appendChild(body);

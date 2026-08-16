@@ -404,8 +404,8 @@ a.link:hover { text-decoration: underline; }
 .contract-view .field-value:not(.has-suggestion) { background: var(--accent-soft); box-shadow: inset 0 -2px 0 var(--accent-soft-border); }
 .contract-view .field-value:not(.has-suggestion):hover { background: var(--accent-soft-border); }
 .contract-view .field-value.has-suggestion { box-shadow: none; }
-.contract-view .field-value .fv-del { color: var(--danger); text-decoration: line-through; opacity: .8; margin-right: 3px; }
-.contract-view .field-value .fv-ins {
+.contract-view .run .fv-del { color: var(--danger); text-decoration: line-through; opacity: .8; margin-right: 3px; }
+.contract-view .run .fv-ins {
   color: var(--success); font-weight: 700; text-decoration: underline; text-underline-offset: 2px;
   background: var(--success-soft); border-radius: 3px; padding: 0 4px;
 }
@@ -484,6 +484,10 @@ a.link:hover { text-decoration: underline; }
 /* ---- field selection + floating action chip ---- */
 .contract-view .field-value.selected {
   background: var(--accent-soft-border) !important; box-shadow: 0 0 0 2px var(--accent) inset !important;
+}
+.contract-view .run.selected:not(.field-value) {
+  background: var(--accent-soft-border) !important; box-shadow: 0 0 0 2px var(--accent) inset !important;
+  border-radius: 3px; padding: 0 2px;
 }
 .field-action-chip {
   position: fixed; z-index: 55; background: var(--ink); color: white; border: none; border-radius: 20px;

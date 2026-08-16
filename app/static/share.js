@@ -89,7 +89,6 @@ function GateView() {
   codeInput.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
 
   const card = el("div", { class: "card gate-card" }, [
-    el("div", { class: "icon" }, "🔒"),
     el("h1", {}, "This document is ready for your review"),
     el("p", { class: "subtitle" }, "Enter the access code the sender gave you to view it and propose changes."),
     errBox,
@@ -102,7 +101,6 @@ function GateView() {
 function ThanksView() {
   return el("div", { class: "share-main" }, [
     el("div", { class: "card thanks-card" }, [
-      el("div", { class: "icon" }, "✅"),
       el("h1", {}, "Thanks — your changes were sent"),
       el("p", { class: "subtitle" }, "The sender has been notified and will review what you proposed. You can close this page."),
     ]),
@@ -136,7 +134,6 @@ function ResponseView(data, onContinue) {
 
   return el("div", { class: "share-main" }, [
     el("div", { class: "card response-card" }, [
-      el("div", { class: "icon" }, "📝"),
       el("h1", {}, "The sender responded to your redlines"),
       el("p", { class: "subtitle" }, "Here's what happened to each one. Anything countered becomes a new suggestion you can accept or adjust."),
       el("div", { class: "response-edit-list" }, rows),
@@ -408,12 +405,12 @@ function DocumentView(data) {
   // ---- select-first interaction: select something (a click on an
   // already-highlighted field, or a drag over any text), a small floating
   // "Suggest edit" action appears, THEN the popover opens ----
-  let selectedEl = null;
+  let selectedEls = [];
   let actionChip = null;
 
   function deselectField() {
-    if (selectedEl) selectedEl.classList.remove("selected");
-    selectedEl = null;
+    selectedEls.forEach((elx) => elx.classList.remove("selected"));
+    selectedEls = [];
     if (actionChip) { actionChip.remove(); actionChip = null; }
   }
 
@@ -491,7 +488,7 @@ function DocumentView(data) {
       const [key, e] = found;
       deselectField();
       runEl.classList.add("selected");
-      selectedEl = runEl;
+      selectedEls = [runEl];
       showActionChip(runEl.getBoundingClientRect(), "Edit suggestion ✎", () => {
         const f = fieldByKey[e.field_key];
         openEditPopover({
@@ -510,7 +507,7 @@ function DocumentView(data) {
       const f = fieldByKey[fieldKey];
       deselectField();
       runEl.classList.add("selected");
-      selectedEl = runEl;
+      selectedEls = [runEl];
       showActionChip(runEl.getBoundingClientRect(), "Suggest edit ✎", () => {
         openEditPopover({
           key: locKey(loc), location: loc, fieldKey, label: f ? f.label : fieldKey,
@@ -532,6 +529,19 @@ function DocumentView(data) {
     const key = locKey(loc);
     const existing = edits[key];
     deselectField();
+    // Free-text drags span one or more .run elements -- highlight every run
+    // the selection actually covers, same as a single marked-field click does.
+    const paraEl = findParaEl(loc.table_path, loc.paragraph_index);
+    if (paraEl) {
+      const allRuns = Array.from(paraEl.querySelectorAll(".run"));
+      info.segments.forEach((seg) => {
+        const runEl = allRuns[seg.r];
+        if (runEl) {
+          runEl.classList.add("selected");
+          selectedEls.push(runEl);
+        }
+      });
+    }
     showActionChip(anchorRect, existing ? "Edit suggestion ✎" : "Suggest edit ✎", () => {
       openEditPopover({
         key, location: loc, fieldKey: existing ? existing.field_key : "", label: existing ? existing.label : "",
