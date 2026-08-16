@@ -942,8 +942,18 @@ async function openRedlinesModal(generatedId) {
             applyBtn.disabled = true;
             applyBtn.textContent = "Applying...";
             try {
-              await api(`/api/redline-submissions/${sub.id}/apply`, { method: "POST" });
+              const result = await api(`/api/redline-submissions/${sub.id}/apply`, { method: "POST" });
               overlay.remove();
+              if (result.chained_from) {
+                // This share link had an earlier round already applied, so this
+                // apply built on top of that revision instead of the original --
+                // otherwise the earlier round's accepted changes would have been
+                // silently dropped. Tell the owner so it's never a silent merge.
+                alert(
+                  `Applied on top of "${result.chained_from.name}", which already had earlier accepted redlines from this document. ` +
+                  `The new version includes both rounds.`
+                );
+              }
               location.hash = "#/documents";
             } catch (e) {
               applyBtn.disabled = false;
