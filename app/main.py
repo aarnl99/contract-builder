@@ -65,6 +65,20 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 app = FastAPI(title="Rotely")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
 
+# A fresh random token each time this process starts (i.e. every deploy, since
+# Render restarts the process). The SPA is a single HTML page whose JS is
+# fetched once and never re-fetched until the tab is hard-refreshed -- a tab
+# left open across a deploy silently keeps running the old code with no
+# indication anything shipped. app.js polls /api/version and prompts a
+# refresh the moment this value changes, so "why isn't my fix showing up"
+# stops being a recurring support question.
+APP_BOOT_ID = secrets.token_hex(8)
+
+
+@app.get("/api/version")
+def get_app_version():
+    return {"boot_id": APP_BOOT_ID}
+
 # Short-lived signed tokens proving a share-link visitor entered the right
 # access code. Not stored server-side -- just a signed, timestamped blob the
 # browser holds for the rest of that visit. max_age enforces "you re-enter
@@ -1278,6 +1292,25 @@ def edit_generated_document(
         source_generated_id=gc.id,
     )
     session.add(new_gc)
+    session.flush()  # assigns new_gc.id, needed below, without ending the transaction
+
+    # If the document just edited is the one an open share link currently
+    # points a client at, move the link onto this new revision -- so the
+    # client's next visit actually shows your edit, not just a notice about
+    # one -- and flag it so that visit also surfaces a "this was updated"
+    # banner instead of them silently landing on different text than they
+    # remember with no explanation. (A client's own free-text/field
+    # redlines are always re-extracted fresh from the live document at
+    # submit time -- see _resolve_edits -- so this never orphans a redline
+    # against text that's already moved on.)
+    open_link = session.exec(
+        select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
+    ).first()
+    if open_link:
+        open_link.generated_contract_id = new_gc.id
+        open_link.owner_edited_at = datetime.utcnow()
+        session.add(open_link)
+
     session.commit()
     session.refresh(new_gc)
     return {"id": new_gc.id, "name": new_gc.name}
@@ -1584,9 +1617,12 @@ def apply_redline_submission(
     already went in would produce a version missing round 1's changes
     entirely, since it never saw them. So this always builds on top of the
     most recently applied round from this same share link (if any), not the
-    original -- rounds compound instead of forking. `chained_from` in the
-    response tells the caller when that happened, so the UI can surface it
-    rather than applying silently."""
+    original -- rounds compound instead of forking. The same reasoning
+    applies to the owner's own direct edits (edit_generated_document) made in
+    between rounds -- those are chained onto as well, not just other applied
+    redline rounds. `chained_from` in the response tells the caller when
+    either kind of chaining happened, so the UI can surface it rather than
+    applying silently."""
     submission = session.get(RedlineSubmission, submission_id)
     if not submission:
         raise HTTPException(404, "Submission not found")
@@ -1618,6 +1654,24 @@ def apply_redline_submission(
         if already_applied:
             base_gc = already_applied[0]
             chained_from = {"id": base_gc.id, "name": base_gc.name}
+
+    # The owner can also directly edit a document (see edit_generated_document)
+    # in between redline rounds, which produces its own revision the same way
+    # an applied round does -- just linked by source_generated_id instead of
+    # source_submission_id. Walk forward through any such direct-edit
+    # revisions layered on top of whatever we just picked, so a direct edit
+    # made after the latest applied round (or on the original, if nothing's
+    # been applied yet) is never silently dropped either.
+    while True:
+        direct_edit = session.exec(
+            select(GeneratedContract)
+            .where(GeneratedContract.source_generated_id == base_gc.id)
+            .order_by(GeneratedContract.created_at.desc())
+        ).first()
+        if not direct_edit:
+            break
+        base_gc = direct_edit
+        chained_from = {"id": base_gc.id, "name": base_gc.name}
 
     gc = base_gc
     if not os.path.exists(gc.file_path):
@@ -1749,6 +1803,15 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
     gc = session.get(GeneratedContract, link.generated_contract_id)
     if not gc or not os.path.exists(gc.file_path):
         raise HTTPException(410, "This document is no longer available.")
+    # Computed against last_viewed_at BEFORE it gets overwritten just below --
+    # true only on the first visit after an owner edit, then naturally false
+    # again on every visit after that, with no separate flag to remember to
+    # clear. Requires a prior visit to have happened at all, so a first-ever
+    # visit never shows an "updated since you last looked" notice about a
+    # look that never happened.
+    owner_updated_since_last_view = bool(
+        link.owner_edited_at and link.last_viewed_at and link.owner_edited_at > link.last_viewed_at
+    )
     link.last_viewed_at = datetime.utcnow()
     session.add(link)
     # Log this exact view as its own row -- last_viewed_at above only ever
@@ -1836,6 +1899,7 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
         "sender_email": sender_email,
         "draft": draft_payload,
         "response": response_payload,
+        "owner_updated_since_last_view": owner_updated_since_last_view,
     }
 
 

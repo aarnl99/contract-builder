@@ -185,6 +185,13 @@ class ShareLink(SQLModel, table=True):
     status: str = "open"  # open | closed
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_viewed_at: Optional[datetime] = None
+    # Set whenever the owner directly edits (see main.edit_generated_document)
+    # the exact document this link points the client at, while the link is
+    # still open. Compared against last_viewed_at (before it's overwritten)
+    # on the client's next GET to decide whether to show them a "this was
+    # updated since you last looked" notice -- naturally resets itself once
+    # they've seen it, with no separate "acknowledged" flag needed.
+    owner_edited_at: Optional[datetime] = None
 
 
 class ShareLinkView(SQLModel, table=True):
