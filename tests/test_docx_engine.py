@@ -179,3 +179,125 @@ def test_save_preserves_table_that_was_never_marked(tmp_path):
     assert len(doc2.tables) == 1
     assert "COMPANY A" in doc2.tables[0].cell(0, 0).text
     assert "COMPANY B" in doc2.tables[0].cell(0, 1).text
+
+
+# ---------------------------------------------------------------------------
+# extract_text_at / apply_text_edits -- redlining directly on a generated
+# document (as opposed to mark_placeholder, which works on a *template*)
+# ---------------------------------------------------------------------------
+
+def test_extract_text_at_reads_back_exact_selection(tmp_path):
+    path = str(tmp_path / "sample.docx")
+    make_sample_doc(path)
+    doc = de.load(path)
+    text = de.extract_text_at(doc, [], 0, [{"r": 1, "start": 0, "end": len("Acme Corp")}])
+    assert text == "Acme Corp"
+
+
+def test_extract_text_at_invalid_offsets_raises(tmp_path):
+    path = str(tmp_path / "sample.docx")
+    make_sample_doc(path)
+    doc = de.load(path)
+    try:
+        de.extract_text_at(doc, [], 0, [{"r": 1, "start": 0, "end": 999}])
+        assert False, "expected MarkError"
+    except de.MarkError:
+        pass
+
+
+def test_apply_text_edits_single_free_text_replacement(tmp_path):
+    path = str(tmp_path / "sample.docx")
+    make_sample_doc(path)
+    doc = de.load(path)
+    # "the undersigned client" isn't a placeholder -- just arbitrary prose.
+    text = doc.paragraphs[0].runs[2].text
+    start = text.index("the undersigned client")
+    end = start + len("the undersigned client")
+    de.apply_text_edits(doc, [{
+        "container_path": [], "paragraph_index": 0,
+        "segments": [{"r": 2, "start": start, "end": end}],
+        "new_text": "Widget Industries LLC",
+    }])
+    assert "Widget Industries LLC" in doc.paragraphs[0].text
+    assert "the undersigned client" not in doc.paragraphs[0].text
+    # Untouched runs (the bold/italic placeholders) must survive intact.
+    assert "Acme Corp" in doc.paragraphs[0].text
+    assert "January 1, 2026" in doc.paragraphs[0].text
+
+
+def test_apply_text_edits_only_touches_the_targeted_occurrence(tmp_path):
+    """Regression test: two occurrences of the same value in different
+    paragraphs must be editable independently -- redlining one shouldn't
+    change the other, unlike the old field_key-wide substitution."""
+    doc = Document()
+    p1 = doc.add_paragraph()
+    p1.add_run("Net 30 days applies to the first invoice.")
+    p2 = doc.add_paragraph()
+    p2.add_run("Net 30 days also applies to every later invoice.")
+    path = str(tmp_path / "dup.docx")
+    doc.save(path)
+
+    doc2 = de.load(path)
+    text0 = doc2.paragraphs[0].runs[0].text
+    start0 = text0.index("Net 30 days")
+    de.apply_text_edits(doc2, [{
+        "container_path": [], "paragraph_index": 0,
+        "segments": [{"r": 0, "start": start0, "end": start0 + len("Net 30 days")}],
+        "new_text": "Net 45 days",
+    }])
+    assert doc2.paragraphs[0].text.startswith("Net 45 days")
+    assert doc2.paragraphs[1].text.startswith("Net 30 days")  # untouched
+
+
+def test_apply_text_edits_multiple_targets_same_paragraph(tmp_path):
+    doc = Document()
+    p = doc.add_paragraph()
+    p.add_run("Buyer shall pay Seller within 30 days of delivery to Chicago.")
+    path = str(tmp_path / "multi.docx")
+    doc.save(path)
+
+    doc2 = de.load(path)
+    text = doc2.paragraphs[0].runs[0].text
+    d_start = text.index("30 days")
+    d_end = d_start + len("30 days")
+    c_start = text.index("Chicago")
+    c_end = c_start + len("Chicago")
+    de.apply_text_edits(doc2, [
+        {"container_path": [], "paragraph_index": 0, "segments": [{"r": 0, "start": d_start, "end": d_end}], "new_text": "45 days"},
+        {"container_path": [], "paragraph_index": 0, "segments": [{"r": 0, "start": c_start, "end": c_end}], "new_text": "Denver"},
+    ])
+    assert doc2.paragraphs[0].text == "Buyer shall pay Seller within 45 days of delivery to Denver."
+
+
+def test_apply_text_edits_overlapping_selections_raise(tmp_path):
+    doc = Document()
+    p = doc.add_paragraph()
+    p.add_run("The quick brown fox.")
+    path = str(tmp_path / "overlap.docx")
+    doc.save(path)
+    doc2 = de.load(path)
+    try:
+        de.apply_text_edits(doc2, [
+            {"container_path": [], "paragraph_index": 0, "segments": [{"r": 0, "start": 4, "end": 15}], "new_text": "A"},
+            {"container_path": [], "paragraph_index": 0, "segments": [{"r": 0, "start": 10, "end": 19}], "new_text": "B"},
+        ])
+        assert False, "expected MarkError"
+    except de.MarkError:
+        pass
+
+
+def test_apply_text_edits_inside_table_cell(tmp_path):
+    path = str(tmp_path / "sig.docx")
+    make_doc_with_signature_table(path)
+    doc = de.load(path)
+    right_cell = doc.tables[0].cell(0, 1)
+    run_text = right_cell.paragraphs[1].runs[0].text
+    start = run_text.index("Jane Roe")
+    de.apply_text_edits(doc, [{
+        "container_path": [[0, 0, 1]], "paragraph_index": 1,
+        "segments": [{"r": 0, "start": start, "end": start + len("Jane Roe")}],
+        "new_text": "Janet Roe-Smith",
+    }])
+    assert right_cell.paragraphs[1].text == "Name: Janet Roe-Smith"
+    left_cell = doc.tables[0].cell(0, 0)
+    assert left_cell.paragraphs[1].text == "Name: John Doe"
