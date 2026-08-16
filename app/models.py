@@ -131,6 +131,12 @@ class GeneratedContract(SQLModel, table=True):
     # redlines from a client review round, so it's traceable back to the
     # submission that produced it (see RedlineSubmission below).
     source_submission_id: Optional[int] = Field(default=None, foreign_key="redlinesubmission.id")
+    # Set when this revision was produced by the owner editing a prior
+    # revision directly in the product (select text -> replace, applied
+    # instantly, no client involved) rather than through a redline round --
+    # its own lineage link, independent of source_submission_id, so direct
+    # edits still slot into the same revision-history chain as redlines.
+    source_generated_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
 
     owner: Optional[User] = Relationship(back_populates="generated_contracts")
 

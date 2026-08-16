@@ -731,12 +731,14 @@ def _get_owned_generated(session: Session, user: User, generated_id: int) -> Gen
 def _lineage_roots_for(rows: list, session: Session) -> dict:
     """Map generated_contract_id -> lineage root id for a set of
     GeneratedContract rows all belonging to the same owner. A document with
-    no source_submission_id is its own root; a redlined-and-applied
-    document's root is found by walking source_submission_id ->
-    RedlineSubmission.share_link_id -> ShareLink.generated_contract_id (its
-    parent document) back until a document with no source_submission_id is
-    reached. Defensive about broken chains (a deleted parent, etc.) -- those
-    just fall back to being their own root rather than erroring."""
+    neither source_submission_id nor source_generated_id is its own root.
+    A redlined-and-applied document's parent is found by walking
+    source_submission_id -> RedlineSubmission.share_link_id ->
+    ShareLink.generated_contract_id; a directly-edited revision's parent is
+    just source_generated_id. Either way the walk continues back until a
+    document with no parent is reached. Defensive about broken chains (a
+    deleted parent, etc.) -- those just fall back to being their own root
+    rather than erroring."""
     by_id = {g.id: g for g in rows}
     sub_ids = {g.source_submission_id for g in rows if g.source_submission_id}
     subs = {}
@@ -749,6 +751,15 @@ def _lineage_roots_for(rows: list, session: Session) -> dict:
 
     roots: dict = {}
 
+    def _parent_id(gc):
+        if gc.source_submission_id:
+            sub = subs.get(gc.source_submission_id)
+            link = links.get(sub.share_link_id) if sub else None
+            return link.generated_contract_id if link else None
+        if gc.source_generated_id:
+            return gc.source_generated_id
+        return None
+
     def resolve(gc_id, _seen=None):
         if gc_id in roots:
             return roots[gc_id]
@@ -758,9 +769,7 @@ def _lineage_roots_for(rows: list, session: Session) -> dict:
             return gc_id
         _seen.add(gc_id)
         gc = by_id.get(gc_id)
-        sub = subs.get(gc.source_submission_id) if gc and gc.source_submission_id else None
-        link = links.get(sub.share_link_id) if sub else None
-        parent_id = link.generated_contract_id if link else None
+        parent_id = _parent_id(gc) if gc else None
         if not gc or parent_id is None or parent_id == gc_id or parent_id not in by_id:
             roots[gc_id] = gc_id
             return gc_id
@@ -802,8 +811,14 @@ def _lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
 
     events = []
     for g in lineage_docs:
+        if g.source_submission_id:
+            ev_type = "redline_applied"
+        elif g.source_generated_id:
+            ev_type = "owner_edited"
+        else:
+            ev_type = "drafted"
         events.append({
-            "type": "redline_applied" if g.source_submission_id else "drafted",
+            "type": ev_type,
             "at": g.created_at.isoformat() + "Z",
             "document_id": g.id,
             "document_name": g.name,
@@ -916,6 +931,75 @@ def _client_lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
         "revision_count": len(full["documents"]),
         "timeline": [{"type": e["type"], "at": e["at"]} for e in full["timeline"]],
     }
+
+
+class DirectEditBody(BaseModel):
+    table_path: str = ""
+    paragraph_index: int
+    segments: list  # [{"r": int, "start": int, "end": int}, ...] -- same shape the browser already captures for template field-marking and redlining
+    new_text: str
+
+
+@app.post("/api/generated/{generated_id}/edit")
+def edit_generated_document(
+    generated_id: int,
+    body: DirectEditBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Owner-side direct editing: select a chunk of text right in the
+    generated document and replace it, applied immediately -- no client
+    approval step, since it's the owner editing their own document. Reuses
+    the exact same docx-splicing engine as accepted redlines
+    (docx_engine.apply_text_edits), and saves the result as a new revision
+    so it slots into the same lineage/history trail as redlines do (see
+    GeneratedContract.source_generated_id)."""
+    gc = _get_owned_generated(session, user, generated_id)
+    if not os.path.exists(gc.file_path):
+        raise HTTPException(410, "This file is no longer available.")
+    if not body.segments:
+        raise HTTPException(400, "No selection to edit.")
+
+    container_path = (
+        [[int(x) for x in triple.split(",")] for triple in body.table_path.split(";")]
+        if body.table_path else []
+    )
+
+    doc = de.load(gc.file_path)
+    try:
+        de.apply_text_edits(doc, [{
+            "container_path": container_path,
+            "paragraph_index": body.paragraph_index,
+            "segments": body.segments,
+            "new_text": body.new_text,
+        }])
+    except de.MarkError as err:
+        raise HTTPException(400, f"Couldn't apply that edit: {err}")
+
+    if gc.template_id:
+        gen_dir = os.path.join(_template_dir(user.id, gc.template_id), "generated")
+    else:
+        gen_dir = os.path.dirname(gc.file_path)
+    os.makedirs(gen_dir, exist_ok=True)
+    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
+    de.save(doc, out_path)
+
+    new_gc = GeneratedContract(
+        owner_id=user.id,
+        template_id=gc.template_id,
+        template_name=gc.template_name,
+        document_type=gc.document_type,
+        name=gc.name,
+        file_path=out_path,
+        values_json=gc.values_json,
+        field_positions_json=gc.field_positions_json,
+        parties_json=gc.parties_json,
+        source_generated_id=gc.id,
+    )
+    session.add(new_gc)
+    session.commit()
+    session.refresh(new_gc)
+    return {"id": new_gc.id, "name": new_gc.name}
 
 
 @app.get("/api/generated/{generated_id}/download")
