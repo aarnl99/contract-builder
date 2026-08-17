@@ -2049,6 +2049,39 @@ def apply_redline_submission(
         )
 
     doc = de.load(gc.file_path)
+
+    # Guard against a stale accepted/auto-approved edit whose recorded text
+    # no longer matches what's actually at that spot in `gc` -- e.g. the
+    # owner made a direct edit (edit_generated_document) or applied another
+    # redline round on the same paragraph after this one was accepted but
+    # before it was applied. de.apply_text_edits only checks that its
+    # recorded run/offsets are numerically IN BOUNDS for whatever now
+    # occupies that run -- it has no idea whether the text there is still
+    # what this edit was proposed against, so a shifted-but-still-in-bounds
+    # location would otherwise splice this edit's proposed value into the
+    # wrong text with no error at all (reproduced: an intervening direct
+    # edit of similar length left the run just long enough that the stale
+    # offsets stayed "valid" while pointing at completely different
+    # characters, silently mangling the sentence). Comparing the location's
+    # current text against what was captured at submit time catches this
+    # up front and fails loudly instead.
+    stale = []
+    for e, loc in edit_targets:
+        try:
+            current_text = de.extract_text_at(doc, loc.get("container_path"), loc["paragraph_index"], loc["segments"])
+        except de.MarkError:
+            current_text = None
+        if current_text != e.original_value:
+            stale.append(e)
+    if stale:
+        names = ", ".join(f'"{e.label or "that field"}"' for e in stale[:3])
+        more = f" and {len(stale) - 3} more" if len(stale) > 3 else ""
+        raise HTTPException(
+            400,
+            f"The document has changed since {names}{more} was accepted, so applying now could overwrite the wrong "
+            "text. Please re-review the current document before applying this round.",
+        )
+
     try:
         de.apply_text_edits(doc, [
             {
