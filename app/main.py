@@ -763,6 +763,19 @@ def _parse_table_path(path_str: str) -> list[list[int]]:
         raise HTTPException(400, "Invalid table path")
 
 
+def _table_path_str(container_path: list) -> str:
+    """Inverse of _parse_table_path: turn a stored [[t, r, c], ...] list
+    back into the "t,r,c;t,r,c" string EditLocationBody.table_path expects.
+    Needed anywhere a RedlineEdit's saved location_json (which stores
+    "container_path" as a list, see _resolve_edits) gets handed back to the
+    client for reuse in a follow-up submission -- without this conversion,
+    the client's next request carries no "table_path" key at all, silently
+    defaulting to "" (top-level body) and resolving a table-cell redline
+    against the wrong paragraph. See RedlineEdit's location round-trip
+    (draft_payload / response_payload in get_share_document)."""
+    return ";".join(",".join(str(x) for x in step) for step in (container_path or []))
+
+
 @app.post("/api/templates/{template_id}/mark")
 def mark_placeholder(
     template_id: int,
@@ -790,6 +803,23 @@ def mark_placeholder(
     container_path = _parse_table_path(body.table_path)
 
     doc = de.load(tpl.working_path)
+
+    # Captured BEFORE mark_placeholder overwrites the selection with the
+    # {{token}}, so un-marking (delete_placeholder) can restore the actual
+    # original wording later instead of having nothing left to fall back
+    # on but the field's label. Only meaningful for a brand-new field --
+    # reusing an existing field_key at a second location doesn't get its
+    # own row, so if that second occurrence's surrounding text differed
+    # from the first, un-marking still restores only the first occurrence's
+    # text everywhere (matches the existing one-row-per-field model, which
+    # already fills every occurrence with the same value).
+    original_text = None
+    if existing_placeholder is None:
+        try:
+            original_text = de.extract_text_at(doc, container_path, body.paragraph_index, [s.dict() for s in body.segments])
+        except de.MarkError:
+            pass  # mark_placeholder below will raise the same error with a proper message
+
     try:
         de.mark_placeholder(
             doc, body.paragraph_index, [s.dict() for s in body.segments], field_key,
@@ -817,6 +847,7 @@ def mark_placeholder(
             required=body.required,
             order=max_order + 1,
             preset_options_json=preset_options_json,
+            original_text=original_text or "",
         )
         session.add(placeholder)
         session.commit()
@@ -904,7 +935,14 @@ def delete_placeholder(
         raise HTTPException(404, "Placeholder not found")
 
     doc = de.load(tpl.working_path)
-    de.fill_template(doc, {ph.field_key: ph.label})
+    # Restore the actual original wording captured at mark-time (see
+    # Placeholder.original_text) rather than baking in the field's label --
+    # a real generated contract could otherwise end up with literal
+    # placeholder text like "Client Name" sitting where "the undersigned"
+    # or whatever the document actually said used to be. Only placeholders
+    # marked before original_text existed have nothing to fall back on but
+    # the label, same as delete_placeholder always did.
+    de.fill_template(doc, {ph.field_key: ph.original_text or ph.label})
     de.save(doc, tpl.working_path)
 
     session.delete(ph)
@@ -980,28 +1018,9 @@ def generate_contract(
     if not tpl.placeholders:
         raise HTTPException(400, "This template has no placeholders yet. Mark some fields before drafting from it.")
 
-    plan = _plan_info(session, user)
-    if plan["limit"] is not None and plan["used"] >= plan["limit"]:
-        raise HTTPException(
-            402,
-            f"You have used all {plan['limit']} contracts included in your {user.plan} plan this month. "
-            f"Upgrade your plan to draft more.",
-        )
-
     missing = [p.label for p in tpl.placeholders if p.required and not (body.values.get(p.field_key) or "").strip()]
     if missing:
         raise HTTPException(400, f"Missing required fields: {', '.join(missing)}")
-
-    doc = de.load(tpl.working_path)
-    field_positions = de.fill_template_tracked(doc, body.values)
-
-    gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
-    os.makedirs(gen_dir, exist_ok=True)
-    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
-    de.save(doc, out_path)
-
-    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
-    display_name = f"{safe_name} - {datetime.utcnow().strftime('%b %d, %Y')}"
 
     values_snapshot = [
         {"label": p.label, "field_key": p.field_key, "value": body.values.get(p.field_key, "")}
@@ -1019,6 +1038,15 @@ def generate_contract(
     # with the same field values was created in the last few seconds, treat
     # this as a repeat of that request and hand back the existing row
     # instead of creating a second document.
+    #
+    # Deliberately checked BEFORE the plan-limit gate below (and before any
+    # file gets written): a legitimate retry of the request that pushed you
+    # to exactly your limit would otherwise see used >= limit on its own
+    # re-check and get rejected with "plan limit reached", even though it's
+    # not actually asking for a new slot -- it's the same request landing
+    # twice. Checking dedup first also means a duplicate never generates or
+    # saves a second .docx to begin with, instead of generating one and
+    # discarding it.
     dedup_window = datetime.utcnow() - timedelta(seconds=15)
     recent_dupe = session.exec(
         select(GeneratedContract).where(
@@ -1038,6 +1066,25 @@ def generate_contract(
             "html": de.render_paragraphs_html(preview_doc),
             "plan": _plan_info(session, user),
         }
+
+    plan = _plan_info(session, user)
+    if plan["limit"] is not None and plan["used"] >= plan["limit"]:
+        raise HTTPException(
+            402,
+            f"You have used all {plan['limit']} contracts included in your {user.plan} plan this month. "
+            f"Upgrade your plan to draft more.",
+        )
+
+    doc = de.load(tpl.working_path)
+    field_positions = de.fill_template_tracked(doc, body.values)
+
+    gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
+    os.makedirs(gen_dir, exist_ok=True)
+    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
+    de.save(doc, out_path)
+
+    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
+    display_name = f"{safe_name} - {datetime.utcnow().strftime('%b %d, %Y')}"
 
     gc = GeneratedContract(
         owner_id=user.id,
@@ -1674,11 +1721,12 @@ def get_redlines(
     # (e.g. reached via the Redlines button on a stale in-app notification,
     # or an older row in the document's history) would otherwise come up
     # empty even though the same link/submissions still apply.
-    link = session.exec(
+    links = session.exec(
         select(ShareLink)
         .where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)))
         .order_by(ShareLink.created_at.desc())
-    ).first()
+    ).all()
+    link = links[0] if links else None
 
     header = {
         "name": gc.name,
@@ -1694,11 +1742,20 @@ def get_redlines(
     if not link:
         return {"header": header, "share": None, "submissions": []}
 
-    # "draft" submissions are just the client's in-progress "Save progress"
-    # state -- not a real submission yet, so the owner never sees them here.
+    # Every submission from EVERY link this family has ever had, not just
+    # the most recent one -- if a link is closed and a fresh one issued
+    # (e.g. re-sharing after a round of edits, or replacing a link the
+    # client lost), whatever the client already submitted through the old,
+    # now-closed link must stay visible here. The client saw "your changes
+    # were sent" at the time; losing that submission just because a newer
+    # link now exists would silently strand it with no way for the owner to
+    # ever see or act on it. "draft" submissions are just the client's
+    # in-progress "Save progress" state -- not a real submission yet, so
+    # the owner never sees those regardless of which link they're on.
+    link_ids = [l.id for l in links]
     submissions = session.exec(
         select(RedlineSubmission)
-        .where(RedlineSubmission.share_link_id == link.id, RedlineSubmission.status != "draft")
+        .where(RedlineSubmission.share_link_id.in_(link_ids), RedlineSubmission.status != "draft")
         .order_by(RedlineSubmission.submitted_at.desc())
     ).all()
     out = []
@@ -2140,6 +2197,22 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
     sender = session.get(User, gc.owner_id)
     sender_email = link.sender_email or (sender.email if sender else "")
 
+    def _client_location(e: "RedlineEdit") -> Optional[dict]:
+        """RedlineEdit.location_json stores "container_path" (a parsed
+        list) -- the server's own internal shape. A location handed back
+        to the client for reuse in a follow-up submission needs
+        "table_path" (a string) instead, matching what EditLocationBody
+        expects and what a fresh browser selection actually sends (see
+        share.js's computeSelectionSegments). Without this conversion the
+        client's next request silently has no table_path at all, defaults
+        to "" (top-level body), and a table-cell redline resolves against
+        the wrong paragraph on resume/counter-accept. See _table_path_str."""
+        loc = json.loads(e.location_json or "{}")
+        if not loc:
+            return None
+        loc["table_path"] = _table_path_str(loc.get("container_path") or [])
+        return loc
+
     # If the client saved progress on an earlier visit, hand it back so the
     # page can resume exactly where they left off instead of starting over.
     draft = session.exec(
@@ -2154,7 +2227,7 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
                 {
                     "field_key": e.field_key, "label": e.label, "proposed_value": e.proposed_value,
                     "original_value": e.original_value, "comment": e.comment,
-                    "location": json.loads(e.location_json or "{}") or None,
+                    "location": _client_location(e),
                     # See RedlineEdit.source_edit_id -- without sending this
                     # back, share.js's draft-resume path had no way to know
                     # this saved item was a counter-acceptance, so it would
@@ -2191,7 +2264,7 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
                     "id": e.id, "field_key": e.field_key, "label": e.label,
                     "proposed_value": e.proposed_value, "original_value": e.original_value,
                     "decision": e.decision, "counter_value": e.counter_value,
-                    "location": json.loads(e.location_json or "{}") or None,
+                    "location": _client_location(e),
                     "client_reply": e.client_reply,
                     "client_reply_at": e.client_reply_at.isoformat() if e.client_reply_at else None,
                 }

@@ -72,11 +72,26 @@ def _iter_unique_cells(table: Table):
     the table, addressed by the (row, col) of its first occurrence in
     reading order. A cell spanned by a horizontal/vertical merge is the
     same underlying XML element for every grid position it covers, so we
-    skip it on repeat occurrences -- each physical cell is yielded once."""
+    skip it on repeat occurrences -- each physical cell is yielded once.
+
+    Dedup key is the cell's underlying lxml element itself (`cell._tc`),
+    NOT `id(cell._tc)`. python-docx hands back a fresh `_Cell` wrapper
+    object on every `row.cells` access, so the wrapper (and the id() of
+    whatever it points at) is only alive for that one iteration -- CPython
+    is then free to reuse that same memory address for the *next* cell's
+    wrapper, making two genuinely distinct cells collide on `id()` and get
+    misidentified as a repeat of the same merged cell. That's not
+    hypothetical: it reproduced on a plain, unmerged 2x2 table, silently
+    dropping the last cell from rendering, marking, redlining, AND
+    placeholder-value substitution at generation time (a real generated
+    contract could go out with a literal unreplaced "{{field_key}}" token).
+    Keying on the element itself avoids this: the set holds a real
+    reference to each element for as long as iteration runs, so nothing
+    it points at can be freed and its address reused underneath us."""
     seen = set()
     for r_idx, row in enumerate(table.rows):
         for c_idx, cell in enumerate(row.cells):
-            key = id(cell._tc)
+            key = cell._tc
             if key in seen:
                 continue
             seen.add(key)

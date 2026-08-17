@@ -108,6 +108,14 @@ class Placeholder(SQLModel, table=True):
     required: bool = True
     order: int = 0
 
+    # The literal text that was selected and replaced with {{field_key}}
+    # when this field was first marked -- captured so un-marking
+    # (main.delete_placeholder) can restore the actual original wording
+    # instead of having nothing to fall back on but the field's label.
+    # "" for placeholders marked before this field existed; delete_placeholder
+    # falls back to the label in that case, same as it always has.
+    original_text: str = ""
+
     # Only used when field_type == "clause_preset": named whole-paragraph
     # variants defined on this template (e.g. "Delaware" / "California"
     # versions of a governing-law clause), so drafting swaps in an entire
