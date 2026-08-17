@@ -240,6 +240,47 @@ function toggleAvatarMenu() {
   }
   api("/api/account/email-alias").then((res) => paintAliasRow(res.address));
 
+  // ---- notification settings: per-type opt-out for both the bell and the
+  // matching email a client's action can trigger. Each toggle saves
+  // immediately on change (same pattern as the plan row above), no
+  // separate save step. ----
+  const notifRow = el("div", { class: "plan-row" });
+  notifRow.appendChild(el("div", { class: "label" }, "Notifications"));
+  const NOTIF_TOGGLES = [
+    { key: "redline_submitted", label: "Someone sends redlines" },
+    { key: "response_acknowledged", label: "Client sees your response" },
+    { key: "redline_comment", label: "Client comments on a declined redline" },
+  ];
+  const notifList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:2px;" }, [
+    el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."),
+  ]);
+  notifRow.appendChild(notifList);
+  dd.appendChild(notifRow);
+
+  function paintNotifToggles(settings) {
+    notifList.innerHTML = "";
+    NOTIF_TOGGLES.forEach((t) => {
+      const check = el("input", { type: "checkbox", checked: settings[t.key] ? "checked" : undefined });
+      check.checked = !!settings[t.key];
+      check.addEventListener("change", async () => {
+        check.disabled = true;
+        try {
+          const res = await api("/api/account/notification-settings", { method: "PATCH", body: { [t.key]: check.checked } });
+          paintNotifToggles(res);
+        } catch (e) {
+          check.checked = !check.checked; // revert on failure
+          alert(e.message);
+        } finally {
+          check.disabled = false;
+        }
+      });
+      notifList.appendChild(
+        el("label", { style: "display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink-soft);cursor:pointer;" }, [check, t.label])
+      );
+    });
+  }
+  api("/api/account/notification-settings").then((res) => paintNotifToggles(res));
+
   const logoutRow = el("div", { class: "logout-row" }, [el("button", { onclick: doLogout }, "Log out")]);
   dd.appendChild(logoutRow);
 
