@@ -2293,11 +2293,11 @@ const BUG_TRACKER = {
     { id: "#10", title: "Un-marking a placeholder field baked the field's label text into the document", fix: "The actual original text is now captured at mark-time and restored on un-mark" },
     { id: "#11", title: "A couple of share-page panels had no error handling and could spin forever", fix: "Both panels now show an error message with a Retry button instead of hanging on “Loading...”" },
     { id: "#12", title: "No autosave or refresh warning on the client share page", fix: "Added a beforeunload warning whenever a suggestion, comment, note, or accepted counter is sitting unsaved" },
+    { id: "#15", title: "No file-size cap on template uploads", fix: "Uploads over 20MB are now rejected -- checked via Content-Length up front and again while streaming to disk, with cleanup on a rejected upload" },
+    { id: "#16", title: "A few lower-risk buttons had no double-click guard or error handling", fix: "Mark-placeholder Save, delete template, and reset template now disable with an in-progress label during the request, and restore themselves with an error message on failure" },
   ],
   open: [
-    { id: "#14", priority: "P3", title: "No rate limit on share-link access-code attempts" },
-    { id: "#15", priority: "P3", title: "No file-size cap on template uploads" },
-    { id: "#16", priority: "P3", title: "A few lower-risk buttons have no double-click guard or error handling", detail: "Mark-placeholder Save, delete template, reset template." },
+    { id: "#14", priority: "P3", title: "No rate limit on share-link access-code attempts", detail: "Reviewed and intentionally left open -- not considered important enough to prioritize right now." },
   ],
 };
 
