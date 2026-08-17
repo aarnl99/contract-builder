@@ -951,8 +951,23 @@ async function openRedlinesModal(generatedId) {
     } else {
       data.submissions.forEach((sub) => {
         const subBox = el("div", { class: "redline-submission" });
-        const awaitingResponse = sub.status === "pending" && !sub.responded_at;
-        const statusLabel = sub.responded_at ? "Response sent" : sub.status === "reviewed" ? "Applied" : "Pending review";
+        // Gated on whether any edit in this round is still undecided, NOT
+        // just on whether a response was already sent -- responding is
+        // allowed to cover only some of a round's edits (see the "Send
+        // response" handler below), and previously, once responded_at was
+        // set, the leftover pending edits permanently lost their decision
+        // buttons with no other way in the product to ever decide them.
+        // Recomputing this from the actual remaining work means a second,
+        // later response for the rest of the round is always possible.
+        const undecidedCount = sub.edits.filter((e) => e.decision === "pending").length;
+        const awaitingResponse = sub.status === "pending" && undecidedCount > 0;
+        const statusLabel = sub.status === "reviewed"
+          ? "Applied"
+          : !sub.responded_at
+          ? "Pending review"
+          : undecidedCount > 0
+          ? `Response sent · ${undecidedCount} more still need${undecidedCount === 1 ? "s" : ""} a decision`
+          : "Response sent";
         subBox.appendChild(
           el("div", { class: "sub-header" }, [
             el("div", { style: "font-weight:700;font-size:13px;" }, statusLabel),
