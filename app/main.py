@@ -975,15 +975,22 @@ def _lineage_roots_for(rows: list, session: Session) -> dict:
     """Map generated_contract_id -> lineage root id for a set of
     GeneratedContract rows all belonging to the same owner. A document with
     neither source_submission_id nor source_generated_id is its own root.
-    A redlined-and-applied document's parent is found by walking
+    A directly-edited revision's parent is source_generated_id. A
+    redlined-and-applied document's parent is ALSO source_generated_id (set
+    alongside source_submission_id since apply_redline_submission started
+    stamping both) -- falls back to the older indirect path (walking
     source_submission_id -> RedlineSubmission.share_link_id ->
-    ShareLink.generated_contract_id; a directly-edited revision's parent is
-    just source_generated_id. Either way the walk continues back until a
+    ShareLink.generated_contract_id) only for rows applied before that field
+    existed. That fallback is best-effort, not exact: ShareLink.generated_
+    contract_id is a live pointer that a later apply on the same link keeps
+    moving forward (see apply_redline_submission's same-link repoint), so it
+    only still reflects a given row's true parent if no later apply has
+    happened on that link since. Either way the walk continues back until a
     document with no parent is reached. Defensive about broken chains (a
     deleted parent, etc.) -- those just fall back to being their own root
     rather than erroring."""
     by_id = {g.id: g for g in rows}
-    sub_ids = {g.source_submission_id for g in rows if g.source_submission_id}
+    sub_ids = {g.source_submission_id for g in rows if g.source_submission_id and not g.source_generated_id}
     subs = {}
     if sub_ids:
         subs = {s.id: s for s in session.exec(select(RedlineSubmission).where(RedlineSubmission.id.in_(sub_ids))).all()}
@@ -995,12 +1002,12 @@ def _lineage_roots_for(rows: list, session: Session) -> dict:
     roots: dict = {}
 
     def _parent_id(gc):
+        if gc.source_generated_id:
+            return gc.source_generated_id
         if gc.source_submission_id:
             sub = subs.get(gc.source_submission_id)
             link = links.get(sub.share_link_id) if sub else None
             return link.generated_contract_id if link else None
-        if gc.source_generated_id:
-            return gc.source_generated_id
         return None
 
     def resolve(gc_id, _seen=None):
@@ -1023,6 +1030,19 @@ def _lineage_roots_for(rows: list, session: Session) -> dict:
     for g in rows:
         resolve(g.id)
     return roots
+
+
+def _lineage_doc_ids(gc: GeneratedContract, session: Session) -> set:
+    """Every GeneratedContract id in the same lineage family as gc,
+    including gc itself -- e.g. so a share link can be found regardless of
+    which specific revision in the family it currently points at (a redline
+    apply keeps moving that pointer forward; see apply_redline_submission's
+    same-link repoint), instead of requiring an exact id match against
+    whichever revision happens to be in hand."""
+    all_docs = session.exec(select(GeneratedContract).where(GeneratedContract.owner_id == gc.owner_id)).all()
+    roots = _lineage_roots_for(all_docs, session)
+    root_id = roots.get(gc.id, gc.id)
+    return {g.id for g in all_docs if roots.get(g.id) == root_id}
 
 
 def _lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
@@ -1460,8 +1480,16 @@ def get_redlines(
     ph_by_key = {p.field_key: p for p in tpl.placeholders} if tpl else {}
     parties = json.loads(gc.parties_json or "[]")
 
+    # Matched against the whole lineage family, not just this exact
+    # revision's id -- a redline apply repoints the link forward to the
+    # newest revision, so looking up "the link" against an older revision
+    # (e.g. reached via the Redlines button on a stale in-app notification,
+    # or an older row in the document's history) would otherwise come up
+    # empty even though the same link/submissions still apply.
     link = session.exec(
-        select(ShareLink).where(ShareLink.generated_contract_id == gc.id).order_by(ShareLink.created_at.desc())
+        select(ShareLink)
+        .where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)))
+        .order_by(ShareLink.created_at.desc())
     ).first()
 
     header = {
@@ -1501,6 +1529,8 @@ def get_redlines(
                 "comment": e.comment,
                 "evaluation": e.evaluation, "decision": e.decision, "counter_value": e.counter_value,
                 "threshold_desc": threshold_desc, "inside_threshold": inside_threshold,
+                "client_reply": e.client_reply,
+                "client_reply_at": e.client_reply_at.isoformat() if e.client_reply_at else None,
             })
         out.append({
             "id": s.id,
@@ -1739,8 +1769,17 @@ def apply_redline_submission(
         field_positions_json=gc.field_positions_json,
         parties_json=gc.parties_json,  # carry the parties forward from the original draft
         source_submission_id=submission.id,
+        # Also stamped with the exact document these edits were spliced onto
+        # (same as gc/base_gc above) -- an explicit, immutable parent
+        # pointer independent of source_submission_id's indirect path
+        # (submission -> share_link_id -> ShareLink.generated_contract_id).
+        # That indirect path stops being reliable once the apply below can
+        # repoint the link forward to newer revisions -- see
+        # _lineage_roots_for's _parent_id, which now prefers this field.
+        source_generated_id=gc.id,
     )
     session.add(new_gc)
+    session.flush()  # assigns new_gc.id, needed below to repoint the share link
 
     applied_ids = {e.id for e, _ in edit_targets}
     for e in to_apply:
@@ -1749,6 +1788,19 @@ def apply_redline_submission(
             session.add(e)
     submission.status = "reviewed"
     session.add(submission)
+
+    # The client should be able to refresh this exact same link, re-enter
+    # the same access code, and see the applied revision -- no brand-new
+    # link needed. Mirrors edit_generated_document's direct-edit repoint
+    # (including reusing owner_edited_at, so the same self-clearing "updated
+    # since your last visit" banner fires here too) -- this was previously
+    # missing here, so Apply silently left the link pointing at the
+    # pre-redline document.
+    if link.status == "open":
+        link.generated_contract_id = new_gc.id
+        link.owner_edited_at = datetime.utcnow()
+        session.add(link)
+
     session.commit()
     session.refresh(new_gc)
 
@@ -1880,10 +1932,12 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
             "responded_at": responded.responded_at.isoformat(),
             "edits": [
                 {
-                    "field_key": e.field_key, "label": e.label,
+                    "id": e.id, "field_key": e.field_key, "label": e.label,
                     "proposed_value": e.proposed_value, "original_value": e.original_value,
                     "decision": e.decision, "counter_value": e.counter_value,
                     "location": json.loads(e.location_json or "{}") or None,
+                    "client_reply": e.client_reply,
+                    "client_reply_at": e.client_reply_at.isoformat() if e.client_reply_at else None,
                 }
                 for e in responded_edits
             ],
@@ -2082,6 +2136,86 @@ def get_share_history(token: str, request: Request, session: Session = Depends(g
     return _client_lineage_timeline(gc, session)
 
 
+@app.get("/api/share/{token}/redlines")
+def get_share_redlines(token: str, request: Request, session: Session = Depends(get_session)):
+    """Every non-draft round the client has ever submitted through this
+    link, with the sender's decision on each edit and the client's own
+    reply (if any) to a declined one. Unlike the one-shot `response` field
+    on GET /api/share/{token} -- which only ever surfaces the single latest
+    round, and only until the client acknowledges it -- this is the full,
+    durable record: always available, on every visit, for as long as the
+    link stays open. Threshold rules are never included here, same as
+    everywhere else client-facing."""
+    link = _require_share_session(request, token, session)
+    submissions = session.exec(
+        select(RedlineSubmission)
+        .where(RedlineSubmission.share_link_id == link.id, RedlineSubmission.status != "draft")
+        .order_by(RedlineSubmission.submitted_at.desc())
+    ).all()
+    out = []
+    for s in submissions:
+        edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all()
+        out.append({
+            "id": s.id,
+            "submitted_at": s.submitted_at.isoformat(),
+            "responded_at": s.responded_at.isoformat() if s.responded_at else None,
+            "status": s.status,
+            "note": s.note,
+            "edits": [
+                {
+                    "id": e.id, "label": e.label,
+                    "original_value": e.original_value, "proposed_value": e.proposed_value,
+                    "comment": e.comment,
+                    "decision": e.decision, "counter_value": e.counter_value,
+                    "client_reply": e.client_reply,
+                    "client_reply_at": e.client_reply_at.isoformat() if e.client_reply_at else None,
+                }
+                for e in edits
+            ],
+        })
+    return {"submissions": out}
+
+
+class ClientReplyBody(BaseModel):
+    reply: str
+
+
+@app.post("/api/share/{token}/edits/{edit_id}/reply")
+def reply_to_redline_edit(token: str, edit_id: int, body: ClientReplyBody, request: Request, session: Session = Depends(get_session)):
+    """Lets the client leave a comment on a redline the sender declined --
+    doesn't reopen the decision itself, just attaches a note the sender
+    sees on their side (Redlines modal + a notification), so a straight
+    rejection isn't necessarily the end of the conversation. Re-callable to
+    edit an existing comment; always just overwrites the previous one."""
+    link = _require_share_session(request, token, session)
+    edit = session.get(RedlineEdit, edit_id)
+    submission = session.get(RedlineSubmission, edit.submission_id) if edit else None
+    if not edit or not submission or submission.share_link_id != link.id:
+        raise HTTPException(404, "That redline no longer exists.")
+    if edit.decision != "rejected":
+        raise HTTPException(400, "You can only leave a comment on a redline that was declined.")
+    reply = body.reply.strip()
+    if not reply:
+        raise HTTPException(400, "Enter a comment before sending.")
+    edit.client_reply = reply[:2000]
+    edit.client_reply_at = datetime.utcnow()
+    session.add(edit)
+    session.commit()
+
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    owner = session.get(User, gc.owner_id) if gc else None
+    if owner and gc:
+        _send_redline_comment_notification(owner, gc, link, edit)
+        who = link.client_email.strip() or "The reviewer"
+        _notify(
+            session, owner.id, "redline_comment",
+            title=f'{who} commented on a declined redline in "{gc.name}"',
+            body=reply[:200],
+            generated_contract_id=gc.id,
+        )
+    return {"id": edit.id, "client_reply": edit.client_reply, "client_reply_at": edit.client_reply_at.isoformat()}
+
+
 @app.get("/api/share/{token}/download")
 def download_share_document(token: str, request: Request, session: Session = Depends(get_session)):
     link = _require_share_session(request, token, session)
@@ -2255,12 +2389,33 @@ def _send_response_acknowledged_notification(owner: User, gc: GeneratedContract,
         pass  # SENDGRID_API_KEY not configured yet -- the in-app notification below still lands either way
 
 
+def _send_redline_comment_notification(owner: User, gc: GeneratedContract, link: ShareLink, edit: RedlineEdit):
+    """Lets the owner know the client pushed back on a redline they
+    declined, without them needing to keep re-opening the Redlines modal to
+    check -- see reply_to_redline_edit."""
+    who = link.client_email.strip() or "The reviewer"
+    body = (
+        f'{who} left a comment on a redline you declined in "{gc.name}":\n\n'
+        f'"{edit.label}": {edit.original_value or "(blank)"} -> {edit.proposed_value}\n'
+        f'Their comment: "{edit.client_reply}"\n\n'
+        "Log in to your Rotely documents library to respond.\n\n- Rotely"
+    )
+    try:
+        ee.send_email(
+            owner.email, f'{who} commented on a declined redline in "{gc.name}"', body,
+            reply_to=(link.client_email.strip() or None),
+        )
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the in-app notification below still lands either way
+
+
 def _notify(session: Session, user_id: int, type_: str, title: str, body: str = "", generated_contract_id: Optional[int] = None):
-    """Writes one row to the owner's in-app notification bell. The ONLY two
-    call sites for this, on purpose (see the Notification model docstring):
-    submit_redlines (a client submitted redlines) and acknowledge_response
-    (a client acknowledged the owner's response). Nothing else should call
-    this -- keeping the bell to exactly those two triggers is a deliberate
+    """Writes one row to the owner's in-app notification bell. Three call
+    sites, on purpose (see the Notification model docstring): submit_redlines
+    (a client submitted redlines), acknowledge_response (a client
+    acknowledged the owner's response), and reply_to_redline_edit (a client
+    commented on a redline the owner declined). Nothing else should call
+    this -- keeping the bell to exactly those triggers is a deliberate
     product decision, not an oversight."""
     session.add(Notification(user_id=user_id, type=type_, title=title, body=body, generated_contract_id=generated_contract_id))
     session.commit()

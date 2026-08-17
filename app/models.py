@@ -271,6 +271,12 @@ class RedlineEdit(SQLModel, table=True):
     # this edit targets. Empty "{}" only for rows written before this field
     # existed; such rows can no longer be applied and are skipped.
     location_json: str = "{}"
+    # The client's own comment on a redline the sender declined -- lets them
+    # push back or explain without reopening the decision itself. Settable
+    # (and re-settable) only while decision == "rejected" -- see
+    # main.reply_to_redline_edit.
+    client_reply: str = ""
+    client_reply_at: Optional[datetime] = None
 
 
 # ---------------------------------------------------------------------------
@@ -312,14 +318,15 @@ class EmailDraftRequest(SQLModel, table=True):
 
 class Notification(SQLModel, table=True):
     """One in-app bell notification for an account owner. Deliberately
-    narrow-scoped: only two things ever create a row here -- a client
-    submitting redlines for review, and a client acknowledging the owner's
-    response to a submission (see main.py's submit_redlines and
-    acknowledge_response). Nothing else should write to this table."""
+    narrow-scoped: only three things ever create a row here -- a client
+    submitting redlines for review, a client acknowledging the owner's
+    response to a submission, and a client commenting on a redline the
+    owner declined (see main.py's submit_redlines, acknowledge_response,
+    and reply_to_redline_edit). Nothing else should write to this table."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id", index=True)
-    type: str  # "redline_submitted" | "response_acknowledged"
+    type: str  # "redline_submitted" | "response_acknowledged" | "redline_comment"
     title: str
     body: str = ""
     generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
