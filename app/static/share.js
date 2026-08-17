@@ -274,11 +274,15 @@ function DocumentView(data) {
   (data.fields || []).forEach((f) => { fieldByKey[f.field_key] = f; });
 
   // locKey(location) -> { field_key, label, location, original_text, value, comment,
-  // counterPending, clientOriginalValue }. counterPending marks a spot the
-  // sender just countered that the client hasn't explicitly accepted,
+  // counterPending, clientOriginalValue, sourceEditId }. counterPending marks a
+  // spot the sender just countered that the client hasn't explicitly accepted,
   // rejected, or re-suggested yet -- see handleRunClick / renderList below,
   // where those get a 3-way Accept/Reject/Suggest chip instead of the
-  // normal single "Edit suggestion" one.
+  // normal single "Edit suggestion" one. sourceEditId, when set, is the id of
+  // the sender's countered RedlineEdit this spot originated from -- sent back
+  // as accepting_edit_id on submit so the server can recognize "the client is
+  // just taking the sender's own counter" and skip re-asking the sender to
+  // approve a value they already proposed themselves (see acceptCounter).
   const edits = {};
 
   if (data.draft && data.draft.edits) {
@@ -289,6 +293,7 @@ function DocumentView(data) {
         field_key: e.field_key || "", label: e.label || "", location: loc,
         original_text: e.original_value || "", value: e.proposed_value, comment: e.comment || "",
         counterPending: !!e.is_counter, clientOriginalValue: e.client_original_value || "",
+        sourceEditId: e.source_edit_id || null,
       };
     });
   }
@@ -859,7 +864,7 @@ function DocumentView(data) {
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving...";
     try {
-      const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location }));
+      const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null }));
       await api(`/api/share/${TOKEN}/save-progress`, { method: "POST", body: { edits: editList, note: noteInput.value.trim() } });
       saveNote.textContent = "Saved — come back anytime with your access code.";
     } catch (e) {
@@ -901,7 +906,7 @@ function DocumentView(data) {
   const submitBtn = el("button", { class: "btn" }, "Finalize and submit");
   submitBtn.addEventListener("click", async () => {
     errBox.innerHTML = "";
-    const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location }));
+    const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null }));
     if (!editList.length && !noteInput.value.trim()) {
       errBox.appendChild(el("div", { class: "error-box" }, "Suggest a change or add a comment before submitting."));
       return;
@@ -954,6 +959,7 @@ async function loadDocument() {
           .map((e) => ({
             field_key: e.field_key, label: e.label, proposed_value: e.counter_value, comment: "", location: e.location,
             original_value: e.original_value, is_counter: true, client_original_value: e.proposed_value,
+            source_edit_id: e.id,
           }));
         const fresh = await api(`/api/share/${TOKEN}`);
         if (seeded.length) {

@@ -1096,6 +1096,17 @@ async function openRedlinesModal(generatedId) {
                   `The new version includes those changes plus this round's.`
                 );
               }
+              if (result.folded_in_submissions && result.folded_in_submissions.length) {
+                // Any other round on this link that had already been decided
+                // but never applied got folded into this same apply -- see
+                // apply_redline_submission's docstring. Tell the owner so
+                // it's clear why those other rounds now show as applied too.
+                const n = result.folded_in_submissions.length;
+                alert(
+                  `This also included ${n} other already-decided round${n === 1 ? "" : "s"} on this document that ` +
+                  `hadn't been applied yet -- nothing decided so far was left behind.`
+                );
+              }
               location.hash = "#/documents";
             } catch (e) {
               applyBtn.disabled = false;
