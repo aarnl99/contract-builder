@@ -199,11 +199,15 @@ function toggleAvatarMenu() {
       [el("span", { class: "plan-option-label" }, p.label), el("span", { class: "plan-option-detail" }, p.detail)]
     );
     opt.addEventListener("click", async () => {
-      await api("/api/account/plan", { method: "POST", body: { plan: p.key } });
-      const meRes = await api("/api/me");
-      state.plan = meRes.plan;
-      dd.remove();
-      router();
+      try {
+        await api("/api/account/plan", { method: "POST", body: { plan: p.key } });
+        const meRes = await api("/api/me");
+        state.plan = meRes.plan;
+        dd.remove();
+        router();
+      } catch (e) {
+        alert(e.message || "Couldn't change your plan. Please try again.");
+      }
     });
     planRow.appendChild(opt);
   });
@@ -231,14 +235,34 @@ function toggleAvatarMenu() {
         class: "btn ghost small",
         onclick: async () => {
           if (!confirm("This invalidates the current address, anything sent to it afterward won't reach you. Continue?")) return;
-          const res = await api("/api/account/email-alias/regenerate", { method: "POST" });
-          paintAliasRow(res.address);
+          try {
+            const res = await api("/api/account/email-alias/regenerate", { method: "POST" });
+            paintAliasRow(res.address);
+          } catch (e) {
+            alert(e.message || "Couldn't regenerate your drafting email address. Please try again.");
+          }
         },
       }, "Regenerate")
     );
     emailValueRow.appendChild(btnRow);
   }
-  api("/api/account/email-alias").then((res) => paintAliasRow(res.address));
+  function loadEmailAlias() {
+    emailValueRow.innerHTML = "";
+    emailValueRow.appendChild(el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."));
+    api("/api/account/email-alias")
+      .then((res) => paintAliasRow(res.address))
+      .catch((e) => {
+        // Same reasoning as share.js's loadRedlineHistory/loadHistory --
+        // without this, a failed request left "Loading..." here forever
+        // with no error and no way to try again.
+        emailValueRow.innerHTML = "";
+        emailValueRow.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load your drafting email address."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:6px;" }, "Retry");
+        retryBtn.addEventListener("click", loadEmailAlias);
+        emailValueRow.appendChild(retryBtn);
+      });
+  }
+  loadEmailAlias();
 
   // ---- notification settings: per-type opt-out. redline_submitted still
   // gates both the bell and a matching email; redline_comment now only
@@ -280,17 +304,40 @@ function toggleAvatarMenu() {
       );
     });
   }
-  api("/api/account/notification-settings").then((res) => paintNotifToggles(res));
+  function loadNotifSettings() {
+    notifList.innerHTML = "";
+    notifList.appendChild(el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."));
+    api("/api/account/notification-settings")
+      .then((res) => paintNotifToggles(res))
+      .catch((e) => {
+        notifList.innerHTML = "";
+        notifList.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load notification settings."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:6px;" }, "Retry");
+        retryBtn.addEventListener("click", loadNotifSettings);
+        notifList.appendChild(retryBtn);
+      });
+  }
+  loadNotifSettings();
 
   const logoutRow = el("div", { class: "logout-row" }, [el("button", { onclick: doLogout }, "Log out")]);
   dd.appendChild(logoutRow);
 
   window.__avatarWrap.appendChild(dd);
   setTimeout(() => {
-    document.addEventListener("click", function onDocClick(e) {
+    // mousedown, not click -- a click on something inside dd that removes
+    // ITSELF synchronously (e.g. the email-alias/notification-settings
+    // Retry buttons above, which clear their row's innerHTML before
+    // re-fetching) leaves e.target already detached from the document by
+    // the time a "click" listener here would run in the bubble phase, so
+    // dd.contains(e.target) on a detached node always reads false --
+    // misreading a click INSIDE the dropdown as outside it and closing the
+    // whole thing out from under the person mid-retry. mousedown fires
+    // before any of that same-click DOM mutation happens, so it still sees
+    // the real ancestry.
+    document.addEventListener("mousedown", function onDocMousedown(e) {
       if (!dd.contains(e.target) && e.target !== window.__avatarWrap) {
         dd.remove();
-        document.removeEventListener("click", onDocClick);
+        document.removeEventListener("mousedown", onDocMousedown);
       }
     });
   }, 0);
@@ -424,17 +471,26 @@ function toggleNotifDropdown() {
 
   window.__notifWrap.appendChild(dd);
   setTimeout(() => {
-    document.addEventListener("click", function onDocClick(e) {
+    // mousedown, not click -- see the matching comment in toggleAvatarMenu's
+    // own outside-dismissal listener for why.
+    document.addEventListener("mousedown", function onDocMousedown(e) {
       if (!dd.contains(e.target) && e.target !== window.__notifWrap && !window.__notifWrap.contains(e.target)) {
         dd.remove();
-        document.removeEventListener("click", onDocClick);
+        document.removeEventListener("mousedown", onDocMousedown);
       }
     });
   }, 0);
 }
 
 async function doLogout() {
-  await api("/api/logout", { method: "POST" });
+  try {
+    await api("/api/logout", { method: "POST" });
+  } catch (e) {
+    // Still log out locally even if invalidating the server-side session
+    // failed (e.g. a network blip) -- the alternative before this was
+    // clicking "Log out" and silently staying logged in with no error and
+    // no visible sign anything happened at all.
+  }
   state.user = null;
   state.plan = null;
   location.hash = "#/login";
@@ -447,12 +503,19 @@ function shell(mainContent) {
 function refreshTopbarInPlace() {
   const oldBar = document.querySelector(".topbar");
   if (!oldBar) return;
-  api("/api/me").then((me) => {
-    state.plan = me.plan;
-    state.isAdmin = !!me.is_admin;
-    const newBar = topbar();
-    oldBar.replaceWith(newBar);
-  });
+  api("/api/me")
+    .then((me) => {
+      state.plan = me.plan;
+      state.isAdmin = !!me.is_admin;
+      const newBar = topbar();
+      oldBar.replaceWith(newBar);
+    })
+    // Opportunistic in-place refresh (e.g. after a plan change elsewhere) --
+    // on failure the existing topbar just stays as it was, same as before
+    // this ever ran. Nothing here shows a "Loading..." state that could get
+    // stuck, so a silent catch (rather than an error UI) is the right
+    // amount of handling -- this only stops an unhandled-rejection warning.
+    .catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -895,15 +958,23 @@ async function openShareModal(generatedId) {
     const senderInput = el("input", { type: "email", placeholder: "you@company.com (defaults to your login email)", value: share.sender_email || "" });
     const senderSavedNote = el("span", { style: "font-size:12px;color:var(--success);margin-left:8px;display:none;" }, "Saved");
     async function saveShareFields(noteEl) {
-      await api(`/api/generated/${generatedId}/share`, {
-        method: "POST",
-        body: {
-          client_first_name: firstNameInput.value.trim(), client_last_name: lastNameInput.value.trim(),
-          client_email: emailInput.value.trim(), sender_email: senderInput.value.trim(),
-        },
-      });
-      noteEl.style.display = "inline";
-      setTimeout(() => (noteEl.style.display = "none"), 1500);
+      try {
+        await api(`/api/generated/${generatedId}/share`, {
+          method: "POST",
+          body: {
+            client_first_name: firstNameInput.value.trim(), client_last_name: lastNameInput.value.trim(),
+            client_email: emailInput.value.trim(), sender_email: senderInput.value.trim(),
+          },
+        });
+        noteEl.style.display = "inline";
+        setTimeout(() => (noteEl.style.display = "none"), 1500);
+      } catch (e) {
+        // Without this, an edit here (e.g. correcting the client's email)
+        // that failed to save left "Saved" simply never appearing, with no
+        // error to explain why -- easy to miss and go on to share the link
+        // still pointed at the old, unsaved value.
+        alert(e.message || "Couldn't save that change. Please try again.");
+      }
     }
     [firstNameInput, lastNameInput, emailInput].forEach((inp) => inp.addEventListener("change", () => saveShareFields(clientSavedNote)));
     senderInput.addEventListener("change", () => saveShareFields(senderSavedNote));
@@ -1232,8 +1303,18 @@ async function openRedlinesModal(generatedId) {
             const summaryEl = edit.decision === "countered"
               ? el("div", { class: "decided-countered" }, ["Countered: ", el("strong", {}, edit.counter_value)])
               : el("div", { class: "decided " + edit.decision }, edit.decision);
+            // See RedlineEdit.source_edit_id / apply_redline_submission's
+            // superseded_edit_ids -- this edit's `decision` column is stale:
+            // something newer (a reconsideration, or the client's own
+            // response to a counter) has since chained back to it, and
+            // that's what actually governs what Apply does now. Flagging it
+            // here keeps this row from reading as "accepted and ready to
+            // apply" when it no longer is.
+            const supersededNote = edit.superseded
+              ? el("div", { class: "decided pending", style: "font-size:11px;" }, "Superseded by a later decision below")
+              : null;
             const reconsiderBtn = el("button", { class: "btn secondary small" }, "Reconsider");
-            actions = el("div", { class: "decision-row" }, [summaryEl, reconsiderBtn]);
+            actions = el("div", { class: "decision-row" }, [summaryEl, supersededNote, reconsiderBtn]);
 
             // Reconsider: reopens accept/reject/counter controls for an
             // already-decided edit and sends the new decision as its own
@@ -1387,7 +1468,13 @@ async function openRedlinesModal(generatedId) {
           footerActions.appendChild(sendBtn);
         }
 
-        const hasAcceptedSomewhere = sub.edits.some((e) => e.decision === "accepted" || (e.decision === "pending" && e.evaluation === "auto_approved"));
+        // Excludes superseded edits (see apply_redline_submission's
+        // superseded_edit_ids) -- an edit whose "accepted" decision has
+        // since been overridden by a reconsideration must not make this
+        // button appear, since Apply itself will now skip it; showing Apply
+        // here for a fully-superseded round with nothing else live would be
+        // a dead end that fails with "No accepted edits to apply yet."
+        const hasAcceptedSomewhere = sub.edits.some((e) => !e.superseded && (e.decision === "accepted" || (e.decision === "pending" && e.evaluation === "auto_approved")));
         if (sub.status === "pending" && hasAcceptedSomewhere) {
           const applyBtn = el("button", { class: "btn secondary" }, "Apply accepted changes → new draft");
           applyBtn.addEventListener("click", async () => {
@@ -1561,53 +1648,76 @@ function DraftView(preselectId) {
   const body = el("div");
   wrap.appendChild(body);
 
-  api("/api/templates").then((templates) => {
-    const ready = templates.filter((t) => t.status === "ready");
+  function loadTemplates() {
     body.innerHTML = "";
-    if (!ready.length) {
-      body.appendChild(
-        el("div", { class: "empty-state card" }, [
-          el("div", { class: "big" }, "No master documents ready yet"),
-          el("div", {}, "Upload a contract and mark its placeholders first."),
-          el("div", { style: "margin-top:14px;" }, [
-            el("button", { class: "btn", onclick: () => (location.hash = "#/masters") }, "Go to Master Documents"),
-          ]),
-        ])
-      );
-      return;
-    }
-    const grid = el("div", { class: "grid" });
-    ready.forEach((t) => {
-      const card = el("div", { class: "doc-card" }, [
-        el("div", { class: "top-row" }, [el("div", { class: "icon" }, "☰"), el("div", { class: "type-tag" }, t.document_type)]),
-        el("div", { class: "name" }, t.name),
-        el("div", { class: "meta" }, `${t.placeholder_count} field${t.placeholder_count === 1 ? "" : "s"} · ${t.generated_count} drafted so far`),
-        el("div", { class: "actions" }, [el("button", { class: "btn small block", onclick: () => startDraft(t.id) }, "Use this template")]),
-      ]);
-      grid.appendChild(card);
-    });
-    body.appendChild(grid);
+    body.appendChild(el("div", { style: "color:var(--muted);font-size:13px;" }, "Loading..."));
+    api("/api/templates")
+      .then((templates) => {
+        const ready = templates.filter((t) => t.status === "ready");
+        body.innerHTML = "";
+        if (!ready.length) {
+          body.appendChild(
+            el("div", { class: "empty-state card" }, [
+              el("div", { class: "big" }, "No master documents ready yet"),
+              el("div", {}, "Upload a contract and mark its placeholders first."),
+              el("div", { style: "margin-top:14px;" }, [
+                el("button", { class: "btn", onclick: () => (location.hash = "#/masters") }, "Go to Master Documents"),
+              ]),
+            ])
+          );
+          return;
+        }
+        const grid = el("div", { class: "grid" });
+        ready.forEach((t) => {
+          const card = el("div", { class: "doc-card" }, [
+            el("div", { class: "top-row" }, [el("div", { class: "icon" }, "☰"), el("div", { class: "type-tag" }, t.document_type)]),
+            el("div", { class: "name" }, t.name),
+            el("div", { class: "meta" }, `${t.placeholder_count} field${t.placeholder_count === 1 ? "" : "s"} · ${t.generated_count} drafted so far`),
+            el("div", { class: "actions" }, [el("button", { class: "btn small block", onclick: () => startDraft(t.id) }, "Use this template")]),
+          ]);
+          grid.appendChild(card);
+        });
+        body.appendChild(grid);
 
-    if (preselectId && ready.some((t) => t.id === preselectId)) {
-      startDraft(preselectId);
-    }
-  });
+        if (preselectId && ready.some((t) => t.id === preselectId)) {
+          startDraft(preselectId);
+        }
+      })
+      .catch((e) => {
+        // Without this, a failed request here left the whole Draft tab
+        // silently blank forever -- no "No master documents" empty state
+        // (that only ever painted on success), no error, nothing to click.
+        body.innerHTML = "";
+        body.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load your master documents."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+        retryBtn.addEventListener("click", loadTemplates);
+        body.appendChild(retryBtn);
+      });
+  }
+  loadTemplates();
 
   function startDraft(templateId) {
-    api(`/api/templates/${templateId}`).then((tpl) => {
-      openFillModal(tpl, null, (result, prefill) => {
-        showResult(tpl, result, prefill);
-      });
-    });
+    api(`/api/templates/${templateId}`)
+      .then((tpl) => {
+        openFillModal(tpl, null, (result, prefill) => {
+          showResult(tpl, result, prefill);
+        });
+      })
+      .catch((e) => alert(e.message || "Couldn't open that template. Please try again."));
   }
 
   function showResult(tpl, result, lastPrefill) {
     const editBtn = el("button", { class: "btn secondary" }, "Edit values");
     editBtn.addEventListener("click", () => {
       overlay.remove();
-      api(`/api/templates/${tpl.id}`).then((freshTpl) => {
-        openFillModal(freshTpl, lastPrefill, (res2, prefill2) => showResult(freshTpl, res2, prefill2));
-      });
+      api(`/api/templates/${tpl.id}`)
+        .then((freshTpl) => {
+          openFillModal(freshTpl, lastPrefill, (res2, prefill2) => showResult(freshTpl, res2, prefill2));
+        })
+        // The overlay above is already gone by the time this could fail --
+        // without this, a failed request here silently dropped the person
+        // back at the bare Draft tab with no fill form and no explanation.
+        .catch((e) => alert(e.message || "Couldn't reopen this document for editing. Please try again."));
     });
     const libBtn = el("button", { class: "btn secondary", onclick: () => { overlay.remove(); location.hash = "#/documents"; } }, "View in Documents");
     const shareBtn = el("button", { class: "btn secondary", onclick: () => openShareModal(result.generated_id) }, "Share for review");
@@ -1630,9 +1740,15 @@ function DraftView(preselectId) {
         // in place -- re-fetch it and re-render so the buttons above (Share,
         // Redlines, further edits) all point at the document you're actually
         // looking at now, not the superseded one.
-        api(`/api/generated/${editRes.id}`).then((fresh) => {
-          showResult(tpl, { generated_id: fresh.id, name: fresh.name, html: fresh.html }, lastPrefill);
-        });
+        api(`/api/generated/${editRes.id}`)
+          .then((fresh) => {
+            showResult(tpl, { generated_id: fresh.id, name: fresh.name, html: fresh.html }, lastPrefill);
+          })
+          // The edit itself already succeeded server-side by this point --
+          // only the re-fetch-and-redisplay failed, so say that plainly
+          // instead of leaving the person staring at a dialog that just
+          // silently vanished with no new one in its place.
+          .catch((e) => alert((e.message || "Couldn't refresh the preview.") + " Your edit was saved -- check Documents to see it."));
       },
     });
     refreshTopbarInPlace();
@@ -1699,35 +1815,45 @@ function MastersView() {
   wrap.appendChild(listWrap);
 
   function load() {
-    api("/api/templates").then((templates) => {
-      listWrap.innerHTML = "";
-      if (!templates.length) {
-        listWrap.appendChild(el("div", { class: "empty-state" }, "No master documents yet. Upload one above to get started."));
-        return;
-      }
-      templates.forEach((t) => {
-        const actions = [el("button", { class: "btn secondary small", onclick: () => (location.hash = `#/editor/${t.id}`) }, t.status === "ready" ? "Edit fields" : "Mark fields")];
-        if (t.status === "ready") {
-          actions.push(el("button", { class: "btn small", onclick: () => (location.hash = `#/draft/${t.id}`) }, "Draft"));
+    listWrap.innerHTML = "";
+    listWrap.appendChild(el("div", { style: "color:var(--muted);font-size:13px;" }, "Loading..."));
+    api("/api/templates")
+      .then((templates) => {
+        listWrap.innerHTML = "";
+        if (!templates.length) {
+          listWrap.appendChild(el("div", { class: "empty-state" }, "No master documents yet. Upload one above to get started."));
+          return;
         }
-        const deleteBtn = el("button", { class: "btn danger small" }, "Delete");
-        deleteBtn.addEventListener("click", () => deleteTemplate(t.id, deleteBtn));
-        actions.push(deleteBtn);
+        templates.forEach((t) => {
+          const actions = [el("button", { class: "btn secondary small", onclick: () => (location.hash = `#/editor/${t.id}`) }, t.status === "ready" ? "Edit fields" : "Mark fields")];
+          if (t.status === "ready") {
+            actions.push(el("button", { class: "btn small", onclick: () => (location.hash = `#/draft/${t.id}`) }, "Draft"));
+          }
+          const deleteBtn = el("button", { class: "btn danger small" }, "Delete");
+          deleteBtn.addEventListener("click", () => deleteTemplate(t.id, deleteBtn));
+          actions.push(deleteBtn);
 
-        listWrap.appendChild(
-          el("div", { class: "doc-card" }, [
-            el("div", { class: "top-row" }, [
-              el("div", { class: "icon" }, "☰"),
-              el("div", { class: "badge " + (t.status === "ready" ? "ready" : "draft") }, t.status === "ready" ? "Ready" : "Draft"),
-            ]),
-            el("div", { class: "type-tag" }, t.document_type),
-            el("div", { class: "name" }, t.name),
-            el("div", { class: "meta" }, `${t.placeholder_count} field${t.placeholder_count === 1 ? "" : "s"} · ${t.generated_count} drafted · uploaded ${new Date(t.created_at).toLocaleDateString()}`),
-            el("div", { class: "actions" }, actions),
-          ])
-        );
+          listWrap.appendChild(
+            el("div", { class: "doc-card" }, [
+              el("div", { class: "top-row" }, [
+                el("div", { class: "icon" }, "☰"),
+                el("div", { class: "badge " + (t.status === "ready" ? "ready" : "draft") }, t.status === "ready" ? "Ready" : "Draft"),
+              ]),
+              el("div", { class: "type-tag" }, t.document_type),
+              el("div", { class: "name" }, t.name),
+              el("div", { class: "meta" }, `${t.placeholder_count} field${t.placeholder_count === 1 ? "" : "s"} · ${t.generated_count} drafted · uploaded ${new Date(t.created_at).toLocaleDateString()}`),
+              el("div", { class: "actions" }, actions),
+            ])
+          );
+        });
+      })
+      .catch((e) => {
+        listWrap.innerHTML = "";
+        listWrap.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load your master documents."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+        retryBtn.addEventListener("click", load);
+        listWrap.appendChild(retryBtn);
       });
-    });
   }
   load();
 
@@ -1925,17 +2051,33 @@ function DocumentsView() {
         chevron,
       ]),
     ]);
+    function loadFolderHistory() {
+      chainWrap.innerHTML = "";
+      chainWrap.appendChild(el("div", { style: "padding:14px 4px;color:var(--muted);font-size:12.5px;" }, "Loading history..."));
+      api(`/api/generated/${latest.id}/history`)
+        .then((hist) => {
+          chainWrap.innerHTML = "";
+          hist.timeline.forEach((ev) => chainWrap.appendChild(chainItemFor(ev, docsById, latest.id)));
+        })
+        .catch((e) => {
+          // Without this, expanding a folder on a failed request left
+          // "Loading history..." on screen forever, with no error and no
+          // way to retry short of collapsing and re-expanding -- which
+          // wouldn't even help, since historyLoaded was already set true.
+          historyLoaded = false;
+          chainWrap.innerHTML = "";
+          chainWrap.appendChild(el("div", { class: "error-box", style: "margin:8px 4px;" }, e.message || "Couldn't load this document's history."));
+          const retryBtn = el("button", { class: "btn secondary small", style: "margin:4px;" }, "Retry");
+          retryBtn.addEventListener("click", loadFolderHistory);
+          chainWrap.appendChild(retryBtn);
+        });
+    }
     head.addEventListener("click", () => {
       open = !open;
       folder.classList.toggle("open", open);
       if (open && !historyLoaded) {
         historyLoaded = true;
-        chainWrap.innerHTML = "";
-        chainWrap.appendChild(el("div", { style: "padding:14px 4px;color:var(--muted);font-size:12.5px;" }, "Loading history..."));
-        api(`/api/generated/${latest.id}/history`).then((hist) => {
-          chainWrap.innerHTML = "";
-          hist.timeline.forEach((ev) => chainWrap.appendChild(chainItemFor(ev, docsById, latest.id)));
-        });
+        loadFolderHistory();
       }
     });
     folder.appendChild(head);
@@ -1944,66 +2086,87 @@ function DocumentsView() {
   }
 
   function load() {
-    api(`/api/generated?archived=${showArchived}`).then((docs) => {
-      listWrap.innerHTML = "";
-      if (!docs.length) {
-        listWrap.appendChild(
-          el("div", { class: "empty-state card" }, [
-            el("div", { class: "big" }, showArchived ? "No archived documents" : "No documents drafted yet"),
-            el("div", {}, showArchived ? "Documents you archive will show up here." : "Head to the Draft tab to generate your first one."),
-          ])
-        );
-        return;
-      }
-      const docsById = {};
-      docs.forEach((d) => { docsById[d.id] = d; });
+    listWrap.innerHTML = "";
+    listWrap.appendChild(el("div", { style: "color:var(--muted);font-size:13px;" }, "Loading..."));
+    api(`/api/generated?archived=${showArchived}`)
+      .then((docs) => {
+        listWrap.innerHTML = "";
+        if (!docs.length) {
+          listWrap.appendChild(
+            el("div", { class: "empty-state card" }, [
+              el("div", { class: "big" }, showArchived ? "No archived documents" : "No documents drafted yet"),
+              el("div", {}, showArchived ? "Documents you archive will show up here." : "Head to the Draft tab to generate your first one."),
+            ])
+          );
+          return;
+        }
+        const docsById = {};
+        docs.forEach((d) => { docsById[d.id] = d; });
 
-      const groups = {};
-      docs.forEach((d) => {
-        (groups[d.document_type] = groups[d.document_type] || []).push(d);
-      });
-      Object.keys(groups).sort().forEach((type) => {
-        const groupEl = el("div", { class: "type-group" });
-        groupEl.appendChild(
-          el("div", { class: "type-group-header" }, [
-            el("div", { class: "t" }, `${type} (${groups[type].length})`),
-            el("div", { class: "line" }),
-          ])
-        );
-        const list = el("div", { class: "output-list" });
-
-        // Group this type's docs by lineage, preserving first-seen order --
-        // since docs arrive sorted desc by created_at, that's also
-        // most-recent-activity-first for the folders themselves.
-        const lineageOrder = [];
-        const lineageDocs = {};
-        groups[type].forEach((d) => {
-          const key = d.lineage_root_id;
-          if (!lineageDocs[key]) { lineageDocs[key] = []; lineageOrder.push(key); }
-          lineageDocs[key].push(d);
+        const groups = {};
+        docs.forEach((d) => {
+          (groups[d.document_type] = groups[d.document_type] || []).push(d);
         });
+        Object.keys(groups).sort().forEach((type) => {
+          const groupEl = el("div", { class: "type-group" });
+          groupEl.appendChild(
+            el("div", { class: "type-group-header" }, [
+              el("div", { class: "t" }, `${type} (${groups[type].length})`),
+              el("div", { class: "line" }),
+            ])
+          );
+          const list = el("div", { class: "output-list" });
 
-        lineageOrder.forEach((key) => {
-          const familyDocs = lineageDocs[key];
-          list.appendChild(familyDocs.length === 1 ? plainRow(familyDocs[0]) : folderRow(familyDocs, docsById));
+          // Group this type's docs by lineage, preserving first-seen order --
+          // since docs arrive sorted desc by created_at, that's also
+          // most-recent-activity-first for the folders themselves.
+          const lineageOrder = [];
+          const lineageDocs = {};
+          groups[type].forEach((d) => {
+            const key = d.lineage_root_id;
+            if (!lineageDocs[key]) { lineageDocs[key] = []; lineageOrder.push(key); }
+            lineageDocs[key].push(d);
+          });
+
+          lineageOrder.forEach((key) => {
+            const familyDocs = lineageDocs[key];
+            list.appendChild(familyDocs.length === 1 ? plainRow(familyDocs[0]) : folderRow(familyDocs, docsById));
+          });
+
+          groupEl.appendChild(list);
+          listWrap.appendChild(groupEl);
         });
-
-        groupEl.appendChild(list);
-        listWrap.appendChild(groupEl);
+      })
+      .catch((e) => {
+        // This is the whole Documents library -- without this, a failed
+        // request left it silently blank forever, indistinguishable from
+        // "you have no documents."
+        listWrap.innerHTML = "";
+        listWrap.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load your documents."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+        retryBtn.addEventListener("click", load);
+        listWrap.appendChild(retryBtn);
       });
-    });
   }
   load();
 
   async function toggleArchive(d) {
-    await api(`/api/generated/${d.id}/archive`, { method: "POST", body: { archived: !d.archived } });
-    load();
+    try {
+      await api(`/api/generated/${d.id}/archive`, { method: "POST", body: { archived: !d.archived } });
+      load();
+    } catch (e) {
+      alert(e.message || "Couldn't update that document. Please try again.");
+    }
   }
 
   async function deleteForever(d) {
     if (!confirm(`Permanently delete "${d.name}"? This cannot be undone.`)) return;
-    await api(`/api/generated/${d.id}`, { method: "DELETE" });
-    load();
+    try {
+      await api(`/api/generated/${d.id}`, { method: "DELETE" });
+      load();
+    } catch (e) {
+      alert(e.message || "Couldn't delete that document. Please try again.");
+    }
   }
 
   // A folder is every revision of one document -- archiving or deleting
@@ -2014,15 +2177,28 @@ function DocumentsView() {
   // keeping the whole folder together on one tab.
   async function toggleArchiveFamily(familyDocs) {
     const nextArchived = !familyDocs[0].archived;
-    await Promise.all(familyDocs.map((d) => api(`/api/generated/${d.id}/archive`, { method: "POST", body: { archived: nextArchived } })));
-    load();
+    try {
+      await Promise.all(familyDocs.map((d) => api(`/api/generated/${d.id}/archive`, { method: "POST", body: { archived: nextArchived } })));
+      load();
+    } catch (e) {
+      // Some of the family's requests may have already gone through --
+      // reload so the list reflects whatever actually landed, rather than
+      // leaving it showing the pre-click state next to a silent failure.
+      alert(e.message || "Couldn't update every version of that document. Please try again.");
+      load();
+    }
   }
 
   async function deleteFamilyForever(familyDocs) {
     const label = familyDocs.length > 1 ? `all ${familyDocs.length} versions of "${familyDocs[0].name}"` : `"${familyDocs[0].name}"`;
     if (!confirm(`Permanently delete ${label}? This cannot be undone.`)) return;
-    await Promise.all(familyDocs.map((d) => api(`/api/generated/${d.id}`, { method: "DELETE" })));
-    load();
+    try {
+      await Promise.all(familyDocs.map((d) => api(`/api/generated/${d.id}`, { method: "DELETE" })));
+      load();
+    } catch (e) {
+      alert(e.message || "Couldn't delete every version of that document. Please try again.");
+      load();
+    }
   }
 
   function openDetail(d) {
@@ -2066,7 +2242,7 @@ function DocumentsView() {
       panelOverlay.appendChild(panel);
       panelOverlay.addEventListener("click", (e) => { if (e.target === panelOverlay) panelOverlay.remove(); });
       document.body.appendChild(panelOverlay);
-    });
+    }).catch((e) => alert(e.message || "Couldn't load that document. Please try again."));
   }
 
   return wrap;
@@ -2206,6 +2382,12 @@ function EditorView(templateId) {
     try {
       const data = await api(`/api/templates/${templateId}/reset`, { method: "POST" });
       contractView.innerHTML = data.html;
+      // The floating "Mark as placeholder" toolbar can still be open from a
+      // selection made just before this -- that selection's offsets are now
+      // meaningless against the freshly-reset document. See mark_placeholder's
+      // stale-selection guard in main.py for the server-side backstop; this
+      // just keeps the (now-dangling) toolbar from lingering on screen too.
+      hideToolbar();
       loadPlaceholders();
     } catch (e) {
       alert(e.message);
@@ -2391,6 +2573,12 @@ function EditorView(templateId) {
             required: requiredCheck.checked,
             existing_field_key: existingFieldKey,
             preset_options: presetOptions,
+            // See mark_placeholder's stale-selection guard (main.py) -- the
+            // exact text captured at selection time, compared server-side
+            // against whatever's actually at these offsets NOW, so a stale
+            // toolbar (see hideToolbar callers) errors instead of silently
+            // marking the wrong text.
+            expected_text: selectionInfo.text || "",
           },
         });
         contractView.innerHTML = res.html;
@@ -2406,6 +2594,8 @@ function EditorView(templateId) {
   }
 
   function loadPlaceholders() {
+    phList.innerHTML = "";
+    phList.appendChild(el("div", { style: "color:var(--muted);font-size:13px;" }, "Loading..."));
     api(`/api/templates/${templateId}`).then((tpl) => {
       currentPlaceholders = tpl.placeholders;
       phList.innerHTML = "";
@@ -2435,13 +2625,33 @@ function EditorView(templateId) {
           ])
         );
       });
+    }).catch((e) => {
+      // This sidebar drives genBtn's enabled state and every "Remove"/
+      // "Set redline rule" action -- without this, a failed request left
+      // it on "Loading..." forever with no error and no way to retry.
+      phList.innerHTML = "";
+      phList.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load placeholders."));
+      const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+      retryBtn.addEventListener("click", loadPlaceholders);
+      phList.appendChild(retryBtn);
     });
   }
 
   async function deletePlaceholder(id) {
-    const data = await api(`/api/templates/${templateId}/placeholders/${id}`, { method: "DELETE" });
-    contractView.innerHTML = data.html;
-    loadPlaceholders();
+    try {
+      const data = await api(`/api/templates/${templateId}/placeholders/${id}`, { method: "DELETE" });
+      contractView.innerHTML = data.html;
+      // Same reasoning as "Start over" above -- this re-renders the document
+      // (removing the {{token}} restores its original wording, shifting every
+      // run's offsets), so any selection the toolbar was still showing is now
+      // stale. This is the actual bug scenario: select some OTHER text, then
+      // remove an unrelated placeholder from the sidebar without the toolbar
+      // ever closing, then click "Mark as placeholder" on stale offsets.
+      hideToolbar();
+      loadPlaceholders();
+    } catch (e) {
+      alert(e.message || "Couldn't remove that placeholder. Please try again.");
+    }
   }
 
   function openThresholdModal(p) {
@@ -2528,7 +2738,23 @@ function EditorView(templateId) {
     }
   }
 
-  api(`/api/templates/${templateId}/html`).then((data) => { contractView.innerHTML = data.html; });
+  function loadContract() {
+    contractView.innerHTML = "";
+    contractView.appendChild(el("div", { style: "color:var(--muted);font-size:13px;padding:12px;" }, "Loading..."));
+    api(`/api/templates/${templateId}/html`)
+      .then((data) => { contractView.innerHTML = data.html; })
+      .catch((e) => {
+        // This is the whole point of the page -- without this, a failed
+        // request left it on "Loading..." forever with nothing to select
+        // and no indication anything went wrong.
+        contractView.innerHTML = "";
+        contractView.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load this document."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+        retryBtn.addEventListener("click", loadContract);
+        contractView.appendChild(retryBtn);
+      });
+  }
+  loadContract();
   loadPlaceholders();
 
   return wrap;
@@ -2804,6 +3030,13 @@ function AdminView() {
   }).catch((e) => {
     body.innerHTML = "";
     body.appendChild(el("div", { class: "error-box" }, e.message || "Failed to load admin data."));
+    const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+    // AdminView() builds this whole page fresh, including this same
+    // api() call -- easiest correct retry is just re-running the router
+    // against the current (unchanged) hash rather than threading a
+    // reload path through this already-large handler.
+    retryBtn.addEventListener("click", () => router());
+    body.appendChild(retryBtn);
   });
 
   return wrap;
@@ -2968,6 +3201,9 @@ function buildManageUsersCard() {
       .catch((e) => {
         tableWrap.innerHTML = "";
         tableWrap.appendChild(el("div", { class: "error-box" }, e.message || "Failed to load users."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+        retryBtn.addEventListener("click", refresh);
+        tableWrap.appendChild(retryBtn);
       });
   }
 
