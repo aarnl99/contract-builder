@@ -307,6 +307,17 @@ class RedlineEdit(SQLModel, table=True):
     # main.reply_to_redline_edit.
     client_reply: str = ""
     client_reply_at: Optional[datetime] = None
+    # Set when this edit's value is the client accepting an earlier
+    # "countered" RedlineEdit of the sender's -- points at that prior edit's
+    # id (see main._resolve_edits' accepting_edit_id handling). Persisted
+    # here (not just resolved in-memory at submit time) so a client who
+    # "Save progress"s a counter-acceptance and resumes on a later visit
+    # still has it recognized as one on their eventual Finalize -- without
+    # this, the resumed draft item looked like an ordinary fresh proposal
+    # with nothing marking it as already-decided, and re-submitting it
+    # silently lost the accepting_edit_id reference, forcing the sender to
+    # re-review a value they'd already dictated via their own counter.
+    source_edit_id: Optional[int] = Field(default=None, foreign_key="redlineedit.id")
 
 
 # ---------------------------------------------------------------------------

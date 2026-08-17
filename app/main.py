@@ -2155,6 +2155,12 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
                     "field_key": e.field_key, "label": e.label, "proposed_value": e.proposed_value,
                     "original_value": e.original_value, "comment": e.comment,
                     "location": json.loads(e.location_json or "{}") or None,
+                    # See RedlineEdit.source_edit_id -- without sending this
+                    # back, share.js's draft-resume path had no way to know
+                    # this saved item was a counter-acceptance, so it would
+                    # submit it as an ordinary fresh proposal on the next
+                    # Finalize and lose the auto-decided treatment.
+                    "source_edit_id": e.source_edit_id,
                 }
                 for e in draft_edits
             ],
@@ -2302,6 +2308,7 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
                 label = (excerpt[:57] + "…") if len(excerpt) > 57 else (excerpt or "Custom edit")
 
         decision = "pending"
+        source_edit_id = None
         if e.accepting_edit_id is not None and link_id is not None:
             prior = session.get(RedlineEdit, e.accepting_edit_id)
             prior_sub = session.get(RedlineSubmission, prior.submission_id) if prior else None
@@ -2311,6 +2318,11 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
                 and prior.counter_value.strip() == proposed
             ):
                 decision = "accepted"
+                # Persisted onto the row itself (not just resolved here in
+                # memory) so a "Save progress" draft remembers it's a
+                # counter-acceptance across a resume -- see RedlineEdit.
+                # source_edit_id's docstring.
+                source_edit_id = e.accepting_edit_id
             # A missing/mismatched reference isn't an error -- it just means
             # this isn't (or is no longer) a pure counter-acceptance, so it
             # falls through to the normal "pending, needs an owner decision"
@@ -2325,6 +2337,7 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
             comment=e.comment.strip()[:1000],
             evaluation=evaluation,
             decision=decision,
+            source_edit_id=source_edit_id,
             location_json=json.dumps({
                 "container_path": container_path,
                 "paragraph_index": e.location.paragraph_index,
