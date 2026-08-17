@@ -1092,6 +1092,16 @@ function buildCommentThread(edit, { editPath, myAuthorType }) {
   return wrap;
 }
 
+// "N unresolved" badge -- bug tracker #21 / phase 4. A countered redline
+// the client hasn't explicitly accepted, rejected, or re-suggested yet
+// (see main.py's _unresolved_counts); independent of Phase 2's separate
+// comment-resolve state. Top-level (not nested in DocumentsView) since
+// both the dashboard/list view and this Redlines modal use it.
+function unresolvedBadgeEl(count) {
+  if (!count) return null;
+  return el("span", { class: "unresolved-badge" }, `${count} unresolved`);
+}
+
 async function openRedlinesModal(generatedId) {
   // See the matching comment in openShareModal -- a leftover detail panel
   // would otherwise render on top of this modal (panel-overlay's z-index
@@ -1129,7 +1139,10 @@ async function openRedlinesModal(generatedId) {
       if (data.header.client) meta.push(" · ", el("span", {}, ["client: ", data.header.client]));
       box.appendChild(
         el("div", { class: "redline-case-header" }, [
-          el("div", { class: "rch-title" }, data.header.name),
+          el("div", { class: "rch-title-row" }, [
+            el("div", { class: "rch-title" }, data.header.name),
+            unresolvedBadgeEl(data.unresolved_count),
+          ]),
           el("div", { class: "rch-meta" }, meta),
         ])
       );
@@ -1743,7 +1756,7 @@ function DocumentsView() {
       el("div", { class: "left" }, [
         el("div", { class: "file-icon" }, "✓"),
         el("div", {}, [
-          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status)]),
+          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status), unresolvedBadgeEl(d.unresolved_count)]),
           el("div", { class: "lineage" }, ["Originated from ", el("span", { class: "tag" }, d.template_name)]),
           partiesLineEl(d.parties),
         ]),
@@ -1835,6 +1848,7 @@ function DocumentsView() {
             el("span", { class: "folder-name" }, latest.name),
             el("span", { class: "version-count" }, `${familyDocs.length} versions`),
             statusTagEl(latest.status),
+            unresolvedBadgeEl(latest.unresolved_count),
           ]),
           el("div", { class: "folder-sub" }, ["Originated from ", el("span", { class: "tag" }, latest.template_name)]),
           partiesLineEl(latest.parties),
@@ -1960,7 +1974,7 @@ function DocumentsView() {
       const panelOverlay = el("div", { class: "panel-overlay" });
       const panel = el("div", { class: "slide-panel" }, [
         el("button", { class: "close", onclick: () => panelOverlay.remove() }, "✕"),
-        el("div", { class: "folder-name-row" }, [el("h2", { style: "margin:0;" }, full.name), statusTagEl(full.status)]),
+        el("div", { class: "folder-name-row" }, [el("h2", { style: "margin:0;" }, full.name), statusTagEl(full.status), unresolvedBadgeEl(full.unresolved_count)]),
         el("div", { class: "sub" }, `Drafted ${new Date(full.created_at).toLocaleString()}`),
         partiesLineEl(full.parties),
         el("div", { class: "lineage-box" }, [

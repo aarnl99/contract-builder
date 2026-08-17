@@ -1034,6 +1034,22 @@ function DocumentView(data) {
   const submitBtn = el("button", { class: "btn" }, "Finalize and submit");
   submitBtn.addEventListener("click", async () => {
     errBox.innerHTML = "";
+    // Hard block -- bug tracker #21 / phase 4. Inaction on a counter used
+    // to default to silent acceptance the moment this button was hit;
+    // every counter-pending spot (see the `edits` comment above and
+    // renderList's counterPending branch) now needs an explicit
+    // Accept/Reject/Suggest before Finalize will go through. "Save
+    // progress" deliberately has no such check -- the client can still
+    // save and come back later to decide. The server enforces this too
+    // (see submit_redlines), so this is just the fast, no-round-trip path
+    // to the same message.
+    const stillPending = Object.values(edits).filter((e) => e.counterPending);
+    if (stillPending.length) {
+      errBox.appendChild(
+        el("div", { class: "error-box" }, `Decide on the sender's countered change${stillPending.length === 1 ? "" : "s"} before submitting — accept, reject, or suggest something else for each one.`)
+      );
+      return;
+    }
     const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null }));
     if (!editList.length && !noteInput.value.trim()) {
       errBox.appendChild(el("div", { class: "error-box" }, "Suggest a change or add a comment before submitting."));
