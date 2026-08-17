@@ -72,7 +72,10 @@ class User(SQLModel, table=True):
     # visit and produced too much low-value email. The column may still
     # exist on older rows in the live DB; it's just unused now.)
     notify_redline_submitted: bool = True  # a client sent back proposed edits
-    notify_redline_comment: bool = True  # a client commented on a redline you declined
+    # A client commented in a redline's thread (any redline, not just a
+    # declined one, as of Phase 2 of the redline-negotiation overhaul).
+    # Gates the in-app bell only -- thread replies never send email.
+    notify_redline_comment: bool = True
 
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
@@ -318,12 +321,19 @@ class RedlineEdit(SQLModel, table=True):
     # this edit targets. Empty "{}" only for rows written before this field
     # existed; such rows can no longer be applied and are skipped.
     location_json: str = "{}"
-    # The client's own comment on a redline the sender declined -- lets them
-    # push back or explain without reopening the decision itself. Settable
-    # (and re-settable) only while decision == "rejected" -- see
-    # main.reply_to_redline_edit.
+    # Superseded by RedlineComment (see below) as of the redline-negotiation
+    # overhaul phase 2 -- a one-shot reply, settable only on a declined edit.
+    # Columns kept (never written to going forward) so old rows aren't
+    # dropped; nothing reads these anymore.
     client_reply: str = ""
     client_reply_at: Optional[datetime] = None
+    # Independent of `decision` -- a thread can be resolved on a pending,
+    # accepted, rejected, OR countered edit; "the conversation is done" is a
+    # separate question from "what was decided." True only while explicitly
+    # marked resolved (via RedlineComment thread endpoints); posting a new
+    # comment while resolved auto-reopens it. See main.post_edit_comment /
+    # main.post_share_edit_comment.
+    comments_resolved: bool = False
     # Set when this edit's value is the client accepting an earlier
     # "countered" RedlineEdit of the sender's -- points at that prior edit's
     # id (see main._resolve_edits' accepting_edit_id handling). Persisted
@@ -335,6 +345,24 @@ class RedlineEdit(SQLModel, table=True):
     # silently lost the accepting_edit_id reference, forcing the sender to
     # re-review a value they'd already dictated via their own counter.
     source_edit_id: Optional[int] = Field(default=None, foreign_key="redlineedit.id")
+
+
+class RedlineComment(SQLModel, table=True):
+    """One message in the open comment thread on a RedlineEdit -- lightweight,
+    Google-Docs-suggest-edit-style back-and-forth, open on ANY redline
+    regardless of its accept/reject/counter decision (see the redline-
+    negotiation overhaul, phase 2). Either side can post; `author_name` is a
+    snapshot at post time (the owner's account name, or the client's
+    first+last name collected at share creation -- see ShareLink), not a
+    live foreign key, so a thread still reads correctly even if the
+    account/client details change later."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    edit_id: int = Field(foreign_key="redlineedit.id", index=True)
+    author_type: str  # "owner" | "client"
+    author_name: str
+    body: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from .db import init_db, get_session, UPLOADS_DIR, DATA_DIR
 from .models import (
     User, Template, Placeholder, GeneratedContract, GenerationEvent, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
-    ShareLink, ShareLinkView, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest, Notification,
+    ShareLink, ShareLinkView, RedlineSubmission, RedlineEdit, RedlineComment, EmailAlias, EmailDraftRequest, Notification,
 )
 from .auth import hash_password, verify_password, validate_password_strength, get_current_user, get_optional_user
 from . import docx_engine as de
@@ -496,7 +496,9 @@ def set_notification_settings(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    """Per-type opt-out for both the bell and the matching email -- each
+    """Per-type opt-out. redline_submitted gates both the bell and a
+    matching email; redline_comment gates the in-app bell only (comment-
+    thread replies never send email -- see post_share_edit_comment). Each
     field is optional so the client can flip just one toggle at a time
     without having to resend the other current value."""
     if body.redline_submitted is not None:
@@ -1675,6 +1677,29 @@ def _generate_access_code() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(8))
 
 
+def _comment_payload(c: RedlineComment) -> dict:
+    return {
+        "id": c.id, "author_type": c.author_type, "author_name": c.author_name,
+        "body": c.body, "created_at": c.created_at.isoformat(),
+    }
+
+
+def _comments_by_edit(session: Session, edit_ids: list) -> dict:
+    """Batch-fetches every comment for a set of edits in one query, grouped
+    by edit_id -- called once per redlines-view request (get_redlines,
+    get_share_redlines) instead of once per edit, so a round with N edits
+    doesn't cost N+1 queries."""
+    if not edit_ids:
+        return {}
+    comments = session.exec(
+        select(RedlineComment).where(RedlineComment.edit_id.in_(edit_ids)).order_by(RedlineComment.created_at)
+    ).all()
+    out = {}
+    for c in comments:
+        out.setdefault(c.edit_id, []).append(_comment_payload(c))
+    return out
+
+
 def _send_share_created_email(request: Request, user: User, gc: GeneratedContract, link: ShareLink) -> None:
     """Lets the client know a document is waiting for them the moment a
     NEW share link is created (never re-sent on later visits to the Share
@@ -1854,9 +1879,13 @@ def get_redlines(
         .where(RedlineSubmission.share_link_id.in_(link_ids), RedlineSubmission.status != "draft")
         .order_by(RedlineSubmission.submitted_at.desc())
     ).all()
+    all_edits_by_sub = {s.id: session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all() for s in submissions}
+    all_edit_ids = [e.id for edits in all_edits_by_sub.values() for e in edits]
+    comments_by_edit = _comments_by_edit(session, all_edit_ids)
+
     out = []
     for s in submissions:
-        edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all()
+        edits = all_edits_by_sub[s.id]
         edit_rows = []
         for e in edits:
             ph = ph_by_key.get(e.field_key)
@@ -1870,8 +1899,8 @@ def get_redlines(
                 "comment": e.comment,
                 "evaluation": e.evaluation, "decision": e.decision, "counter_value": e.counter_value,
                 "threshold_desc": threshold_desc, "inside_threshold": inside_threshold,
-                "client_reply": e.client_reply,
-                "client_reply_at": e.client_reply_at.isoformat() if e.client_reply_at else None,
+                "comments": comments_by_edit.get(e.id, []),
+                "comments_resolved": e.comments_resolved,
             })
         out.append({
             "id": s.id,
@@ -2394,8 +2423,11 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
                     "proposed_value": e.proposed_value, "original_value": e.original_value,
                     "decision": e.decision, "counter_value": e.counter_value,
                     "location": _client_location(e),
-                    "client_reply": e.client_reply,
-                    "client_reply_at": e.client_reply_at.isoformat() if e.client_reply_at else None,
+                    # No comment thread here on purpose -- this is the
+                    # one-time "sender responded" banner (ResponseView),
+                    # which the client clicks through via "Continue
+                    # redlining" into the full Redline History panel, where
+                    # get_share_redlines does include each edit's thread.
                 }
                 for e in responded_edits
             ],
@@ -2655,22 +2687,26 @@ def get_share_history(token: str, request: Request, session: Session = Depends(g
 @app.get("/api/share/{token}/redlines")
 def get_share_redlines(token: str, request: Request, session: Session = Depends(get_session)):
     """Every non-draft round the client has ever submitted through this
-    link, with the sender's decision on each edit and the client's own
-    reply (if any) to a declined one. Unlike the one-shot `response` field
-    on GET /api/share/{token} -- which only ever surfaces the single latest
-    round, and only until the client acknowledges it -- this is the full,
-    durable record: always available, on every visit, for as long as the
-    link stays open. Threshold rules are never included here, same as
-    everywhere else client-facing."""
+    link, with the sender's decision on each edit and its open comment
+    thread. Unlike the one-shot `response` field on GET /api/share/{token}
+    -- which only ever surfaces the single latest round, and only until the
+    client acknowledges it -- this is the full, durable record: always
+    available, on every visit, for as long as the link stays open.
+    Threshold rules are never included here, same as everywhere else
+    client-facing."""
     link = _require_share_session(request, token, session)
     submissions = session.exec(
         select(RedlineSubmission)
         .where(RedlineSubmission.share_link_id == link.id, RedlineSubmission.status != "draft")
         .order_by(RedlineSubmission.submitted_at.desc())
     ).all()
+    all_edits_by_sub = {s.id: session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all() for s in submissions}
+    all_edit_ids = [e.id for edits in all_edits_by_sub.values() for e in edits]
+    comments_by_edit = _comments_by_edit(session, all_edit_ids)
+
     out = []
     for s in submissions:
-        edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all()
+        edits = all_edits_by_sub[s.id]
         out.append({
             "id": s.id,
             "submitted_at": s.submitted_at.isoformat(),
@@ -2683,8 +2719,8 @@ def get_share_redlines(token: str, request: Request, session: Session = Depends(
                     "original_value": e.original_value, "proposed_value": e.proposed_value,
                     "comment": e.comment,
                     "decision": e.decision, "counter_value": e.counter_value,
-                    "client_reply": e.client_reply,
-                    "client_reply_at": e.client_reply_at.isoformat() if e.client_reply_at else None,
+                    "comments": comments_by_edit.get(e.id, []),
+                    "comments_resolved": e.comments_resolved,
                 }
                 for e in edits
             ],
@@ -2692,44 +2728,140 @@ def get_share_redlines(token: str, request: Request, session: Session = Depends(
     return {"submissions": out}
 
 
-class ClientReplyBody(BaseModel):
-    reply: str
+class CommentBody(BaseModel):
+    body: str
 
 
-@app.post("/api/share/{token}/edits/{edit_id}/reply")
-def reply_to_redline_edit(token: str, edit_id: int, body: ClientReplyBody, request: Request, session: Session = Depends(get_session)):
-    """Lets the client leave a comment on a redline the sender declined --
-    doesn't reopen the decision itself, just attaches a note the sender
-    sees on their side (Redlines modal + a notification), so a straight
-    rejection isn't necessarily the end of the conversation. Re-callable to
-    edit an existing comment; always just overwrites the previous one."""
-    link = _require_share_session(request, token, session)
+def _get_owned_edit(session: Session, user: User, edit_id: int) -> RedlineEdit:
+    edit = session.get(RedlineEdit, edit_id)
+    submission = session.get(RedlineSubmission, edit.submission_id) if edit else None
+    link = session.get(ShareLink, submission.share_link_id) if submission else None
+    gc = session.get(GeneratedContract, link.generated_contract_id) if link else None
+    if not edit or not gc or gc.owner_id != user.id:
+        raise HTTPException(404, "Edit not found")
+    return edit
+
+
+def _get_client_edit(session: Session, link: ShareLink, edit_id: int) -> RedlineEdit:
     edit = session.get(RedlineEdit, edit_id)
     submission = session.get(RedlineSubmission, edit.submission_id) if edit else None
     if not edit or not submission or submission.share_link_id != link.id:
         raise HTTPException(404, "That redline no longer exists.")
-    if edit.decision != "rejected":
-        raise HTTPException(400, "You can only leave a comment on a redline that was declined.")
-    reply = body.reply.strip()
-    if not reply:
+    return edit
+
+
+@app.get("/api/redline-edits/{edit_id}/comments")
+def get_edit_comments(edit_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Owner-side read of one redline's open comment thread -- used when the
+    Redlines modal's inline thread (embedded via get_redlines) needs a
+    refresh without reloading the whole modal, e.g. right after posting."""
+    edit = _get_owned_edit(session, user, edit_id)
+    comments = session.exec(select(RedlineComment).where(RedlineComment.edit_id == edit_id).order_by(RedlineComment.created_at)).all()
+    return {"comments": [_comment_payload(c) for c in comments], "comments_resolved": edit.comments_resolved}
+
+
+@app.post("/api/redline-edits/{edit_id}/comments")
+def post_edit_comment(edit_id: int, body: CommentBody, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Owner posts into a redline's thread -- open on ANY edit regardless of
+    its decision, independent of Phase 1's decision-response flow. No email
+    goes out for this -- thread replies are meant to be low-friction back-
+    and-forth, not another inbox ping; the client just sees it next time they
+    open the thread."""
+    edit = _get_owned_edit(session, user, edit_id)
+    text = body.body.strip()
+    if not text:
         raise HTTPException(400, "Enter a comment before sending.")
-    edit.client_reply = reply[:2000]
-    edit.client_reply_at = datetime.utcnow()
+    user_name = user.name.strip() or user.email
+    comment = RedlineComment(edit_id=edit.id, author_type="owner", author_name=user_name, body=text[:2000])
+    session.add(comment)
+    # Posting into a resolved thread reopens it -- see RedlineEdit.comments_resolved.
+    if edit.comments_resolved:
+        edit.comments_resolved = False
+        session.add(edit)
+    session.commit()
+    session.refresh(comment)
+    return _comment_payload(comment)
+
+
+@app.post("/api/redline-edits/{edit_id}/comments/resolve")
+def resolve_edit_comments(edit_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    edit = _get_owned_edit(session, user, edit_id)
+    edit.comments_resolved = True
     session.add(edit)
     session.commit()
+    return {"comments_resolved": True}
+
+
+@app.post("/api/redline-edits/{edit_id}/comments/reopen")
+def reopen_edit_comments(edit_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Manual reopen, independent of a new reply auto-reopening -- either
+    side should be able to say "this isn't actually settled" without first
+    having to post a message just to flip the state."""
+    edit = _get_owned_edit(session, user, edit_id)
+    edit.comments_resolved = False
+    session.add(edit)
+    session.commit()
+    return {"comments_resolved": False}
+
+
+@app.get("/api/share/{token}/edits/{edit_id}/comments")
+def get_share_edit_comments(token: str, edit_id: int, request: Request, session: Session = Depends(get_session)):
+    link = _require_share_session(request, token, session)
+    edit = _get_client_edit(session, link, edit_id)
+    comments = session.exec(select(RedlineComment).where(RedlineComment.edit_id == edit_id).order_by(RedlineComment.created_at)).all()
+    return {"comments": [_comment_payload(c) for c in comments], "comments_resolved": edit.comments_resolved}
+
+
+@app.post("/api/share/{token}/edits/{edit_id}/comments")
+def post_share_edit_comment(token: str, edit_id: int, body: CommentBody, request: Request, session: Session = Depends(get_session)):
+    """Client posts into a redline's thread -- open on ANY redline, not just
+    a declined one (this is what replaces the old one-shot
+    reply_to_redline_edit). Notifies the owner via the in-app bell only, no
+    email -- see post_edit_comment's docstring for why."""
+    link = _require_share_session(request, token, session)
+    edit = _get_client_edit(session, link, edit_id)
+    text = body.body.strip()
+    if not text:
+        raise HTTPException(400, "Enter a comment before sending.")
+    author_name = f"{link.client_first_name} {link.client_last_name}".strip() or (link.client_email.strip() or "Reviewer")
+    comment = RedlineComment(edit_id=edit.id, author_type="client", author_name=author_name, body=text[:2000])
+    session.add(comment)
+    if edit.comments_resolved:
+        edit.comments_resolved = False
+        session.add(edit)
+    session.commit()
+    session.refresh(comment)
 
     gc = session.get(GeneratedContract, link.generated_contract_id)
     owner = session.get(User, gc.owner_id) if gc else None
     if owner and gc and owner.notify_redline_comment:
-        _send_redline_comment_notification(owner, gc, link, edit)
-        who = link.client_email.strip() or "The reviewer"
         _notify(
             session, owner.id, "redline_comment",
-            title=f'{who} commented on a declined redline in "{gc.name}"',
-            body=reply[:200],
+            title=f'{author_name} commented on a redline in "{gc.name}"',
+            body=text[:200],
             generated_contract_id=gc.id,
         )
-    return {"id": edit.id, "client_reply": edit.client_reply, "client_reply_at": edit.client_reply_at.isoformat()}
+    return _comment_payload(comment)
+
+
+@app.post("/api/share/{token}/edits/{edit_id}/comments/resolve")
+def resolve_share_edit_comments(token: str, edit_id: int, request: Request, session: Session = Depends(get_session)):
+    link = _require_share_session(request, token, session)
+    edit = _get_client_edit(session, link, edit_id)
+    edit.comments_resolved = True
+    session.add(edit)
+    session.commit()
+    return {"comments_resolved": True}
+
+
+@app.post("/api/share/{token}/edits/{edit_id}/comments/reopen")
+def reopen_share_edit_comments(token: str, edit_id: int, request: Request, session: Session = Depends(get_session)):
+    link = _require_share_session(request, token, session)
+    edit = _get_client_edit(session, link, edit_id)
+    edit.comments_resolved = False
+    session.add(edit)
+    session.commit()
+    return {"comments_resolved": False}
 
 
 @app.get("/api/share/{token}/download")
@@ -2878,31 +3010,13 @@ def _send_redlines_submitted_notification(owner: User, gc: GeneratedContract, li
         pass  # SENDGRID_API_KEY not configured yet -- the submission is still recorded, just no email goes out
 
 
-def _send_redline_comment_notification(owner: User, gc: GeneratedContract, link: ShareLink, edit: RedlineEdit):
-    """Lets the owner know the client pushed back on a redline they
-    declined, without them needing to keep re-opening the Redlines modal to
-    check -- see reply_to_redline_edit."""
-    who = link.client_email.strip() or "The reviewer"
-    body = (
-        f'{who} left a comment on a redline you declined in "{gc.name}":\n\n'
-        f'"{edit.label}": {edit.original_value or "(blank)"} -> {edit.proposed_value}\n'
-        f'Their comment: "{edit.client_reply}"\n\n'
-        "Log in to your Rotely documents library to respond.\n\n- Rotely"
-    )
-    try:
-        ee.send_email(
-            owner.email, f'{who} commented on a declined redline in "{gc.name}"', body,
-            reply_to=(link.client_email.strip() or None),
-        )
-    except RuntimeError:
-        pass  # SENDGRID_API_KEY not configured yet -- the in-app notification below still lands either way
-
-
 def _notify(session: Session, user_id: int, type_: str, title: str, body: str = "", generated_contract_id: Optional[int] = None):
     """Writes one row to the owner's in-app notification bell. Two call
     sites, on purpose (see the Notification model docstring): submit_redlines
-    (a client submitted redlines) and reply_to_redline_edit (a client
-    commented on a redline the owner declined). Nothing else should call
+    (a client submitted redlines) and post_share_edit_comment (a client
+    commented in a redline's thread -- ANY redline as of Phase 2 of the
+    redline-negotiation overhaul, not just a declined one; bell only, no
+    email -- see that function's docstring). Nothing else should call
     this -- keeping the bell to exactly those triggers is a deliberate
     product decision, not an oversight. (acknowledge_response used to be a
     third trigger; it was removed for firing too often with too little
