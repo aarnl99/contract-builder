@@ -2295,9 +2295,15 @@ const BUG_TRACKER = {
     { id: "#12", title: "No autosave or refresh warning on the client share page", fix: "Added a beforeunload warning whenever a suggestion, comment, note, or accepted counter is sitting unsaved" },
     { id: "#15", title: "No file-size cap on template uploads", fix: "Uploads over 20MB are now rejected -- checked via Content-Length up front and again while streaming to disk, with cleanup on a rejected upload" },
     { id: "#16", title: "A few lower-risk buttons had no double-click guard or error handling", fix: "Mark-placeholder Save, delete template, and reset template now disable with an in-progress label during the request, and restore themselves with an error message on failure" },
+    { id: "F6", title: "Critical: applying an accepted-but-not-yet-applied redline could silently overwrite the wrong text", fix: "Only in-bounds offsets were checked, not that the text there still matched -- an intervening direct edit or applied round on the same paragraph could leave stale offsets in range but pointing at different text. Reproduced live (produced garbled “Gamma HoldingsLC” with zero error). Apply now re-checks the current text matches what was recorded before splicing, and blocks with a clear error if it doesn't" },
+    { id: "#18", title: "Countered-redline highlight underlined the whole sentence, not just the changed word", fix: "The indicator was applied to the whole .run element, but a run can span an entire clause with no formatting break -- now scoped to just the changed word's del/ins spans" },
   ],
   open: [
     { id: "#14", priority: "P3", title: "No rate limit on share-link access-code attempts", detail: "Reviewed and intentionally left open -- not considered important enough to prioritize right now." },
+    { id: "#19", priority: "DECISION", title: "A rejection is a dead end for the owner once the client pushes back with a comment", detail: "No UI to reconsider/re-decide, and even a raw API re-decide wouldn't notify the client -- needs a real “reconsider” design, not just a button." },
+    { id: "#20", priority: "DECISION", title: "Resubmitting after rejecting a counter loses the negotiation context", detail: "It goes back as an ordinary fresh redline with no flag that it's round 2 on a field the sender already countered." },
+    { id: "#21", priority: "DECISION", title: "Doing nothing about a counter is silently treated as accepting it", detail: "Saving or finalizing without an explicit Accept/Reject/Suggest submits the counter value as-is, indistinguishable server-side from an explicit accept." },
+    { id: "#22", priority: "DECISION", title: "A declined redline with a client's pushback comment has no reply path at all", detail: "No in-app way to have a back-and-forth on one specific proposed change -- the core of what makes the flow feel one-directional." },
   ],
 };
 
@@ -2312,9 +2318,12 @@ function buildBugTrackerCard() {
     )
   );
 
-  const priorityOrder = ["P0", "P1", "P2", "P3"];
-  const priorityLabels = { P0: "P0 — fix next", P1: "P1", P2: "P2 — real bugs, lower stakes", P3: "P3 — minor / hardening" };
-  const toneByPriority = { P0: "critical", P1: "pending", P2: "pending", P3: "draft" };
+  const priorityOrder = ["P0", "P1", "P2", "P3", "DECISION"];
+  const priorityLabels = {
+    P0: "P0 — fix next", P1: "P1", P2: "P2 — real bugs, lower stakes", P3: "P3 — minor / hardening",
+    DECISION: "Needs a product decision, not a bug fix",
+  };
+  const toneByPriority = { P0: "critical", P1: "pending", P2: "pending", P3: "draft", DECISION: "draft" };
 
   const bugRow = (idTone, idLabel, title, detail) =>
     el("div", { class: "bug-row" }, [
