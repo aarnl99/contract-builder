@@ -464,7 +464,6 @@ def set_plan(body: PlanBody, user: User = Depends(get_current_user), session: Se
 def _notification_settings_payload(user: User) -> dict:
     return {
         "redline_submitted": user.notify_redline_submitted,
-        "response_acknowledged": user.notify_response_acknowledged,
         "redline_comment": user.notify_redline_comment,
     }
 
@@ -476,7 +475,6 @@ def get_notification_settings(user: User = Depends(get_current_user)):
 
 class NotificationSettingsBody(BaseModel):
     redline_submitted: Optional[bool] = None
-    response_acknowledged: Optional[bool] = None
     redline_comment: Optional[bool] = None
 
 
@@ -488,11 +486,9 @@ def set_notification_settings(
 ):
     """Per-type opt-out for both the bell and the matching email -- each
     field is optional so the client can flip just one toggle at a time
-    without having to resend the other two current values."""
+    without having to resend the other current value."""
     if body.redline_submitted is not None:
         user.notify_redline_submitted = body.redline_submitted
-    if body.response_acknowledged is not None:
-        user.notify_response_acknowledged = body.response_acknowledged
     if body.redline_comment is not None:
         user.notify_redline_comment = body.redline_comment
     session.add(user)
@@ -502,10 +498,13 @@ def set_notification_settings(
 
 # ---------------------------------------------------------------------------
 # Notifications -- the bell in the topbar. Deliberately narrow: the only
-# three things that ever create a row are a client submitting redlines, a
-# client acknowledging the owner's response, and a client commenting on a
-# declined redline (see _notify's call sites) -- each individually mutable
-# via /api/account/notification-settings above.
+# two things that ever create a row are a client submitting redlines and a
+# client commenting on a declined redline (see _notify's call sites) --
+# each individually mutable via /api/account/notification-settings above.
+# (A third type, "response_acknowledged" -- a client viewing the owner's
+# accept/reject/counter response -- used to fire here too; it was removed
+# because it produced too much low-value email volume. Older rows of that
+# type may still exist and will still display fine.)
 # ---------------------------------------------------------------------------
 
 def _notification_payload(n: Notification) -> dict:
@@ -2274,10 +2273,12 @@ class AckResponseBody(BaseModel):
 @app.post("/api/share/{token}/acknowledge-response")
 def acknowledge_response(token: str, body: AckResponseBody, request: Request, session: Session = Depends(get_session)):
     """Marks the owner's batched response as seen, so it doesn't keep
-    reappearing on later visits once the client has continued past it. Also
-    the second (and last) trigger for the owner's notification bell -- the
-    owner learns the client actually looked at their accept/reject/counter
-    call, without needing to keep checking back themselves."""
+    reappearing on later visits once the client has continued past it. Used
+    to also notify the owner (bell + email) that the client saw their
+    response -- that was removed as a notification trigger since it fired
+    on every visit and generated too much low-value email volume; the
+    acknowledgment is still recorded and still drives the "seen" state, it
+    just no longer pings the owner."""
     link = _require_share_session(request, token, session)
     submission = session.get(RedlineSubmission, body.submission_id)
     if not submission or submission.share_link_id != link.id:
@@ -2285,17 +2286,6 @@ def acknowledge_response(token: str, body: AckResponseBody, request: Request, se
     submission.client_ack_at = datetime.utcnow()
     session.add(submission)
     session.commit()
-
-    gc = session.get(GeneratedContract, link.generated_contract_id)
-    owner = session.get(User, gc.owner_id) if gc else None
-    if owner and gc and owner.notify_response_acknowledged:
-        _send_response_acknowledged_notification(owner, gc, link)
-        who = link.client_email.strip() or "The reviewer"
-        _notify(
-            session, owner.id, "response_acknowledged",
-            title=f'{who} saw your response on "{gc.name}"',
-            generated_contract_id=gc.id,
-        )
     return {"ok": True}
 
 
@@ -2412,24 +2402,6 @@ def _send_redlines_submitted_notification(owner: User, gc: GeneratedContract, li
         pass  # SENDGRID_API_KEY not configured yet -- the submission is still recorded, just no email goes out
 
 
-def _send_response_acknowledged_notification(owner: User, gc: GeneratedContract, link: ShareLink):
-    """Lets the owner know the client actually opened and moved past their
-    accept/reject/counter response, the second (and last) of the two
-    triggers for owner-facing notifications -- see acknowledge_response."""
-    who = link.client_email.strip() or "The reviewer"
-    body = (
-        f'{who} saw your response on "{gc.name}" and continued.\n\n'
-        "Log in to your Rotely documents library for the full history.\n\n- Rotely"
-    )
-    try:
-        ee.send_email(
-            owner.email, f'{who} saw your response on "{gc.name}"', body,
-            reply_to=(link.client_email.strip() or None),
-        )
-    except RuntimeError:
-        pass  # SENDGRID_API_KEY not configured yet -- the in-app notification below still lands either way
-
-
 def _send_redline_comment_notification(owner: User, gc: GeneratedContract, link: ShareLink, edit: RedlineEdit):
     """Lets the owner know the client pushed back on a redline they
     declined, without them needing to keep re-opening the Redlines modal to
@@ -2451,13 +2423,14 @@ def _send_redline_comment_notification(owner: User, gc: GeneratedContract, link:
 
 
 def _notify(session: Session, user_id: int, type_: str, title: str, body: str = "", generated_contract_id: Optional[int] = None):
-    """Writes one row to the owner's in-app notification bell. Three call
+    """Writes one row to the owner's in-app notification bell. Two call
     sites, on purpose (see the Notification model docstring): submit_redlines
-    (a client submitted redlines), acknowledge_response (a client
-    acknowledged the owner's response), and reply_to_redline_edit (a client
+    (a client submitted redlines) and reply_to_redline_edit (a client
     commented on a redline the owner declined). Nothing else should call
     this -- keeping the bell to exactly those triggers is a deliberate
-    product decision, not an oversight."""
+    product decision, not an oversight. (acknowledge_response used to be a
+    third trigger; it was removed for firing too often with too little
+    value -- see that endpoint's docstring.)"""
     session.add(Notification(user_id=user_id, type=type_, title=title, body=body, generated_contract_id=generated_contract_id))
     session.commit()
 

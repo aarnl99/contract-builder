@@ -67,8 +67,11 @@ class User(SQLModel, table=True):
     # call sites) and the matching email. Each defaults on, since these are
     # about the account's own documents and someone would normally want to
     # hear about them; see GET/PATCH /api/account/notification-settings.
+    # (A third toggle, notify_response_acknowledged, used to gate a "client
+    # saw your response" notification -- removed because it fired on every
+    # visit and produced too much low-value email. The column may still
+    # exist on older rows in the live DB; it's just unused now.)
     notify_redline_submitted: bool = True  # a client sent back proposed edits
-    notify_response_acknowledged: bool = True  # a client saw your accept/reject/counter response
     notify_redline_comment: bool = True  # a client commented on a redline you declined
 
     templates: List["Template"] = Relationship(back_populates="owner")
@@ -327,15 +330,17 @@ class EmailDraftRequest(SQLModel, table=True):
 
 class Notification(SQLModel, table=True):
     """One in-app bell notification for an account owner. Deliberately
-    narrow-scoped: only three things ever create a row here -- a client
-    submitting redlines for review, a client acknowledging the owner's
-    response to a submission, and a client commenting on a redline the
-    owner declined (see main.py's submit_redlines, acknowledge_response,
-    and reply_to_redline_edit). Nothing else should write to this table."""
+    narrow-scoped: only two things ever create a row here -- a client
+    submitting redlines for review, and a client commenting on a redline the
+    owner declined (see main.py's submit_redlines and reply_to_redline_edit).
+    Nothing else should write to this table. (A third trigger,
+    "response_acknowledged" -- a client acknowledging the owner's response --
+    used to write here too; it was retired for firing too often with too
+    little value. Old rows of that type may still exist and still render.)"""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id", index=True)
-    type: str  # "redline_submitted" | "response_acknowledged" | "redline_comment"
+    type: str  # "redline_submitted" | "redline_comment" (legacy rows may also be "response_acknowledged")
     title: str
     body: str = ""
     generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
