@@ -62,6 +62,15 @@ class User(SQLModel, table=True):
     # email/password.
     google_sub: str = Field(default="", index=True)
 
+    # Per-type opt-outs for the owner-facing notifications a client's
+    # actions can trigger -- both the in-app bell (see main.py's _notify
+    # call sites) and the matching email. Each defaults on, since these are
+    # about the account's own documents and someone would normally want to
+    # hear about them; see GET/PATCH /api/account/notification-settings.
+    notify_redline_submitted: bool = True  # a client sent back proposed edits
+    notify_response_acknowledged: bool = True  # a client saw your accept/reject/counter response
+    notify_redline_comment: bool = True  # a client commented on a redline you declined
+
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
 

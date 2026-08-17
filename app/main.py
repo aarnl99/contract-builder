@@ -461,10 +461,51 @@ def set_plan(body: PlanBody, user: User = Depends(get_current_user), session: Se
     return {"plan": _plan_info(session, user)}
 
 
+def _notification_settings_payload(user: User) -> dict:
+    return {
+        "redline_submitted": user.notify_redline_submitted,
+        "response_acknowledged": user.notify_response_acknowledged,
+        "redline_comment": user.notify_redline_comment,
+    }
+
+
+@app.get("/api/account/notification-settings")
+def get_notification_settings(user: User = Depends(get_current_user)):
+    return _notification_settings_payload(user)
+
+
+class NotificationSettingsBody(BaseModel):
+    redline_submitted: Optional[bool] = None
+    response_acknowledged: Optional[bool] = None
+    redline_comment: Optional[bool] = None
+
+
+@app.patch("/api/account/notification-settings")
+def set_notification_settings(
+    body: NotificationSettingsBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Per-type opt-out for both the bell and the matching email -- each
+    field is optional so the client can flip just one toggle at a time
+    without having to resend the other two current values."""
+    if body.redline_submitted is not None:
+        user.notify_redline_submitted = body.redline_submitted
+    if body.response_acknowledged is not None:
+        user.notify_response_acknowledged = body.response_acknowledged
+    if body.redline_comment is not None:
+        user.notify_redline_comment = body.redline_comment
+    session.add(user)
+    session.commit()
+    return _notification_settings_payload(user)
+
+
 # ---------------------------------------------------------------------------
-# Notifications -- the bell in the topbar. Deliberately narrow: the only two
-# things that ever create a row are a client submitting redlines and a
-# client acknowledging the owner's response (see _notify's call sites).
+# Notifications -- the bell in the topbar. Deliberately narrow: the only
+# three things that ever create a row are a client submitting redlines, a
+# client acknowledging the owner's response, and a client commenting on a
+# declined redline (see _notify's call sites) -- each individually mutable
+# via /api/account/notification-settings above.
 # ---------------------------------------------------------------------------
 
 def _notification_payload(n: Notification) -> dict:
@@ -2115,7 +2156,7 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     session.commit()
 
     owner = session.get(User, gc.owner_id)
-    if owner:
+    if owner and owner.notify_redline_submitted:
         _send_redlines_submitted_notification(owner, gc, link, len(resolved), body.note.strip())
         who = link.client_email.strip() or "A reviewer"
         _notify(
@@ -2204,7 +2245,7 @@ def reply_to_redline_edit(token: str, edit_id: int, body: ClientReplyBody, reque
 
     gc = session.get(GeneratedContract, link.generated_contract_id)
     owner = session.get(User, gc.owner_id) if gc else None
-    if owner and gc:
+    if owner and gc and owner.notify_redline_comment:
         _send_redline_comment_notification(owner, gc, link, edit)
         who = link.client_email.strip() or "The reviewer"
         _notify(
@@ -2247,7 +2288,7 @@ def acknowledge_response(token: str, body: AckResponseBody, request: Request, se
 
     gc = session.get(GeneratedContract, link.generated_contract_id)
     owner = session.get(User, gc.owner_id) if gc else None
-    if owner and gc:
+    if owner and gc and owner.notify_response_acknowledged:
         _send_response_acknowledged_notification(owner, gc, link)
         who = link.client_email.strip() or "The reviewer"
         _notify(
