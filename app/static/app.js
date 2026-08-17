@@ -2365,13 +2365,14 @@ const BUG_TRACKER = {
     { id: "#16", title: "A few lower-risk buttons had no double-click guard or error handling", fix: "Mark-placeholder Save, delete template, and reset template now disable with an in-progress label during the request, and restore themselves with an error message on failure" },
     { id: "F6", title: "Critical: applying an accepted-but-not-yet-applied redline could silently overwrite the wrong text", fix: "Only in-bounds offsets were checked, not that the text there still matched -- an intervening direct edit or applied round on the same paragraph could leave stale offsets in range but pointing at different text. Reproduced live (produced garbled “Gamma HoldingsLC” with zero error). Apply now re-checks the current text matches what was recorded before splicing, and blocks with a clear error if it doesn't" },
     { id: "#18", title: "Countered-redline highlight underlined the whole sentence, not just the changed word", fix: "The indicator was applied to the whole .run element, but a run can span an entire clause with no formatting break -- now scoped to just the changed word's del/ins spans" },
+    { id: "Phase 1", title: "Redline overhaul, phase 1 of 4: share links didn't require a real client identity", fix: "A share link now requires the client's first name, last name, and email before it can be created (existing links untouched). Client gets emailed the link + access code when a NEW link is created; review page now shows “Editing as: {Full Name} (email)”. Foundation for phases 2-4 below." },
   ],
   open: [
     { id: "#14", priority: "P3", title: "No rate limit on share-link access-code attempts", detail: "Reviewed and intentionally left open -- not considered important enough to prioritize right now." },
-    { id: "#19", priority: "DECISION", title: "A rejection is a dead end for the owner once the client pushes back with a comment", detail: "No UI to reconsider/re-decide, and even a raw API re-decide wouldn't notify the client -- needs a real “reconsider” design, not just a button." },
-    { id: "#20", priority: "DECISION", title: "Resubmitting after rejecting a counter loses the negotiation context", detail: "It goes back as an ordinary fresh redline with no flag that it's round 2 on a field the sender already countered." },
-    { id: "#21", priority: "DECISION", title: "Doing nothing about a counter is silently treated as accepting it", detail: "Saving or finalizing without an explicit Accept/Reject/Suggest submits the counter value as-is, indistinguishable server-side from an explicit accept." },
-    { id: "#22", priority: "DECISION", title: "A declined redline with a client's pushback comment has no reply path at all", detail: "No in-app way to have a back-and-forth on one specific proposed change -- the core of what makes the flow feel one-directional." },
+    { id: "#19", priority: "BUILDING", title: "A rejection is a dead end for the owner once the client pushes back with a comment", detail: "Decided: Phase 3 (reconsider flow) -- resend just the reconsidered edit(s) as a new round, everything else in that round stands as already-approved, client notified by email. Blocked on Phase 1 (shipped)." },
+    { id: "#20", priority: "BUILDING", title: "Resubmitting after rejecting a counter loses the negotiation context", detail: "Decided: Phase 3 -- a visible chain linking the resubmission back to the original counter, for transparency and tracking." },
+    { id: "#21", priority: "BUILDING", title: "Doing nothing about a counter is silently treated as accepting it", detail: "Decided: Phase 4 -- Finalize and submit becomes a hard block until every counter has an explicit decision (Save progress stays unblocked), plus an “N unresolved” badge on the document dashboard/list view." },
+    { id: "#22", priority: "BUILDING", title: "A declined redline with a client's pushback comment has no reply path at all", detail: "Decided: Phase 2 -- an open comment thread on any redline, Google-Docs-suggest-edit-style, with real names (needs Phase 1, shipped), independent resolve state, auto- and manual-reopen, no per-reply email." },
   ],
 };
 
@@ -2386,12 +2387,13 @@ function buildBugTrackerCard() {
     )
   );
 
-  const priorityOrder = ["P0", "P1", "P2", "P3", "DECISION"];
+  const priorityOrder = ["P0", "P1", "P2", "P3", "DECISION", "BUILDING"];
   const priorityLabels = {
     P0: "P0 — fix next", P1: "P1", P2: "P2 — real bugs, lower stakes", P3: "P3 — minor / hardening",
     DECISION: "Needs a product decision, not a bug fix",
+    BUILDING: "Decided — building now (4-phase plan, phase 1 shipped)",
   };
-  const toneByPriority = { P0: "critical", P1: "pending", P2: "pending", P3: "draft", DECISION: "draft" };
+  const toneByPriority = { P0: "critical", P1: "pending", P2: "pending", P3: "draft", DECISION: "draft", BUILDING: "pending" };
 
   const bugRow = (idTone, idLabel, title, detail) =>
     el("div", { class: "bug-row" }, [
