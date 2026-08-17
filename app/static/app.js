@@ -1175,6 +1175,7 @@ function openFillModal(tpl, prefill, onDone) {
     value: (prefill && prefill.party_b) || "",
   });
 
+  const generateBtn = el("button", { class: "btn", onclick: submit }, "Generate");
   const modal = el("div", { class: "modal" }, [
     el("h2", {}, tpl.name),
     el("p", { class: "subtitle", style: "margin:2px 0 16px;" }, `${tpl.document_type} · fill in the blanks below`),
@@ -1184,19 +1185,26 @@ function openFillModal(tpl, prefill, onDone) {
     ...fieldRows,
     el("div", { class: "modal-actions" }, [
       el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"),
-      el("button", { class: "btn", onclick: submit }, "Generate"),
+      generateBtn,
     ]),
   ]);
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
   async function submit() {
+    // Guard against double-submit (double-click, or a slow request plus a
+    // second click before it resolves) -- without this, each click fires an
+    // independent POST /generate and the server had no dedup, so a single
+    // "draft from template" action could silently create two documents.
+    if (generateBtn.disabled) return;
     errBox.innerHTML = "";
     const values = {};
     Object.entries(inputs).forEach(([k, i]) => (values[k] = i.value));
     const partyA = partyAInput.value.trim();
     const partyB = partyBInput.value.trim();
     const parties = [partyA, partyB].filter(Boolean);
+    generateBtn.disabled = true;
+    generateBtn.textContent = "Generating...";
     try {
       const res = await api(`/api/templates/${tpl.id}/generate`, { method: "POST", body: { values, parties } });
       state.plan = res.plan;
@@ -1208,6 +1216,8 @@ function openFillModal(tpl, prefill, onDone) {
       onDone(res, { values, party_a: partyA, party_b: partyB });
     } catch (e) {
       errBox.appendChild(el("div", { class: "error-box" }, e.message));
+      generateBtn.disabled = false;
+      generateBtn.textContent = "Generate";
     }
   }
 }
