@@ -1411,7 +1411,9 @@ function MastersView() {
         if (t.status === "ready") {
           actions.push(el("button", { class: "btn small", onclick: () => (location.hash = `#/draft/${t.id}`) }, "Draft"));
         }
-        actions.push(el("button", { class: "btn danger small", onclick: () => deleteTemplate(t.id) }, "Delete"));
+        const deleteBtn = el("button", { class: "btn danger small" }, "Delete");
+        deleteBtn.addEventListener("click", () => deleteTemplate(t.id, deleteBtn));
+        actions.push(deleteBtn);
 
         listWrap.appendChild(
           el("div", { class: "doc-card" }, [
@@ -1430,10 +1432,18 @@ function MastersView() {
   }
   load();
 
-  async function deleteTemplate(id) {
+  async function deleteTemplate(id, btn) {
     if (!confirm("Delete this master document? Fields and any editing progress will be lost. Documents already drafted from it are kept in your library.")) return;
-    await api(`/api/templates/${id}`, { method: "DELETE" });
-    load();
+    btn.disabled = true;
+    btn.textContent = "Deleting...";
+    try {
+      await api(`/api/templates/${id}`, { method: "DELETE" });
+      load();
+    } catch (e) {
+      alert(e.message);
+      btn.disabled = false;
+      btn.textContent = "Delete";
+    }
   }
 
   return wrap;
@@ -1835,9 +1845,18 @@ function EditorView(templateId) {
   const resetBtn = el("button", { class: "btn secondary small" }, "Start over (remove all marks)");
   resetBtn.addEventListener("click", async () => {
     if (!confirm("This removes all placeholders and restores the original document text. Continue?")) return;
-    const data = await api(`/api/templates/${templateId}/reset`, { method: "POST" });
-    contractView.innerHTML = data.html;
-    loadPlaceholders();
+    resetBtn.disabled = true;
+    resetBtn.textContent = "Resetting...";
+    try {
+      const data = await api(`/api/templates/${templateId}/reset`, { method: "POST" });
+      contractView.innerHTML = data.html;
+      loadPlaceholders();
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      resetBtn.disabled = false;
+      resetBtn.textContent = "Start over (remove all marks)";
+    }
   });
   const genBtn = el("button", { class: "btn block", style: "margin-bottom:8px;" }, "Draft from this document →");
   genBtn.addEventListener("click", () => (location.hash = `#/draft/${templateId}`));
@@ -1971,10 +1990,11 @@ function EditorView(templateId) {
       modalChildren.push(...newFieldFields);
     }
 
+    const saveBtn = el("button", { class: "btn", onclick: submit }, "Save");
     modalChildren.push(
       el("div", { class: "modal-actions" }, [
         el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"),
-        el("button", { class: "btn", onclick: submit }, "Save"),
+        saveBtn,
       ])
     );
 
@@ -2001,6 +2021,8 @@ function EditorView(templateId) {
           return;
         }
       }
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving...";
       try {
         const res = await api(`/api/templates/${templateId}/mark`, {
           method: "POST",
@@ -2021,6 +2043,8 @@ function EditorView(templateId) {
         loadPlaceholders();
       } catch (e) {
         errBox.appendChild(el("div", { class: "error-box" }, e.message));
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save";
       }
     }
   }
