@@ -1660,6 +1660,8 @@ def _share_link_payload(link: ShareLink) -> dict:
         "token": link.token,
         "access_code": link.access_code,
         "client_email": link.client_email,
+        "client_first_name": link.client_first_name,
+        "client_last_name": link.client_last_name,
         "sender_email": link.sender_email,
         "url": f"/share/{link.token}",
         "status": link.status,
@@ -1673,8 +1675,38 @@ def _generate_access_code() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(8))
 
 
+def _send_share_created_email(request: Request, user: User, gc: GeneratedContract, link: ShareLink) -> None:
+    """Lets the client know a document is waiting for them the moment a
+    NEW share link is created (never re-sent on later visits to the Share
+    modal -- see create_share_link, this only runs on the branch that
+    actually inserts a new ShareLink row). Includes the link and access
+    code directly in the body rather than making them go find it separately
+    -- see the redline-negotiation overhaul notes: it's their own email
+    address, on file because we now require it, so this is no less safe
+    than any other "here's your access code" email."""
+    sender_name = user.name.strip() or user.email
+    share_url = f"{_base_url(request)}/share/{link.token}"
+    body = (
+        f"Hi {link.client_first_name},\n\n"
+        f'{sender_name} shared a document with you to review: "{gc.name}".\n\n'
+        f"Open it here:\n{share_url}\n\n"
+        f"Access code: {link.access_code}\n\n"
+        "You can review it, suggest changes, and send them back right from that page -- no account needed.\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(
+            link.client_email, f'{sender_name} shared "{gc.name}" with you for review', body,
+            reply_to=(link.sender_email.strip() or user.email),
+        )
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the link still works, just wasn't emailed
+
+
 class CreateShareBody(BaseModel):
-    client_email: str = ""  # optional -- shown to the client as "Editing as"
+    client_email: str = ""
+    client_first_name: str = ""
+    client_last_name: str = ""
     # Optional override for what the client sees as the sender's contact
     # email -- falls back to the account's own login email when blank.
     sender_email: str = ""
@@ -1683,14 +1715,28 @@ class CreateShareBody(BaseModel):
 @app.post("/api/generated/{generated_id}/share")
 def create_share_link(
     generated_id: int,
+    request: Request,
     body: CreateShareBody = CreateShareBody(),
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """Returns the account's existing open share link for this document if
-    there is one, otherwise creates a new one with a fresh access code."""
+    there is one, otherwise creates a new one with a fresh access code.
+
+    Creating a brand-new link requires the client's first name, last name,
+    and a valid email -- previously all three were optional, but a named,
+    attributed reviewer is now load-bearing for the redline comment thread
+    (see RedlineComment) and will be for e-signature down the line, so it's
+    collected up front instead of being backfilled later. This does NOT
+    apply to an already-existing link: re-calling this (as the Share modal
+    does on open, to fetch the current link) only ever *updates* fields
+    that were actually re-supplied, exactly as before, so an existing link
+    from before this requirement stays valid even if it's missing one of
+    these -- nothing here forces every old link to be fixed up."""
     gc = _get_owned_generated(session, user, generated_id)
     client_email = body.client_email.strip()[:200]
+    client_first_name = body.client_first_name.strip()[:100]
+    client_last_name = body.client_last_name.strip()[:100]
     sender_email = body.sender_email.strip()[:200]
     existing = session.exec(
         select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
@@ -1700,6 +1746,12 @@ def create_share_link(
         if client_email and client_email != existing.client_email:
             existing.client_email = client_email
             changed = True
+        if client_first_name and client_first_name != existing.client_first_name:
+            existing.client_first_name = client_first_name
+            changed = True
+        if client_last_name and client_last_name != existing.client_last_name:
+            existing.client_last_name = client_last_name
+            changed = True
         if sender_email != existing.sender_email:
             existing.sender_email = sender_email
             changed = True
@@ -1708,13 +1760,21 @@ def create_share_link(
             session.commit()
             session.refresh(existing)
         return _share_link_payload(existing)
+
+    if not (client_email and client_first_name and client_last_name):
+        raise HTTPException(400, "Enter the client's first name, last name, and email before creating a share link.")
+    if not _EMAIL_ADDR_RE.fullmatch(client_email):
+        raise HTTPException(400, "That doesn't look like a valid email address.")
+
     link = ShareLink(
         generated_contract_id=gc.id, token=secrets.token_urlsafe(16), access_code=_generate_access_code(),
-        client_email=client_email, sender_email=sender_email,
+        client_email=client_email, client_first_name=client_first_name, client_last_name=client_last_name,
+        sender_email=sender_email,
     )
     session.add(link)
     session.commit()
     session.refresh(link)
+    _send_share_created_email(request, user, gc, link)
     return _share_link_payload(link)
 
 
@@ -2348,6 +2408,8 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
         "fields": fields,
         "parties": json.loads(gc.parties_json or "[]"),
         "client_email": link.client_email,
+        "client_first_name": link.client_first_name,
+        "client_last_name": link.client_last_name,
         "sender_email": sender_email,
         "draft": draft_payload,
         "response": response_payload,

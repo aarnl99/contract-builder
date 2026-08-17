@@ -213,7 +213,16 @@ class ShareLink(SQLModel, table=True):
     generated_contract_id: int = Field(foreign_key="generatedcontract.id", index=True)
     token: str = Field(index=True, unique=True)
     access_code: str  # short passcode the sender shares with the client out of band
-    client_email: str = ""  # optional, set by the sender when creating the link -- shown to the client as "Editing as"
+    # Required as of the redline-negotiation overhaul (2026-08-17) for any
+    # NEWLY created link -- see main.create_share_link -- both so a share
+    # always has a real person attached (comments and, eventually,
+    # signatures need an actual name, not a maybe-blank email) and so the
+    # "document shared with you" / "sender responded" emails always have
+    # somewhere to go. Links created before that change keep whatever they
+    # had (possibly blank); nothing here retroactively enforces it.
+    client_email: str = ""  # shown to the client as "Editing as", and where share/response emails go
+    client_first_name: str = ""
+    client_last_name: str = ""
     # Optional override for what the client sees as "the document sender"
     # (contact link, reply-to on outbound mail) -- falls back to the
     # account's own login email when blank, but lets an account holder who
