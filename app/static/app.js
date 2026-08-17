@@ -938,7 +938,20 @@ async function openRedlinesModal(generatedId) {
             const summaryEl = edit.decision === "countered"
               ? el("div", { class: "decided-countered" }, ["Countered: ", el("strong", {}, edit.counter_value)])
               : el("div", { class: "decided " + edit.decision }, edit.decision);
-            actions = el("div", { class: "decision-row" }, [summaryEl]);
+            const actionChildren = [summaryEl];
+            // The client can leave a comment on any redline the owner
+            // declined (see share.js's renderReplyArea) -- surface it here
+            // so the owner sees the pushback without having to go dig for
+            // it, styled the same way it appears on the client's side.
+            if (edit.decision === "rejected" && edit.client_reply) {
+              actionChildren.push(
+                el("div", { class: "client-reply-box" }, [
+                  el("div", { class: "client-reply-label" }, "Client's comment:"),
+                  el("div", { class: "client-reply-text" }, edit.client_reply),
+                ])
+              );
+            }
+            actions = el("div", { class: "decision-row" }, actionChildren);
           } else if (!awaitingResponse) {
             actions = el("div", { class: "decision-row" }, [el("div", { class: "decided pending" }, "No response yet")]);
           } else {

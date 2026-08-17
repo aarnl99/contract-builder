@@ -688,6 +688,119 @@ function DocumentView(data) {
   );
   docCard.appendChild(errBox);
 
+  // ---- redline history: every round of redlines ever submitted through
+  // this link, with the sender's decision on each one -- accepted,
+  // declined, or countered -- and, on a declined one, the client's own
+  // reply. Unlike ResponseView (which only shows up once, right after a
+  // fresh response, and disappears for good once "Continue redlining" is
+  // clicked), this stays available on every visit for as long as the link
+  // is open, so what was approved/declined/countered is never just gone. ----
+  const redlineHistoryList = el("div", { style: "display:block;" });
+  function renderRedlineHistoryEdit(edit) {
+    const rows = [
+      el("div", { class: "rl-diff" }, [
+        el("span", { class: "old" }, edit.original_value || "(blank)"),
+        " → ",
+        el("span", { class: "new" }, edit.proposed_value || "(blank)"),
+      ]),
+    ];
+    if (edit.comment) rows.push(el("div", { class: "rl-comment" }, [`"${edit.comment}"`]));
+
+    let decisionEl;
+    if (edit.decision === "accepted") decisionEl = el("div", { class: "re-outcome outcome-accepted" }, "Accepted");
+    else if (edit.decision === "rejected") decisionEl = el("div", { class: "re-outcome outcome-rejected" }, "Declined");
+    else if (edit.decision === "countered") decisionEl = el("div", { class: "re-outcome outcome-countered" }, ["Countered with: ", el("strong", {}, edit.counter_value)]);
+    else decisionEl = el("div", { class: "re-outcome outcome-pending" }, "Awaiting the sender's decision");
+
+    const row = el("div", { class: "redline-history-edit-row" }, [
+      el("div", { class: "rl-label" }, edit.label || "Custom edit"),
+      ...rows,
+      decisionEl,
+    ]);
+
+    if (edit.decision === "rejected") {
+      const replyHolder = el("div", {});
+      row.appendChild(replyHolder);
+      renderReplyArea(edit, replyHolder);
+    }
+    return row;
+  }
+
+  function renderReplyArea(edit, holder) {
+    holder.innerHTML = "";
+    if (edit.client_reply) {
+      const editLink = el("a", { class: "link", style: "font-size:12px;" }, "Edit comment");
+      editLink.addEventListener("click", () => showReplyForm(edit, holder));
+      holder.appendChild(
+        el("div", { class: "client-reply-box" }, [
+          el("div", { class: "client-reply-label" }, "Your comment:"),
+          el("div", { class: "client-reply-text" }, edit.client_reply),
+        ])
+      );
+      holder.appendChild(el("div", { style: "margin-top:4px;" }, editLink));
+    } else {
+      const replyBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Leave a comment");
+      replyBtn.addEventListener("click", () => showReplyForm(edit, holder));
+      holder.appendChild(replyBtn);
+    }
+  }
+
+  function showReplyForm(edit, holder) {
+    holder.innerHTML = "";
+    const textarea = el("textarea", { class: "rp-comment", placeholder: "Why should this be reconsidered?" }, edit.client_reply || "");
+    const sendBtn = el("button", { class: "btn small" }, "Send");
+    const cancelBtn = el("button", { class: "btn secondary small" }, "Cancel");
+    sendBtn.addEventListener("click", async () => {
+      const reply = textarea.value.trim();
+      if (!reply) return;
+      sendBtn.disabled = true;
+      sendBtn.textContent = "Sending...";
+      try {
+        const res = await api(`/api/share/${TOKEN}/edits/${edit.id}/reply`, { method: "POST", body: { reply } });
+        edit.client_reply = res.client_reply;
+        edit.client_reply_at = res.client_reply_at;
+        renderReplyArea(edit, holder);
+      } catch (e) {
+        alert(e.message);
+        sendBtn.disabled = false;
+        sendBtn.textContent = "Send";
+      }
+    });
+    cancelBtn.addEventListener("click", () => renderReplyArea(edit, holder));
+    holder.appendChild(
+      el("div", { style: "margin-top:8px;" }, [
+        textarea,
+        el("div", { style: "display:flex;gap:8px;margin-top:6px;" }, [sendBtn, cancelBtn]),
+      ])
+    );
+    textarea.focus();
+  }
+
+  function loadRedlineHistory() {
+    redlineHistoryList.innerHTML = "";
+    redlineHistoryList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "Loading..."));
+    api(`/api/share/${TOKEN}/redlines`).then((data) => {
+      redlineHistoryList.innerHTML = "";
+      if (!data.submissions.length) {
+        redlineHistoryList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "Nothing submitted yet."));
+        return;
+      }
+      data.submissions.forEach((sub) => {
+        const statusLabel = sub.status === "reviewed" ? "Applied" : sub.responded_at ? "Response sent" : "Awaiting response";
+        const subBox = el("div", { class: "redline-submission" }, [
+          el("div", { class: "sub-header" }, [
+            el("div", { style: "font-weight:700;font-size:13px;" }, statusLabel),
+            el("div", { class: "when" }, new Date(sub.submitted_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
+          ]),
+        ]);
+        if (sub.note) subBox.appendChild(el("div", { class: "note-box" }, sub.note));
+        sub.edits.forEach((edit) => subBox.appendChild(renderRedlineHistoryEdit(edit)));
+        redlineHistoryList.appendChild(subBox);
+      });
+    });
+  }
+  loadRedlineHistory();
+
   // ---- activity history: every time this document (and its revisions)
   // was drafted, shared, viewed, or redlined -- in local time, every
   // occurrence, not just the latest. Same lineage data the sender sees on
@@ -731,6 +844,8 @@ function DocumentView(data) {
     statsBar,
     el("h2", { class: "redline-list-heading" }, "Redlines"),
     redlineList,
+    el("h2", { class: "redline-list-heading", style: "margin-top:22px;" }, "Redline history"),
+    redlineHistoryList,
     el("h2", { class: "redline-list-heading", style: "margin-top:22px;" }, "Activity"),
     historyList,
   ]);
