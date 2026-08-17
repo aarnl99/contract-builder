@@ -257,7 +257,11 @@ class ShareLinkView(SQLModel, table=True):
 
 
 class RedlineSubmission(SQLModel, table=True):
-    """One batch of proposed edits a client submitted through a share link."""
+    """One batch of proposed edits, submitted through a share link. Almost
+    always the client (see `origin`), but as of the redline-negotiation
+    overhaul phase 3 the owner can also originate one directly, to send a
+    reconsidered decision back as its own scoped round -- see
+    main.reconsider_redline_edit."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     share_link_id: int = Field(foreign_key="sharelink.id", index=True)
@@ -269,10 +273,24 @@ class RedlineSubmission(SQLModel, table=True):
     # reviewed -- the owner has processed it (applied accepted edits into a
     #             new draft; independent of whether a response was sent).
     status: str = "pending"  # draft | pending | reviewed
+    # client -- the normal case, a client's own batch (via Save progress /
+    #           Finalize and submit).
+    # owner_reconsideration -- created directly by main.reconsider_redline_edit
+    #           when the owner changes their mind on an edit they'd already
+    #           decided; contains exactly the one reconsidered edit, arrives
+    #           already responded_at-set (see below), and must NOT be treated
+    #           as "the client sent proposed changes for review" anywhere
+    #           that branches on submission type (e.g. the document activity
+    #           timeline in main.get_generated_history / app.js's
+    #           chainItemFor -- gets its own "owner_reconsidered" event type
+    #           there instead of "redline_submitted").
+    origin: str = "client"
 
     # Set when the owner reviews every edit (accept/reject/counter) and hits
     # "Send response" -- batches the whole outcome into one round the client
-    # sees next time, rather than pinging them once per edit.
+    # sees next time, rather than pinging them once per edit. For an
+    # owner_reconsideration submission this is set immediately at creation
+    # (the owner's action IS the response, there's no separate review step).
     responded_at: Optional[datetime] = None
     # Set once the client has seen the response and continued past it, so it
     # doesn't keep reappearing on later visits.
@@ -334,16 +352,32 @@ class RedlineEdit(SQLModel, table=True):
     # comment while resolved auto-reopens it. See main.post_edit_comment /
     # main.post_share_edit_comment.
     comments_resolved: bool = False
-    # Set when this edit's value is the client accepting an earlier
-    # "countered" RedlineEdit of the sender's -- points at that prior edit's
-    # id (see main._resolve_edits' accepting_edit_id handling). Persisted
-    # here (not just resolved in-memory at submit time) so a client who
-    # "Save progress"s a counter-acceptance and resumes on a later visit
-    # still has it recognized as one on their eventual Finalize -- without
+    # Points at the prior RedlineEdit this one continues a negotiation
+    # from -- two distinct producers as of phase 3 of the redline-
+    # negotiation overhaul:
+    #   1. The client responding (accepting exactly OR countering again) to
+    #      a "countered" RedlineEdit of the sender's -- see
+    #      main._resolve_edits' accepting_edit_id handling. Set regardless
+    #      of whether the client took the counter's value as-is (decision
+    #      also auto-set to "accepted" in that case) or suggested something
+    #      different (decision stays "pending" for the owner to review) --
+    #      before phase 3 this was only set on an exact match, so a client
+    #      who suggested a different value after a counter lost the link
+    #      back to the negotiation entirely (bug tracker #20).
+    #   2. The owner reconsidering an edit they'd already decided -- see
+    #      main.reconsider_redline_edit (#19). Points back at the edit
+    #      being reconsidered; the new row carries the owner's updated
+    #      decision and lives in its own `origin="owner_reconsideration"`
+    #      RedlineSubmission (see RedlineSubmission.origin) rather than
+    #      mutating the original row, so the original decision stays in
+    #      the record as-was.
+    # Persisted here (not just resolved in-memory at submit time) so a
+    # client who "Save progress"s a counter-response and resumes on a later
+    # visit still has it recognized on their eventual Finalize -- without
     # this, the resumed draft item looked like an ordinary fresh proposal
-    # with nothing marking it as already-decided, and re-submitting it
-    # silently lost the accepting_edit_id reference, forcing the sender to
-    # re-review a value they'd already dictated via their own counter.
+    # with nothing marking it as continuing an earlier round.
+    # main._source_edit_summary turns this into a short "responds to ..."
+    # preview shown in both the owner and client redline views.
     source_edit_id: Optional[int] = Field(default=None, foreign_key="redlineedit.id")
 
 

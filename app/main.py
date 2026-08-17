@@ -1297,8 +1297,14 @@ def _lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
         if s.status == "draft":
             continue  # only saved-in-progress, never actually sent -- nothing happened yet
         link = link_by_id.get(s.share_link_id)
+        # An owner_reconsideration round (see RedlineSubmission.origin) is
+        # the OWNER updating their own earlier decision, not the client
+        # sending anything -- give it its own event type so it isn't
+        # mislabeled "The client sent proposed changes for review" in the
+        # timeline (app.js's chainItemFor).
+        ev_type = "owner_reconsidered" if s.origin == "owner_reconsideration" else "redline_submitted"
         events.append({
-            "type": "redline_submitted", "at": s.submitted_at.isoformat() + "Z",
+            "type": ev_type, "at": s.submitted_at.isoformat() + "Z",
             "document_id": link.generated_contract_id if link else None,
             "share_link_id": s.share_link_id, "submission_id": s.id,
         })
@@ -1700,6 +1706,27 @@ def _comments_by_edit(session: Session, edit_ids: list) -> dict:
     return out
 
 
+def _source_summaries_by_id(session: Session, source_ids: list) -> dict:
+    """Batch-fetches a short preview of every RedlineEdit referenced by
+    another edit's `source_edit_id` -- see that field's docstring for the
+    two things it can mean (a client responding to a counter, or an owner
+    reconsideration). Keyed by the SOURCE edit's own id so callers can look
+    up `e.source_edit_id` directly; used to render a "responds to ..." note
+    in the owner and client redline views instead of leaving the chain
+    invisible (bug tracker #20)."""
+    ids = [i for i in set(source_ids) if i]
+    if not ids:
+        return {}
+    sources = session.exec(select(RedlineEdit).where(RedlineEdit.id.in_(ids))).all()
+    return {
+        s.id: {
+            "id": s.id, "label": s.label, "proposed_value": s.proposed_value,
+            "counter_value": s.counter_value, "decision": s.decision,
+        }
+        for s in sources
+    }
+
+
 def _send_share_created_email(request: Request, user: User, gc: GeneratedContract, link: ShareLink) -> None:
     """Lets the client know a document is waiting for them the moment a
     NEW share link is created (never re-sent on later visits to the Share
@@ -1726,6 +1753,40 @@ def _send_share_created_email(request: Request, user: User, gc: GeneratedContrac
         )
     except RuntimeError:
         pass  # SENDGRID_API_KEY not configured yet -- the link still works, just wasn't emailed
+
+
+def _send_reconsideration_email(
+    request: Request, user: User, gc: GeneratedContract, link: ShareLink, edit: "RedlineEdit"
+) -> None:
+    """One email per owner reconsideration round (bug tracker #19) -- the
+    owner changed their mind on a single already-decided edit and it's
+    going out as its own scoped round rather than resurfacing the whole
+    original submission (see reconsider_redline_edit). Deliberately not a
+    bell/in-app notification -- clients have no account or notification
+    center, email is the only channel that reaches them at all, unlike the
+    bell-only comment-thread notifications in phase 2 which are for the
+    OWNER's side."""
+    sender_name = user.name.strip() or user.email
+    share_url = f"{_base_url(request)}/share/{link.token}"
+    outcome = (
+        f'countered with: "{edit.counter_value}"' if edit.decision == "countered"
+        else f"now {edit.decision}"
+    )
+    body = (
+        f"Hi {link.client_first_name},\n\n"
+        f'{sender_name} updated an earlier decision on "{gc.name}": '
+        f'"{edit.label}" is {outcome}.\n\n'
+        f"Open it here:\n{share_url}\n\n"
+        f"Access code: {link.access_code}\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(
+            link.client_email, f'{sender_name} updated a decision on "{gc.name}"', body,
+            reply_to=(link.sender_email.strip() or user.email),
+        )
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the reconsideration still applies, just wasn't emailed
 
 
 class CreateShareBody(BaseModel):
@@ -1882,6 +1943,9 @@ def get_redlines(
     all_edits_by_sub = {s.id: session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all() for s in submissions}
     all_edit_ids = [e.id for edits in all_edits_by_sub.values() for e in edits]
     comments_by_edit = _comments_by_edit(session, all_edit_ids)
+    source_by_id = _source_summaries_by_id(
+        session, [e.source_edit_id for edits in all_edits_by_sub.values() for e in edits if e.source_edit_id]
+    )
 
     out = []
     for s in submissions:
@@ -1901,6 +1965,10 @@ def get_redlines(
                 "threshold_desc": threshold_desc, "inside_threshold": inside_threshold,
                 "comments": comments_by_edit.get(e.id, []),
                 "comments_resolved": e.comments_resolved,
+                # See RedlineEdit.source_edit_id -- a client's response to
+                # one of the owner's own counters, chained so it's never
+                # just an unexplained fresh redline (bug tracker #20).
+                "responding_to": source_by_id.get(e.source_edit_id) if e.source_edit_id else None,
             })
         out.append({
             "id": s.id,
@@ -1908,6 +1976,9 @@ def get_redlines(
             "submitted_at": s.submitted_at.isoformat(),
             "status": s.status,
             "responded_at": s.responded_at.isoformat() if s.responded_at else None,
+            # See RedlineSubmission.origin -- "owner_reconsideration" rounds
+            # are the owner's own updated decision, not a client submission.
+            "origin": s.origin,
             "edits": edit_rows,
         })
     return {"header": header, "share": _share_link_payload(link), "submissions": out}
@@ -2551,19 +2622,22 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
             if (
                 prior and prior_sub and prior_sub.share_link_id == link_id
                 and prior.decision == "countered"
-                and prior.counter_value.strip() == proposed
             ):
-                decision = "accepted"
-                # Persisted onto the row itself (not just resolved here in
-                # memory) so a "Save progress" draft remembers it's a
-                # counter-acceptance across a resume -- see RedlineEdit.
-                # source_edit_id's docstring.
+                # Chain this new edit back to the counter it's responding
+                # to regardless of whether the client took the counter's
+                # value exactly or suggested something different -- see
+                # RedlineEdit.source_edit_id and bug tracker #20. Before
+                # this, the chain was only recorded on an exact match, so a
+                # client who countered the sender's counter (rather than
+                # taking it as-is) lost the link back to the negotiation
+                # entirely, and the sender saw an unrelated fresh redline.
                 source_edit_id = e.accepting_edit_id
+                if prior.counter_value.strip() == proposed:
+                    decision = "accepted"
             # A missing/mismatched reference isn't an error -- it just means
-            # this isn't (or is no longer) a pure counter-acceptance, so it
-            # falls through to the normal "pending, needs an owner decision"
-            # path, e.g. if the client edited the value via "Suggest edit"
-            # instead of taking the counter as-is.
+            # this isn't (or is no longer) a response to a live counter, so
+            # it falls through to the normal "pending, needs an owner
+            # decision" path with no chain recorded.
 
         out.append(dict(
             field_key=e.field_key if ph else "",
@@ -2703,6 +2777,9 @@ def get_share_redlines(token: str, request: Request, session: Session = Depends(
     all_edits_by_sub = {s.id: session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all() for s in submissions}
     all_edit_ids = [e.id for edits in all_edits_by_sub.values() for e in edits]
     comments_by_edit = _comments_by_edit(session, all_edit_ids)
+    source_by_id = _source_summaries_by_id(
+        session, [e.source_edit_id for edits in all_edits_by_sub.values() for e in edits if e.source_edit_id]
+    )
 
     out = []
     for s in submissions:
@@ -2713,6 +2790,10 @@ def get_share_redlines(token: str, request: Request, session: Session = Depends(
             "responded_at": s.responded_at.isoformat() if s.responded_at else None,
             "status": s.status,
             "note": s.note,
+            # See RedlineSubmission.origin -- lets the client's own history
+            # panel label an owner reconsideration round distinctly from a
+            # round they submitted themselves.
+            "origin": s.origin,
             "edits": [
                 {
                     "id": e.id, "label": e.label,
@@ -2721,6 +2802,11 @@ def get_share_redlines(token: str, request: Request, session: Session = Depends(
                     "decision": e.decision, "counter_value": e.counter_value,
                     "comments": comments_by_edit.get(e.id, []),
                     "comments_resolved": e.comments_resolved,
+                    # See RedlineEdit.source_edit_id -- for an
+                    # owner_reconsideration round this points at the edit
+                    # the client originally proposed, giving the client a
+                    # visible link back to what changed (bug tracker #19).
+                    "responding_to": source_by_id.get(e.source_edit_id) if e.source_edit_id else None,
                 }
                 for e in edits
             ],
@@ -2748,6 +2834,78 @@ def _get_client_edit(session: Session, link: ShareLink, edit_id: int) -> Redline
     if not edit or not submission or submission.share_link_id != link.id:
         raise HTTPException(404, "That redline no longer exists.")
     return edit
+
+
+class ReconsiderBody(BaseModel):
+    decision: str  # accepted | rejected | countered
+    counter_value: str = ""
+
+
+@app.post("/api/redline-edits/{edit_id}/reconsider")
+def reconsider_redline_edit(
+    edit_id: int,
+    body: ReconsiderBody,
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Lets the owner change their mind on an edit they've already decided
+    (accepted/rejected/countered) -- bug tracker #19. Before this, a
+    decision was a dead end: once made, the Redlines modal permanently
+    dropped an edit's decision controls (see openRedlinesModal's `already`
+    branch), even after a client pushed back in its comment thread, with
+    no way to reverse or revise it.
+
+    Deliberately does NOT mutate the original edit or reuse
+    respond_to_submission -- either would lose the original decision from
+    the record, or resurface the whole ORIGINAL round (including every
+    other item in it, already resolved and acknowledged rounds ago) in the
+    client's "sender responded" banner just because one item changed.
+    Instead this creates a single new RedlineEdit, chained back to the one
+    being reconsidered via source_edit_id, inside its own one-edit
+    origin="owner_reconsideration" RedlineSubmission that arrives already
+    responded_at-set -- so the client's banner and history show exactly
+    and only the reconsidered item as its own new round, with a visible
+    link back to what it updates, and everything else from the original
+    round is untouched. See RedlineSubmission.origin and
+    RedlineEdit.source_edit_id."""
+    if body.decision not in ("accepted", "rejected", "countered"):
+        raise HTTPException(400, "decision must be 'accepted', 'rejected', or 'countered'")
+    if body.decision == "countered" and not body.counter_value.strip():
+        raise HTTPException(400, "Enter a counter value or choose accept/reject instead.")
+
+    edit = _get_owned_edit(session, user, edit_id)
+    if edit.decision == "pending":
+        raise HTTPException(400, "This redline hasn't been decided yet -- respond to it normally instead of reconsidering.")
+
+    submission = session.get(RedlineSubmission, edit.submission_id)
+    link = session.get(ShareLink, submission.share_link_id)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+
+    new_sub = RedlineSubmission(
+        share_link_id=link.id, status="pending", origin="owner_reconsideration",
+        responded_at=datetime.utcnow(), client_ack_at=None,
+    )
+    session.add(new_sub)
+    session.commit()
+    session.refresh(new_sub)
+
+    new_edit = RedlineEdit(
+        submission_id=new_sub.id,
+        field_key=edit.field_key, label=edit.label,
+        original_value=edit.original_value, proposed_value=edit.proposed_value,
+        evaluation=edit.evaluation,
+        decision=body.decision,
+        counter_value=body.counter_value.strip() if body.decision == "countered" else "",
+        location_json=edit.location_json,
+        source_edit_id=edit.id,
+    )
+    session.add(new_edit)
+    session.commit()
+    session.refresh(new_edit)
+
+    _send_reconsideration_email(request, user, gc, link, new_edit)
+    return {"id": new_edit.id, "submission_id": new_sub.id, "decision": new_edit.decision}
 
 
 @app.get("/api/redline-edits/{edit_id}/comments")
