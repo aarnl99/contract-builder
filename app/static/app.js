@@ -248,7 +248,6 @@ function toggleAvatarMenu() {
   notifRow.appendChild(el("div", { class: "label" }, "Notifications"));
   const NOTIF_TOGGLES = [
     { key: "redline_submitted", label: "Someone sends redlines" },
-    { key: "response_acknowledged", label: "Client sees your response" },
     { key: "redline_comment", label: "Client comments on a declined redline" },
   ];
   const notifList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:2px;" }, [
@@ -297,11 +296,14 @@ function toggleAvatarMenu() {
 
 // ---------------------------------------------------------------------------
 // Notification bell -- fires on exactly two events (see main.py's _notify
-// call sites): a client submits redlines for review, and a client
-// acknowledges the owner's response. Nothing else lights up the bell.
+// call sites): a client submits redlines for review, and a client comments
+// on a redline the owner declined. Nothing else lights up the bell.
+// "response_acknowledged" is kept in the label map only so any older,
+// already-delivered notifications of that (now-retired) type still render
+// with a readable title instead of raw text.
 // ---------------------------------------------------------------------------
 
-const NOTIF_TYPE_LABELS = { redline_submitted: "Redlines submitted", response_acknowledged: "Response seen" };
+const NOTIF_TYPE_LABELS = { redline_submitted: "Redlines submitted", response_acknowledged: "Response seen", redline_comment: "Redline comment" };
 
 function refreshNotifBadge() {
   if (!state.user) return;
