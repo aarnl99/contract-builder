@@ -787,6 +787,11 @@ class MarkBody(BaseModel):
     # Only used when field_type == "clause_preset" -- the named whole-clause
     # variants to offer on the draft form for this field.
     preset_options: list[PresetOption] = []
+    # The text app.js's computeSelectionSegments captured at the moment this
+    # selection was made (range.toString()) -- see mark_placeholder's stale-
+    # selection guard. Empty only from a caller that predates this field;
+    # never sent empty by app.js itself.
+    expected_text: str = ""
 
 
 def _parse_table_path(path_str: str) -> list[list[int]]:
@@ -842,6 +847,31 @@ def mark_placeholder(
 
     doc = de.load(tpl.working_path)
 
+    # The browser's floating "Mark as placeholder" toolbar captures a
+    # selection (paragraph/run/offsets) once, on mouseup, and can stay
+    # visible and clickable long after that selection stopped meaning
+    # anything -- e.g. the owner deletes a different placeholder, or hits
+    # "Start over," either of which re-renders contractView's whole DOM
+    # (shifting every run's offsets) without the toolbar itself ever being
+    # dismissed. app.js's hideToolbar() now gets called from those actions
+    # too (see EditorView), but that only closes the common triggers, not
+    # every way this selection could go stale -- this is the real guard.
+    # Always re-read whatever text actually sits at the client's numeric
+    # location in the CURRENT document (not the client's echoed guess) and
+    # compare it against what the browser captured at selection time
+    # (expected_text). A mismatch means the offsets now point at different
+    # text than the owner ever selected -- reject instead of silently
+    # marking whatever happens to be there now with no error at all.
+    try:
+        current_text = de.extract_text_at(doc, container_path, body.paragraph_index, [s.dict() for s in body.segments])
+    except de.MarkError as e:
+        raise HTTPException(400, str(e))
+    if body.expected_text and current_text != body.expected_text:
+        raise HTTPException(
+            400,
+            "That selection is no longer valid -- the document changed since you selected this text. Please reselect and try again.",
+        )
+
     # Captured BEFORE mark_placeholder overwrites the selection with the
     # {{token}}, so un-marking (delete_placeholder) can restore the actual
     # original wording later instead of having nothing left to fall back
@@ -851,12 +881,7 @@ def mark_placeholder(
     # from the first, un-marking still restores only the first occurrence's
     # text everywhere (matches the existing one-row-per-field model, which
     # already fills every occurrence with the same value).
-    original_text = None
-    if existing_placeholder is None:
-        try:
-            original_text = de.extract_text_at(doc, container_path, body.paragraph_index, [s.dict() for s in body.segments])
-        except de.MarkError:
-            pass  # mark_placeholder below will raise the same error with a proper message
+    original_text = current_text if existing_placeholder is None else None
 
     try:
         de.mark_placeholder(
@@ -2162,6 +2187,14 @@ def get_redlines(
     source_by_id = _source_summaries_by_id(
         session, [e.source_edit_id for edits in all_edits_by_sub.values() for e in edits if e.source_edit_id]
     )
+    # See apply_redline_submission's superseded_edit_ids -- an edit's
+    # `decision` column is never mutated once set, so a reconsidered edit
+    # can still read "accepted" here long after something newer (a
+    # reconsideration, or the client's own response to a counter) chained
+    # back to it via source_edit_id. Surfacing that here lets the UI grey
+    # out the stale "Apply" affordance instead of showing a decision that
+    # apply itself will now silently skip.
+    superseded_edit_ids = {e.source_edit_id for edits in all_edits_by_sub.values() for e in edits if e.source_edit_id}
 
     out = []
     for s in submissions:
@@ -2185,6 +2218,7 @@ def get_redlines(
                 # one of the owner's own counters, chained so it's never
                 # just an unexplained fresh redline (bug tracker #20).
                 "responding_to": source_by_id.get(e.source_edit_id) if e.source_edit_id else None,
+                "superseded": e.id in superseded_edit_ids,
             })
         out.append({
             "id": s.id,
@@ -2383,6 +2417,28 @@ def apply_redline_submission(
 
     edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == submission.id)).all()
 
+    # An edit's `decision` column is never mutated once set -- reconsidering
+    # one (reconsider_redline_edit) leaves the original's `decision` exactly
+    # as it was and instead creates a brand-new RedlineEdit, in a brand-new
+    # sibling submission on this same link, chained back via
+    # `source_edit_id`. That means an edit can still read `decision ==
+    # "accepted"` in this table long after the owner reconsidered and
+    # rejected it. Anything ANY other edit on this link has since chained
+    # back to via source_edit_id -- whether from that reconsideration path
+    # or the client's own accept/reject/counter response -- is superseded:
+    # something newer stands in its place, so it must never be treated as
+    # still-accepted here, however its own `decision` column still reads.
+    # Without this, accepting a redline, reconsidering it to rejected, and
+    # then clicking Apply on ANY round on this link would silently re-apply
+    # the original (reconsidered-away) value, since apply only ever looked
+    # at `decision` and had no way to see it had been superseded.
+    superseded_edit_ids = set()
+    if sibling_sub_ids:
+        all_sibling_edits = session.exec(
+            select(RedlineEdit).where(RedlineEdit.submission_id.in_(sibling_sub_ids))
+        ).all()
+        superseded_edit_ids = {e.source_edit_id for e in all_sibling_edits if e.source_edit_id}
+
     # Fold in every other submission on this link that's been responded to
     # (the owner has decided on it) but never applied -- see the docstring
     # above. edit_to_folded_sub tracks which sibling submission each folded
@@ -2401,14 +2457,22 @@ def apply_redline_submission(
         ).all()
         for s in other_unapplied:
             s_edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all()
-            relevant = [e for e in s_edits if e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved")]
+            relevant = [
+                e for e in s_edits
+                if e.id not in superseded_edit_ids
+                and (e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved"))
+            ]
             if relevant:
                 folded_in_subs.append(s)
                 for e in relevant:
                     edit_to_folded_sub[e.id] = s
                 edits = edits + relevant
 
-    to_apply = [e for e in edits if e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved")]
+    to_apply = [
+        e for e in edits
+        if e.id not in superseded_edit_ids
+        and (e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved"))
+    ]
     if not to_apply:
         raise HTTPException(400, "No accepted edits to apply yet.")
 
