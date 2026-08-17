@@ -1579,11 +1579,21 @@ def _client_lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
     when, in plain terms, with none of the owner's internal identifiers
     (document/share-link/submission ids, document names) or anything
     threshold-related -- consistent with get_share_document, which likewise
-    never sends redline threshold rules to the client."""
+    never sends redline threshold rules to the client.
+
+    "owner_edited" events (see #23 in the bug tracker) are dropped entirely
+    here, not just relabeled -- a direct edit the owner made to their own
+    private draft BEFORE the document was ever shared is internal drafting
+    process, not something the client was ever part of or needs to know
+    happened; it's still a real revision (nothing here changes the document
+    itself or its lineage), it just never surfaces as a timeline entry on
+    this side. Contrast with "owner_edit_proposed" (an edit made AFTER
+    sharing), which the client absolutely must see since it's a proposal
+    they need to act on."""
     full = _lineage_timeline(gc, session)
     return {
         "revision_count": len(full["documents"]),
-        "timeline": [{"type": e["type"], "at": e["at"]} for e in full["timeline"]],
+        "timeline": [{"type": e["type"], "at": e["at"]} for e in full["timeline"] if e["type"] != "owner_edited"],
     }
 
 
