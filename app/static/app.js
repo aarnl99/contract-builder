@@ -2225,6 +2225,76 @@ function statusRow(label, ok, okText, badText) {
   ]);
 }
 
+// Running list from the full-flow audit (Aug 17, 2026). Kept in sync by
+// hand as items get fixed or new ones surface -- not derived from live
+// data, just a convenient place for the account owner to see engineering
+// status without leaving the product. Mirrors the same list kept in the
+// attached Claude project.
+const BUG_TRACKER = {
+  fixed: [
+    { id: "F1", title: "“response_acknowledged” notification fired on every client visit, too much email volume", fix: "Removed the notification (bell + email); underlying “seen” tracking kept" },
+    { id: "F2", title: "Applying redlines silently dropped accepted-but-unapplied edits from an earlier submission on the same link", fix: "Apply now sweeps in and folds in any other decided-but-unapplied sibling submission" },
+    { id: "F3", title: "Client accepting a sender’s counter forced the owner to re-review it as a brand-new redline", fix: "New submissions can reference the countered edit they’re accepting; validated and auto-marked decided" },
+    { id: "F4", title: "Double-clicking “Generate” created two separate documents from one action", fix: "Button disables while in flight; server also dedupes identical requests within 15s" },
+    { id: "#2", title: "Deleting a master template destroyed every contract ever generated from it", fix: "The generated/ folder is preserved and file paths repointed before the template is deleted" },
+    { id: "#3", title: "Archiving a document didn’t close its live share link, letting a client revive it with a new active revision", fix: "Archiving now closes the family’s share link; new revisions inherit the source’s archived state" },
+    { id: "#4", title: "An older revision’s status badge wrongly reverted to “Draft” once a later revision was shared/applied", fix: "Status lookup now matches the whole lineage family, not just the exact document a link points at" },
+    { id: "#5", title: "Responding to only some edits in a redline round permanently stranded the rest", fix: "Decision controls stay available for any edit still pending, regardless of prior partial responses" },
+    { id: "#6", title: "Deleting a generated contract quietly freed up monthly plan quota", fix: "Usage is now computed from an immutable generation log, not currently-existing documents" },
+  ],
+  open: [
+    { id: "#1", priority: "P0", title: "Counter-acceptance tracking is lost on Save-progress → resume → Submit", detail: "Reintroduces the F3 bug through a different path -- the “already accepted” marker isn’t persisted across a save/resume." },
+    { id: "#7", priority: "P2", title: "Plan-limit check runs before the duplicate-request check in Generate", detail: "A legitimate retry at exactly your monthly cap gets falsely rejected instead of recognized as a duplicate." },
+    { id: "#8", priority: "P2", title: "Redlines submitted on a closed-then-reissued share link become invisible to the owner", detail: "The client still sees “your changes were sent.”" },
+    { id: "#9", priority: "P2", title: "No UI way for an owner to close/revoke a share link", detail: "The backend endpoint exists; nothing calls it." },
+    { id: "#10", priority: "P2", title: "Un-marking a placeholder field bakes the field’s label text into the document", detail: "Risk of literal placeholder text (e.g. “Client Name”) ending up in a real contract." },
+    { id: "#11", priority: "P2", title: "A couple of share-page panels have no error handling and can spin forever", detail: "Redline history and document history, if something goes wrong mid-session." },
+    { id: "#12", priority: "P2", title: "No autosave or refresh warning on the client share page", detail: "In-progress redline edits are lost on an accidental reload." },
+    { id: "#13", priority: "P3", title: "No rate limit on share-link access-code attempts" },
+    { id: "#14", priority: "P3", title: "No file-size cap on template uploads" },
+    { id: "#15", priority: "P3", title: "A few lower-risk buttons have no double-click guard or error handling", detail: "Mark-placeholder Save, delete template, reset template." },
+    { id: "#16", priority: "P3", title: "Small amount of dead code left from the notification cleanup", detail: "Harmless." },
+    { id: "#17", priority: "P3", title: "Deduped duplicate Generate requests leave an orphaned file on disk", detail: "Storage waste only." },
+  ],
+};
+
+function buildBugTrackerCard() {
+  const card = el("div", { class: "card bug-tracker-card" });
+  card.appendChild(el("div", { class: "chart-title" }, "Bug tracker"));
+  card.appendChild(
+    el(
+      "p",
+      { class: "subtitle", style: "margin:-6px 0 14px;" },
+      `From the full-flow audit — ${BUG_TRACKER.fixed.length} fixed & shipped, ${BUG_TRACKER.open.length} open. Kept in sync by hand, not derived from live data.`
+    )
+  );
+
+  const priorityOrder = ["P0", "P1", "P2", "P3"];
+  const priorityLabels = { P0: "P0 — fix next", P1: "P1", P2: "P2 — real bugs, lower stakes", P3: "P3 — minor / hardening" };
+  const toneByPriority = { P0: "critical", P1: "pending", P2: "pending", P3: "draft" };
+
+  const bugRow = (idTone, idLabel, title, detail) =>
+    el("div", { class: "bug-row" }, [
+      el("span", { class: "status-tag " + idTone }, idLabel),
+      el("div", { class: "bug-row-body" }, [
+        el("div", { class: "bug-row-title" }, title),
+        detail ? el("div", { class: "bug-row-detail" }, detail) : null,
+      ]),
+    ]);
+
+  priorityOrder.forEach((p) => {
+    const items = BUG_TRACKER.open.filter((it) => it.priority === p);
+    if (!items.length) return;
+    card.appendChild(el("div", { class: "bug-group-label" }, priorityLabels[p]));
+    items.forEach((it) => card.appendChild(bugRow(toneByPriority[p], it.id, it.title, it.detail)));
+  });
+
+  card.appendChild(el("div", { class: "bug-group-label" }, "Fixed & shipped"));
+  BUG_TRACKER.fixed.forEach((it) => card.appendChild(bugRow("final", it.id, it.title, it.fix)));
+
+  return card;
+}
+
 function AdminView() {
   const wrap = el("div", { class: "admin-view" });
   wrap.appendChild(el("h1", {}, "Admin"));
@@ -2320,6 +2390,7 @@ function AdminView() {
     usersCard.appendChild(table);
     body.appendChild(usersCard);
     body.appendChild(buildManageUsersCard());
+    body.appendChild(buildBugTrackerCard());
   }).catch((e) => {
     body.innerHTML = "";
     body.appendChild(el("div", { class: "error-box" }, e.message || "Failed to load admin data."));
