@@ -1344,6 +1344,7 @@ def list_generated(
         q = q.where(GeneratedContract.template_id == template_id)
     rows = session.exec(q.order_by(GeneratedContract.created_at.desc())).all()
     status_by_doc = _document_statuses(session, [g.id for g in rows], owner_id=user.id)
+    unresolved_by_doc = _unresolved_counts(session, [g.id for g in rows], owner_id=user.id)
     return [
         {
             "id": g.id,
@@ -1358,6 +1359,11 @@ def list_generated(
             "is_redline_result": g.source_submission_id is not None,
             "parties": json.loads(g.parties_json or "[]"),
             "status": status_by_doc.get(g.id, {"key": "draft", "label": "Draft", "tone": "draft"}),
+            # See _unresolved_counts -- #21 / phase 4. How many of the
+            # owner's own countered redlines are still awaiting an explicit
+            # client response, independent of Phase 2's comment-resolve
+            # state.
+            "unresolved_count": unresolved_by_doc.get(g.id, 0),
         }
         for g in rows
     ]
@@ -1453,6 +1459,83 @@ def _document_statuses(session: Session, doc_ids: list, owner_id: Optional[int] 
     return out
 
 
+def _unresolved_counts(session: Session, doc_ids: list, owner_id: Optional[int] = None) -> dict:
+    """Bulk-computes, per generated document id, how many of the owner's own
+    countered redlines are still hanging with no explicit response -- bug
+    tracker #21 (phase 4 of the redline-negotiation overhaul). Before this,
+    a client who never explicitly accepted, rejected, or re-suggested a
+    countered edit had it silently treated as accepted the moment they hit
+    Finalize; that loophole is now closed (see submit_redlines and
+    share.js's own client-side check), and this count is the "N unresolved"
+    visibility the owner gets in the meantime -- while the client is still
+    deciding, or if they never come back to decide at all.
+
+    A countered RedlineEdit counts as resolved the moment ANY other
+    RedlineEdit chains back to it via source_edit_id -- whether that's the
+    client's own explicit accept/reject/counter response (submit_redlines /
+    _resolve_edits' accepting_edit_id path) or the owner reconsidering it
+    themselves (reconsider_redline_edit). Either way, something now stands
+    in its place, so it's no longer just silently waiting.
+
+    Counted across every share link the document's lineage has ever had, to
+    match #8 and _document_statuses' same family-wide scope, then mirrored
+    onto every revision in that family so the badge reads the same
+    regardless of which exact revision a share link's pointer currently
+    sits on."""
+    if not doc_ids:
+        return {}
+
+    root_by_doc: dict = {}
+    family_ids = set(doc_ids)
+    if owner_id is None and doc_ids:
+        any_doc = session.get(GeneratedContract, doc_ids[0])
+        owner_id = any_doc.owner_id if any_doc else None
+    if owner_id is not None:
+        all_docs = session.exec(select(GeneratedContract).where(GeneratedContract.owner_id == owner_id)).all()
+        roots = _lineage_roots_for(all_docs, session)
+        root_by_doc = {g.id: roots.get(g.id, g.id) for g in all_docs}
+        wanted_roots = {root_by_doc[d] for d in doc_ids if d in root_by_doc}
+        family_ids = {gid for gid, root in root_by_doc.items() if root in wanted_roots} | set(doc_ids)
+
+    links = session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(family_ids))).all()
+    if not links:
+        return {d: 0 for d in doc_ids}
+    link_by_id = {l.id: l for l in links}
+    subs = session.exec(
+        select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(list(link_by_id.keys())), RedlineSubmission.status != "draft")
+    ).all()
+    sub_ids = [s.id for s in subs]
+    if not sub_ids:
+        return {d: 0 for d in doc_ids}
+    sub_link = {s.id: s.share_link_id for s in subs}
+    edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id.in_(sub_ids))).all()
+    referenced = {e.source_edit_id for e in edits if e.source_edit_id}
+
+    count_by_doc: dict = {}
+    for e in edits:
+        if e.decision != "countered" or e.id in referenced:
+            continue
+        link = link_by_id.get(sub_link.get(e.submission_id))
+        if not link:
+            continue
+        count_by_doc[link.generated_contract_id] = count_by_doc.get(link.generated_contract_id, 0) + 1
+
+    out = {}
+    if root_by_doc:
+        count_by_root: dict = {}
+        for doc_id, cnt in count_by_doc.items():
+            root = root_by_doc.get(doc_id)
+            if root is None:
+                continue
+            count_by_root[root] = count_by_root.get(root, 0) + cnt
+        for d in doc_ids:
+            out[d] = count_by_root.get(root_by_doc.get(d), 0)
+    else:
+        for d in doc_ids:
+            out[d] = count_by_doc.get(d, 0)
+    return out
+
+
 @app.get("/api/generated/{generated_id}")
 def get_generated(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     gc = _get_owned_generated(session, user, generated_id)
@@ -1460,6 +1543,7 @@ def get_generated(generated_id: int, user: User = Depends(get_current_user), ses
     if os.path.exists(gc.file_path):
         html = de.render_paragraphs_html(de.load(gc.file_path))
     status = _document_statuses(session, [gc.id], owner_id=gc.owner_id).get(gc.id, {"key": "draft", "label": "Draft", "tone": "draft"})
+    unresolved_count = _unresolved_counts(session, [gc.id], owner_id=gc.owner_id).get(gc.id, 0)
     return {
         "id": gc.id,
         "name": gc.name,
@@ -1472,6 +1556,8 @@ def get_generated(generated_id: int, user: User = Depends(get_current_user), ses
         "html": html,
         "parties": json.loads(gc.parties_json or "[]"),
         "status": status,
+        # See _unresolved_counts -- #21 / phase 4.
+        "unresolved_count": unresolved_count,
     }
 
 
@@ -1921,8 +2007,13 @@ def get_redlines(
         "client": (parties[1] if len(parties) > 1 else (link.client_email if link else "")) or "",
     }
 
+    # See _unresolved_counts -- #21 / phase 4. Shown in the modal header
+    # regardless of whether a link currently exists, same as the dashboard
+    # badge -- though with no link there's nothing to be unresolved either.
+    unresolved_count = _unresolved_counts(session, [generated_id], owner_id=user.id).get(generated_id, 0)
+
     if not link:
-        return {"header": header, "share": None, "submissions": []}
+        return {"header": header, "share": None, "submissions": [], "unresolved_count": unresolved_count}
 
     # Every submission from EVERY link this family has ever had, not just
     # the most recent one -- if a link is closed and a fresh one issued
@@ -1981,7 +2072,7 @@ def get_redlines(
             "origin": s.origin,
             "edits": edit_rows,
         })
-    return {"header": header, "share": _share_link_payload(link), "submissions": out}
+    return {"header": header, "share": _share_link_payload(link), "submissions": out, "unresolved_count": unresolved_count}
 
 
 class DecisionBody(BaseModel):
@@ -2663,6 +2754,24 @@ def _existing_draft(session: Session, share_link_id: int) -> Optional[RedlineSub
     ).first()
 
 
+def _unresolved_countered_edit_ids(session: Session, link_id: int) -> set:
+    """The id of every countered RedlineEdit on this link that no other
+    RedlineEdit has chained back to yet via source_edit_id -- see
+    _unresolved_counts for the full rationale. Scoped to just this one
+    link (not the whole lineage family _unresolved_counts uses for the
+    dashboard badge), since that's the exact set of counters the client
+    reviewing THIS link is responsible for deciding on before Finalize."""
+    subs = session.exec(
+        select(RedlineSubmission).where(RedlineSubmission.share_link_id == link_id, RedlineSubmission.status != "draft")
+    ).all()
+    sub_ids = [s.id for s in subs]
+    if not sub_ids:
+        return set()
+    edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id.in_(sub_ids))).all()
+    referenced = {e.source_edit_id for e in edits if e.source_edit_id}
+    return {e.id for e in edits if e.decision == "countered" and e.id not in referenced}
+
+
 @app.post("/api/share/{token}/save-progress")
 def save_share_progress(token: str, body: ShareSubmitBody, request: Request, session: Session = Depends(get_session)):
     """Persists the client's in-progress redlines and comments server-side
@@ -2706,6 +2815,20 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
         raise HTTPException(400, "No changes or comments were provided.")
 
     resolved = _resolve_edits(session, gc, body.edits, link_id=link.id)
+
+    # Hard block -- bug tracker #21 / phase 4. Inaction on a counter used to
+    # default to silent acceptance the moment Finalize was hit; now every
+    # countered edit on this link must be explicitly resolved (accepted,
+    # rejected, or re-suggested -- see _resolve_edits' accepting_edit_id
+    # chaining) before a submission can go through. "Save progress" (above)
+    # deliberately has no such check -- the client is allowed to come back
+    # later and decide then. share.js checks this client-side too so the
+    # error surfaces as soon as the client clicks Finalize, but the real
+    # gate is here: nothing this endpoint accepts can leave a counter
+    # silently unresolved.
+    still_unresolved = _unresolved_countered_edit_ids(session, link.id) - {kw["source_edit_id"] for kw in resolved if kw["source_edit_id"]}
+    if still_unresolved:
+        raise HTTPException(400, "Decide on the sender's countered change(s) before finalizing -- accept, reject, or suggest something else for each one.")
 
     # Finalizing replaces any in-progress "Save progress" draft -- it's now
     # a real submission, not a draft anymore.
