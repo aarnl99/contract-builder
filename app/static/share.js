@@ -435,16 +435,22 @@ function DocumentView(data) {
         let cursor = 0;
         segEdits.forEach(({ seg, edit }) => {
           if (seg.start > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, seg.start)));
-          frag.appendChild(el("span", { class: "fv-del" }, text.slice(seg.start, seg.end)));
+          // The counter-pending indicator is scoped to just the del/ins pair
+          // for THIS edit, not the whole .run -- a run can span an entire
+          // clause (Word often merges a whole sentence into one run when
+          // there's no formatting boundary), so marking the run itself
+          // visually underlined every word in it, not just the countered
+          // one. See has-counter-pending's CSS comment.
+          const pendingCls = edit.counterPending ? " counter-pending" : "";
+          frag.appendChild(el("span", { class: "fv-del" + pendingCls }, text.slice(seg.start, seg.end)));
           if (!seen.has(edit)) {
-            frag.appendChild(el("span", { class: "fv-ins" }, edit.value || "(blank)"));
+            frag.appendChild(el("span", { class: "fv-ins" + pendingCls }, edit.value || "(blank)"));
             seen.add(edit);
           }
           cursor = seg.end;
         });
         if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
         runEl.classList.add("has-suggestion");
-        if (segEdits.some(({ edit }) => edit.counterPending)) runEl.classList.add("has-counter-pending");
         runEl.innerHTML = "";
         runEl.appendChild(frag);
       });

@@ -633,7 +633,10 @@ a.link:hover { text-decoration: underline; }
 .fdc-suggest { background: var(--bg); color: var(--ink); border: 1px solid var(--border); }
 .fdc-suggest:hover { background: var(--accent-soft); }
 
-.contract-view .run.has-counter-pending { box-shadow: inset 0 -2px 0 var(--accent); border-radius: 3px; }
+/* Scoped to the del/ins pair for the countered edit itself, not the whole
+   .run -- a run can span an entire clause (see share.js's repaint), so
+   marking the run would underline every word in it, not just the change. */
+.contract-view .fv-del.counter-pending, .contract-view .fv-ins.counter-pending { box-shadow: inset 0 -2px 0 var(--accent); border-radius: 3px; }
 .redline-list-item.counter-pending { border-color: var(--accent-soft-border); background: var(--accent-soft); }
 .rl-counter-note { font-size: 11.5px; color: var(--accent-dark); font-weight: 600; margin-top: 2px; }
 .rl-counter-actions { display: flex; gap: 5px; flex-shrink: 0; }
