@@ -172,6 +172,24 @@ class GeneratedContract(SQLModel, table=True):
     owner: Optional[User] = Relationship(back_populates="generated_contracts")
 
 
+class GenerationEvent(SQLModel, table=True):
+    """Immutable log of every successful document-generation event (a fresh
+    draft, an owner edit, an applied redline round, or an inbound-email
+    draft -- anything that produces a new GeneratedContract row), used only
+    to compute monthly plan usage. Kept as its own append-only table,
+    separate from GeneratedContract itself, specifically so permanently
+    deleting a generated document later (see delete_generated_forever)
+    can't retroactively free up the plan quota it already used this month
+    -- counting live GeneratedContract rows directly let a user at their
+    cap delete an old draft to "unlock" another slot, which didn't match
+    the "used X of Y this month" messaging shown to them."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    owner_id: int = Field(foreign_key="user.id", index=True)
+    generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
 # ---------------------------------------------------------------------------
 # Redlining: share a generated contract for review, with per-field
 # auto-approval thresholds set by the account owner (see Placeholder above).

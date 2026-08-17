@@ -19,7 +19,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from .db import init_db, get_session, UPLOADS_DIR, DATA_DIR
 from .models import (
-    User, Template, Placeholder, GeneratedContract, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
+    User, Template, Placeholder, GeneratedContract, GenerationEvent, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
     ShareLink, ShareLinkView, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest, Notification,
 )
 from .auth import hash_password, verify_password, validate_password_strength, get_current_user, get_optional_user
@@ -402,13 +402,25 @@ def _month_start() -> datetime:
 
 
 def _usage_this_month(session: Session, user_id: int) -> int:
+    # Counts from the immutable GenerationEvent log, not live GeneratedContract
+    # rows -- a generated document can be permanently deleted later, and that
+    # must not retroactively free up the quota it already used this month.
+    # See GenerationEvent's docstring in models.py.
     rows = session.exec(
-        select(GeneratedContract).where(
-            GeneratedContract.owner_id == user_id,
-            GeneratedContract.created_at >= _month_start(),
+        select(GenerationEvent).where(
+            GenerationEvent.owner_id == user_id,
+            GenerationEvent.created_at >= _month_start(),
         )
     ).all()
     return len(rows)
+
+
+def _log_generation_event(session: Session, owner_id: int, generated_contract_id: Optional[int]) -> None:
+    """Call once for every successful path that creates a new
+    GeneratedContract row (fresh draft, owner edit, applied redline round,
+    inbound-email draft) -- NOT for a deduped repeat that hands back an
+    existing row without creating a new one."""
+    session.add(GenerationEvent(owner_id=owner_id, generated_contract_id=generated_contract_id))
 
 
 def _plan_info(session: Session, user: User) -> dict:
@@ -917,7 +929,33 @@ def reset_template(template_id: int, user: User = Depends(get_current_user), ses
 @app.delete("/api/templates/{template_id}")
 def delete_template(template_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     tpl = _get_owned_template(session, user, template_id)
-    shutil.rmtree(_template_dir(user.id, tpl.id), ignore_errors=True)
+    tpl_dir = _template_dir(user.id, tpl.id)
+    gen_dir = os.path.join(tpl_dir, "generated")
+
+    # GeneratedContract rows deliberately survive template deletion (see
+    # that model's docstring, and the confirmation dialog in app.js which
+    # tells the user their drafted documents are "kept in your library").
+    # But their .docx files live inside this template's own directory tree
+    # (see generate_contract's gen_dir), so deleting that tree out from
+    # under them would silently break every "kept" document's download.
+    # Move the generated/ subfolder out to a stable location first, and
+    # repoint each surviving row's file_path there, before removing the
+    # rest of the template's files.
+    if os.path.isdir(gen_dir):
+        preserved_dir = os.path.join(UPLOADS_DIR, str(user.id), "_deleted_templates", str(tpl.id), "generated")
+        os.makedirs(os.path.dirname(preserved_dir), exist_ok=True)
+        if os.path.isdir(preserved_dir):
+            shutil.rmtree(preserved_dir, ignore_errors=True)
+        shutil.move(gen_dir, preserved_dir)
+        surviving = session.exec(
+            select(GeneratedContract).where(GeneratedContract.template_id == tpl.id)
+        ).all()
+        for gc in surviving:
+            if gc.file_path and gc.file_path.startswith(gen_dir):
+                gc.file_path = preserved_dir + gc.file_path[len(gen_dir):]
+                session.add(gc)
+
+    shutil.rmtree(tpl_dir, ignore_errors=True)
     for ph in list(tpl.placeholders):
         session.delete(ph)
     session.delete(tpl)
@@ -1013,6 +1051,8 @@ def generate_contract(
         parties_json=parties_json,
     )
     session.add(gc)
+    session.flush()
+    _log_generation_event(session, user.id, gc.id)
     session.commit()
     session.refresh(gc)
 
@@ -1212,7 +1252,7 @@ def list_generated(
     if template_id is not None:
         q = q.where(GeneratedContract.template_id == template_id)
     rows = session.exec(q.order_by(GeneratedContract.created_at.desc())).all()
-    status_by_doc = _document_statuses(session, [g.id for g in rows])
+    status_by_doc = _document_statuses(session, [g.id for g in rows], owner_id=user.id)
     return [
         {
             "id": g.id,
@@ -1232,17 +1272,43 @@ def list_generated(
     ]
 
 
-def _document_statuses(session: Session, doc_ids: list) -> dict:
+def _document_statuses(session: Session, doc_ids: list, owner_id: Optional[int] = None) -> dict:
     """Bulk-computes a human status label per generated document id from its
     most recent share link and redline submission (if any): draft (never
     shared) -> shared, awaiting review -> redlines submitted -> response
     sent, awaiting client -> client reviewing your response -> redlines
-    applied. Two queries total (not one per document) so this stays fast as
-    a library grows -- called from the documents list, which can return
-    dozens of rows at once."""
+    applied.
+
+    A status belongs to a whole lineage FAMILY, not just whichever exact
+    revision a share link's live pointer currently happens to sit on --
+    applying redlines or editing a document keeps moving that pointer
+    forward onto the newest revision (see apply_redline_submission's
+    same-link repoint). Without accounting for that, an older revision's
+    status would silently regress to the caller's "never shared" default
+    the moment a later revision in the same family picked up the link, even
+    though the older revision's own visible history clearly shows it was
+    shared/reviewed too. So when an owner_id is available, every document
+    in doc_ids gets matched against the whole lineage family it belongs to
+    (mirroring the same approach get_redlines already relies on to find
+    "the" link off a stale revision), and the family's most-recently-linked
+    status is mirrored onto every member of that family that doesn't have
+    its own direct link match."""
     if not doc_ids:
         return {}
-    links = session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(doc_ids))).all()
+
+    root_by_doc: dict = {}
+    family_ids = set(doc_ids)
+    if owner_id is None and doc_ids:
+        any_doc = session.get(GeneratedContract, doc_ids[0])
+        owner_id = any_doc.owner_id if any_doc else None
+    if owner_id is not None:
+        all_docs = session.exec(select(GeneratedContract).where(GeneratedContract.owner_id == owner_id)).all()
+        roots = _lineage_roots_for(all_docs, session)
+        root_by_doc = {g.id: roots.get(g.id, g.id) for g in all_docs}
+        wanted_roots = {root_by_doc[d] for d in doc_ids if d in root_by_doc}
+        family_ids = {gid for gid, root in root_by_doc.items() if root in wanted_roots} | set(doc_ids)
+
+    links = session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(family_ids))).all()
     if not links:
         return {}
     link_ids = [l.id for l in links]
@@ -1273,8 +1339,26 @@ def _document_statuses(session: Session, doc_ids: list) -> dict:
             status = {"key": "submitted", "label": "Redlines submitted, awaiting your review", "tone": "pending"}
         status["_link_created_at"] = link.created_at
         out[link.generated_contract_id] = status
+
+    # Mirror each family's most-recently-linked status onto every other
+    # revision in doc_ids that shares its lineage root but isn't itself the
+    # exact document a link currently points at.
+    if root_by_doc:
+        status_by_root = {}
+        for doc_id, status in out.items():
+            root = root_by_doc.get(doc_id)
+            if root is None:
+                continue
+            if root not in status_by_root or status["_link_created_at"] > status_by_root[root]["_link_created_at"]:
+                status_by_root[root] = status
+        for d in doc_ids:
+            if d not in out:
+                root = root_by_doc.get(d)
+                if root in status_by_root:
+                    out[d] = status_by_root[root]
+
     for status in out.values():
-        del status["_link_created_at"]
+        status.pop("_link_created_at", None)
     return out
 
 
@@ -1284,7 +1368,7 @@ def get_generated(generated_id: int, user: User = Depends(get_current_user), ses
     html = None
     if os.path.exists(gc.file_path):
         html = de.render_paragraphs_html(de.load(gc.file_path))
-    status = _document_statuses(session, [gc.id]).get(gc.id, {"key": "draft", "label": "Draft", "tone": "draft"})
+    status = _document_statuses(session, [gc.id], owner_id=gc.owner_id).get(gc.id, {"key": "draft", "label": "Draft", "tone": "draft"})
     return {
         "id": gc.id,
         "name": gc.name,
@@ -1381,9 +1465,16 @@ def edit_generated_document(
         field_positions_json=gc.field_positions_json,
         parties_json=gc.parties_json,
         source_generated_id=gc.id,
+        # Inherit the source revision's archived state -- otherwise a new
+        # revision always defaulted to un-archived, which could revive an
+        # archived document's family and split it across both the Active
+        # and Archived tabs (they're meant to move as one unit; see
+        # toggleArchiveFamily in app.js).
+        archived=gc.archived,
     )
     session.add(new_gc)
     session.flush()  # assigns new_gc.id, needed below, without ending the transaction
+    _log_generation_event(session, user.id, new_gc.id)
 
     # If the document just edited is the one an open share link currently
     # points a client at, move the link onto this new revision -- so the
@@ -1434,6 +1525,32 @@ def set_archived(
     gc = _get_owned_generated(session, user, generated_id)
     gc.archived = body.archived
     session.add(gc)
+
+    # Archiving is meant to take a document out of active circulation.
+    # Without also closing its share link, a client could keep submitting
+    # redlines against an "archived" document, and if the owner later
+    # applied them, the new revision would come back un-archived (see
+    # apply_redline_submission's archived=gc.archived above) -- silently
+    # reviving the document and splitting its family across both the
+    # Active and Archived tabs, which the product otherwise keeps moving
+    # together as one unit (see toggleArchiveFamily in app.js). Matched
+    # against the whole lineage family, not just this exact revision,
+    # since the link's live pointer may currently sit on a different
+    # (e.g. newer) revision in the same family. Un-archiving deliberately
+    # does NOT reopen a closed link -- that would be a surprising side
+    # effect the owner didn't ask for.
+    if body.archived:
+        family_ids = _lineage_doc_ids(gc, session)
+        open_links = session.exec(
+            select(ShareLink).where(
+                ShareLink.generated_contract_id.in_(family_ids),
+                ShareLink.status == "open",
+            )
+        ).all()
+        for link in open_links:
+            link.status = "closed"
+            session.add(link)
+
     session.commit()
     return {"id": gc.id, "archived": gc.archived}
 
@@ -1891,9 +2008,14 @@ def apply_redline_submission(
         # repoint the link forward to newer revisions -- see
         # _lineage_roots_for's _parent_id, which now prefers this field.
         source_generated_id=gc.id,
+        # See edit_generated_document's identical comment: inherit archived
+        # state so a redline apply on an archived document's family doesn't
+        # produce a new, un-archived revision that splits the family.
+        archived=gc.archived,
     )
     session.add(new_gc)
     session.flush()  # assigns new_gc.id, needed below to repoint the share link
+    _log_generation_event(session, user.id, new_gc.id)
 
     applied_ids = {e.id for e, _ in edit_targets}
     for e in to_apply:
@@ -2664,6 +2786,8 @@ def _process_draft_request(session: Session, user: User, req: EmailDraftRequest,
         field_positions_json=json.dumps(field_positions),
     )
     session.add(gc)
+    session.flush()
+    _log_generation_event(session, user.id, gc.id)
     req.status = "done"
     session.add(req)
     session.commit()
