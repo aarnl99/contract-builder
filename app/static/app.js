@@ -892,6 +892,25 @@ async function openShareModal(generatedId) {
     );
     body.appendChild(
       el("div", { class: "modal-actions" }, [
+        el(
+          "button",
+          {
+            class: "btn danger",
+            onclick: async (e) => {
+              if (!confirm("Close this review link? The client won't be able to open it or submit further redlines. You can share a fresh link afterward if needed.")) return;
+              const btn = e.currentTarget;
+              btn.disabled = true;
+              try {
+                await api(`/api/generated/${generatedId}/share/close`, { method: "POST" });
+                overlay.remove();
+              } catch (err) {
+                btn.disabled = false;
+                alert(err.message);
+              }
+            },
+          },
+          "Close review link"
+        ),
         el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Close"),
       ])
     );

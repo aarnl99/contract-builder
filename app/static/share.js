@@ -30,6 +30,20 @@ function cssEscape(s) {
 const TOKEN = location.pathname.replace(/^\/share\//, "").replace(/\/$/, "");
 let sessionToken = null;
 
+// Tracks whether there's redlining work sitting only in this tab's memory
+// that hasn't been sent to the server yet, via either "Save progress" or
+// "Finalize and submit" -- an accidental reload or tab close would silently
+// lose it with no warning otherwise. Module-level (not local to
+// DocumentView) so it survives DocumentView being torn down and rebuilt
+// mid-session (e.g. after acknowledging a response) without stacking up
+// duplicate beforeunload listeners that could reference stale state.
+let hasUnsavedChanges = false;
+window.addEventListener("beforeunload", (e) => {
+  if (!hasUnsavedChanges) return;
+  e.preventDefault();
+  e.returnValue = ""; // required for Chrome to show the native confirmation
+});
+
 async function api(path, opts = {}) {
   const headers = opts.body ? { "Content-Type": "application/json" } : {};
   if (sessionToken) headers["X-Share-Session"] = sessionToken;
@@ -446,6 +460,7 @@ function DocumentView(data) {
     } else {
       edits[key] = { field_key: fieldKey, label, location, original_text: originalText, value: trimmed, comment: (comment || "").trim() };
     }
+    hasUnsavedChanges = true;
     closePopover();
     deselectField();
     repaint();
@@ -453,6 +468,7 @@ function DocumentView(data) {
 
   function removeSuggestion(key) {
     delete edits[key];
+    hasUnsavedChanges = true;
     closePopover();
     deselectField();
     repaint();
@@ -687,7 +703,10 @@ function DocumentView(data) {
   const docCard = el("div", { class: "redline-doc-card" }, [preview]);
 
   const noteInput = el("textarea", { placeholder: "Anything else worth flagging that isn't captured above?" }, (data.draft && data.draft.note) || "");
-  noteInput.addEventListener("input", renderStats);
+  noteInput.addEventListener("input", () => {
+    hasUnsavedChanges = true;
+    renderStats();
+  });
   docCard.appendChild(
     el("div", { class: "form-row", style: "margin-top:20px;" }, [el("label", { class: "field-label" }, "General comment (optional)"), noteInput])
   );
@@ -784,25 +803,37 @@ function DocumentView(data) {
   function loadRedlineHistory() {
     redlineHistoryList.innerHTML = "";
     redlineHistoryList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "Loading..."));
-    api(`/api/share/${TOKEN}/redlines`).then((data) => {
-      redlineHistoryList.innerHTML = "";
-      if (!data.submissions.length) {
-        redlineHistoryList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "Nothing submitted yet."));
-        return;
-      }
-      data.submissions.forEach((sub) => {
-        const statusLabel = sub.status === "reviewed" ? "Applied" : sub.responded_at ? "Response sent" : "Awaiting response";
-        const subBox = el("div", { class: "redline-submission" }, [
-          el("div", { class: "sub-header" }, [
-            el("div", { style: "font-weight:700;font-size:13px;" }, statusLabel),
-            el("div", { class: "when" }, new Date(sub.submitted_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
-          ]),
-        ]);
-        if (sub.note) subBox.appendChild(el("div", { class: "note-box" }, sub.note));
-        sub.edits.forEach((edit) => subBox.appendChild(renderRedlineHistoryEdit(edit)));
-        redlineHistoryList.appendChild(subBox);
+    api(`/api/share/${TOKEN}/redlines`)
+      .then((data) => {
+        redlineHistoryList.innerHTML = "";
+        if (!data.submissions.length) {
+          redlineHistoryList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "Nothing submitted yet."));
+          return;
+        }
+        data.submissions.forEach((sub) => {
+          const statusLabel = sub.status === "reviewed" ? "Applied" : sub.responded_at ? "Response sent" : "Awaiting response";
+          const subBox = el("div", { class: "redline-submission" }, [
+            el("div", { class: "sub-header" }, [
+              el("div", { style: "font-weight:700;font-size:13px;" }, statusLabel),
+              el("div", { class: "when" }, new Date(sub.submitted_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
+            ]),
+          ]);
+          if (sub.note) subBox.appendChild(el("div", { class: "note-box" }, sub.note));
+          sub.edits.forEach((edit) => subBox.appendChild(renderRedlineHistoryEdit(edit)));
+          redlineHistoryList.appendChild(subBox);
+        });
+      })
+      .catch((e) => {
+        // Without this, a failed request left "Loading..." on screen
+        // forever with no way to tell anything went wrong, let alone try
+        // again -- redline history isn't consulted every visit, so this
+        // could sit broken for a long time before anyone noticed.
+        redlineHistoryList.innerHTML = "";
+        redlineHistoryList.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load redline history."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+        retryBtn.addEventListener("click", loadRedlineHistory);
+        redlineHistoryList.appendChild(retryBtn);
       });
-    });
   }
   loadRedlineHistory();
 
@@ -816,32 +847,43 @@ function DocumentView(data) {
   function loadHistory() {
     historyList.innerHTML = "";
     historyList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "Loading..."));
-    api(`/api/share/${TOKEN}/history`).then((hist) => {
-      historyList.innerHTML = "";
-      if (!hist.timeline.length) {
-        historyList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "No activity yet."));
-        return;
-      }
-      const LABELS = {
-        drafted: ["•", "draft", "Drafted"],
-        redline_applied: ["✓", "final", "Redlines applied"],
-        shared: ["→", "pending", "Shared for review"],
-        viewed: ["○", "draft", "Viewed"],
-        redline_submitted: ["✎", "pending", "Redline submitted"],
-      };
-      hist.timeline.forEach((ev) => {
-        const [dot, cls, title] = LABELS[ev.type] || ["•", "draft", ev.type];
-        historyList.appendChild(
-          el("div", { class: "chain-item" }, [
-            el("div", { class: "chain-dot " + cls }, dot),
-            el("div", { class: "chain-body" }, [
-              el("div", { class: "chain-title-row" }, [el("span", { class: "chain-title" }, title)]),
-              el("div", { class: "chain-meta" }, [new Date(ev.at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })]),
-            ]),
-          ])
-        );
+    api(`/api/share/${TOKEN}/history`)
+      .then((hist) => {
+        historyList.innerHTML = "";
+        if (!hist.timeline.length) {
+          historyList.appendChild(el("div", { style: "font-size:12.5px;color:var(--muted);" }, "No activity yet."));
+          return;
+        }
+        const LABELS = {
+          drafted: ["•", "draft", "Drafted"],
+          redline_applied: ["✓", "final", "Redlines applied"],
+          shared: ["→", "pending", "Shared for review"],
+          viewed: ["○", "draft", "Viewed"],
+          redline_submitted: ["✎", "pending", "Redline submitted"],
+        };
+        hist.timeline.forEach((ev) => {
+          const [dot, cls, title] = LABELS[ev.type] || ["•", "draft", ev.type];
+          historyList.appendChild(
+            el("div", { class: "chain-item" }, [
+              el("div", { class: "chain-dot " + cls }, dot),
+              el("div", { class: "chain-body" }, [
+                el("div", { class: "chain-title-row" }, [el("span", { class: "chain-title" }, title)]),
+                el("div", { class: "chain-meta" }, [new Date(ev.at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })]),
+              ]),
+            ])
+          );
+        });
+      })
+      .catch((e) => {
+        // Same reasoning as loadRedlineHistory's catch -- without this the
+        // panel was stuck on "Loading..." forever with no error and no
+        // retry if the request failed.
+        historyList.innerHTML = "";
+        historyList.appendChild(el("div", { class: "error-box" }, e.message || "Couldn't load activity history."));
+        const retryBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Retry");
+        retryBtn.addEventListener("click", loadHistory);
+        historyList.appendChild(retryBtn);
       });
-    });
   }
   loadHistory();
 
@@ -866,6 +908,7 @@ function DocumentView(data) {
     try {
       const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null }));
       await api(`/api/share/${TOKEN}/save-progress`, { method: "POST", body: { edits: editList, note: noteInput.value.trim() } });
+      hasUnsavedChanges = false;
       saveNote.textContent = "Saved — come back anytime with your access code.";
     } catch (e) {
       saveNote.textContent = e.message;
@@ -915,6 +958,7 @@ function DocumentView(data) {
     submitBtn.textContent = "Submitting...";
     try {
       await api(`/api/share/${TOKEN}/submit`, { method: "POST", body: { edits: editList, note: noteInput.value.trim() } });
+      hasUnsavedChanges = false;
       render(el("div", {}, [topbar(), ThanksView(), JoinCta()]));
     } catch (e) {
       errBox.appendChild(el("div", { class: "error-box" }, e.message));
@@ -970,6 +1014,12 @@ async function loadDocument() {
           seeded.forEach((s) => { if (!existingKeys.has(locKey(s.location))) fresh.draft.edits.push(s); });
         }
         showDocument(fresh);
+        // The seeded counter-acceptances above exist only in this tab's
+        // memory until "Save progress" or "Finalize" actually sends them --
+        // see the comment on hasUnsavedChanges. Without this, accepting a
+        // counter and then reloading before saving would silently lose it
+        // with no warning at all.
+        if (seeded.length) hasUnsavedChanges = true;
       })]));
     } else {
       showDocument(data);
