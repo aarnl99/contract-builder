@@ -747,8 +747,11 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
   if (editable && generatedId) {
     // Phase 5 (#23): once a document is shared, a direct edit is no longer
     // instant -- it's queued as a redline the client has to approve, same
-    // as the copy in showResult/openDetail's confirmation below.
-    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:-8px 0 10px;" }, "Select any text below to edit it directly -- saved instantly as a new revision if this document hasn't been shared yet, or sent to the client for approval if it has."));
+    // as the copy in showResult/openDetail's confirmation below. Click-to-
+    // insert (no selection needed) added right after Phase 5 shipped, once
+    // it was clear "select something to edit it" left no way to just add
+    // new text -- see computeCursorPosition.
+    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:-8px 0 10px;" }, "Select text to edit it, or click anywhere to insert something new -- saved instantly as a new revision if this document hasn't been shared yet, or sent to the client for approval if it has."));
   }
 
   const preview = el("div", { class: "contract-view compact", style: "max-height:52vh;overflow-y:auto;" });
@@ -761,20 +764,29 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
     preview.addEventListener("mouseup", () => {
       setTimeout(() => {
         const sel = window.getSelection();
-        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+        if (!sel || sel.rangeCount === 0) return;
         const range = sel.getRangeAt(0);
         if (!preview.contains(range.commonAncestorContainer)) return;
+        // A drag (real selection) edits/replaces that text; a plain click
+        // (collapsed selection) inserts new text at that point instead --
+        // see computeCursorPosition. Both post to the same endpoint; the
+        // only difference is a zero-width vs. a real segment.
+        const isInsert = sel.isCollapsed;
         const rect = range.getBoundingClientRect();
-        const info = computeSelectionSegments(preview);
+        const info = isInsert ? computeCursorPosition(preview) : computeSelectionSegments(preview);
         sel.removeAllRanges();
         if (!info) return;
         if (info.error === "cross-paragraph") { alert("Please select text within a single paragraph."); return; }
         closePop();
-        const input = el("textarea", { rows: "2" }, info.text);
+        const input = el("textarea", { rows: "2", placeholder: isInsert ? "Type text to insert here..." : "" }, info.text);
         const errBox = el("div");
-        const saveBtn = el("button", { class: "btn" }, "Save as new revision");
+        const saveBtn = el("button", { class: "btn" }, isInsert ? "Insert" : "Save as new revision");
         saveBtn.addEventListener("click", async () => {
           errBox.innerHTML = "";
+          if (isInsert && !input.value.trim()) {
+            errBox.appendChild(el("div", { class: "error-box" }, "Type something to insert."));
+            return;
+          }
           saveBtn.disabled = true;
           try {
             const editRes = await api(`/api/generated/${generatedId}/edit`, {
@@ -800,7 +812,7 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
           }
         });
         const pop = el("div", { class: "redline-popover" }, [
-          el("div", { class: "rp-label" }, "Edit text"),
+          el("div", { class: "rp-label" }, isInsert ? "Insert text" : "Edit text"),
           input,
           errBox,
           el("div", { class: "rp-actions" }, [
@@ -2053,39 +2065,72 @@ function DocumentsView() {
 // Editor (click-to-mark placeholders) -- unchanged mechanics, restyled
 // ---------------------------------------------------------------------------
 
+// Shared by computeSelectionSegments (a real, non-empty selection -- template
+// field-marking and client redlining) and computeCursorPosition (a plain
+// click with no drag -- the owner direct-edit "click to insert" flow, see
+// showPreviewOverlay). Hoisted out of both so the tricky text-node-walking
+// logic exists in exactly one place.
+function _toTextNode(node, offset) {
+  if (node.nodeType === 3) return { node, offset };
+  if (offset < node.childNodes.length) {
+    let n = node.childNodes[offset];
+    while (n && n.nodeType !== 3 && n.firstChild) n = n.firstChild;
+    if (n && n.nodeType === 3) return { node: n, offset: 0 };
+  }
+  let n = node.lastChild;
+  while (n && n.nodeType !== 3 && n.lastChild) n = n.lastChild;
+  if (n && n.nodeType === 3) return { node: n, offset: n.length };
+  return { node: null, offset: 0 };
+}
+
+function _findAncestorWithClass(node, cls) {
+  let e = node.nodeType === 3 ? node.parentElement : node;
+  while (e && !(e.classList && e.classList.contains(cls))) e = e.parentElement;
+  return e;
+}
+
+// Cursor-position variant of computeSelectionSegments: a plain click (no
+// drag) is a collapsed selection, which computeSelectionSegments always
+// rejects -- correct for field-marking and redlining (you must select real
+// text to mark or propose a change to), but exactly what a "click and type
+// to insert" direct edit needs instead. Returns a single zero-width segment
+// (start === end) at the click point; docx_engine.apply_text_edits and
+// extract_text_at on the backend already treat that as "insert here without
+// removing anything" -- confirmed with zero server-side changes needed (see
+// _apply_paragraph_group's piece-building loop).
+function computeCursorPosition(containerEl) {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!containerEl.contains(range.commonAncestorContainer)) return null;
+
+  const tn = _toTextNode(range.startContainer, range.startOffset);
+  if (!tn.node) return null;
+
+  const runEl = _findAncestorWithClass(tn.node, "run");
+  const paraEl = _findAncestorWithClass(tn.node, "para");
+  if (!runEl || !paraEl) return null;
+
+  const pIndex = parseInt(paraEl.dataset.p, 10);
+  const tablePath = paraEl.dataset.path || "";
+  const r = parseInt(runEl.dataset.r, 10);
+  return { paragraph_index: pIndex, table_path: tablePath, segments: [{ r, start: tn.offset, end: tn.offset }], text: "" };
+}
+
 function computeSelectionSegments(containerEl) {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
   const range = sel.getRangeAt(0);
   if (!containerEl.contains(range.commonAncestorContainer)) return null;
 
-  function toTextNode(node, offset) {
-    if (node.nodeType === 3) return { node, offset };
-    if (offset < node.childNodes.length) {
-      let n = node.childNodes[offset];
-      while (n && n.nodeType !== 3 && n.firstChild) n = n.firstChild;
-      if (n && n.nodeType === 3) return { node: n, offset: 0 };
-    }
-    let n = node.lastChild;
-    while (n && n.nodeType !== 3 && n.lastChild) n = n.lastChild;
-    if (n && n.nodeType === 3) return { node: n, offset: n.length };
-    return { node: null, offset: 0 };
-  }
-
-  function findAncestorWithClass(node, cls) {
-    let e = node.nodeType === 3 ? node.parentElement : node;
-    while (e && !(e.classList && e.classList.contains(cls))) e = e.parentElement;
-    return e;
-  }
-
-  const startTN = toTextNode(range.startContainer, range.startOffset);
-  const endTN = toTextNode(range.endContainer, range.endOffset);
+  const startTN = _toTextNode(range.startContainer, range.startOffset);
+  const endTN = _toTextNode(range.endContainer, range.endOffset);
   if (!startTN.node || !endTN.node) return null;
 
-  const startRunEl = findAncestorWithClass(startTN.node, "run");
-  const endRunEl = findAncestorWithClass(endTN.node, "run");
-  const startParaEl = findAncestorWithClass(startTN.node, "para");
-  const endParaEl = findAncestorWithClass(endTN.node, "para");
+  const startRunEl = _findAncestorWithClass(startTN.node, "run");
+  const endRunEl = _findAncestorWithClass(endTN.node, "run");
+  const startParaEl = _findAncestorWithClass(startTN.node, "para");
+  const endParaEl = _findAncestorWithClass(endTN.node, "para");
   if (!startRunEl || !endRunEl || !startParaEl || !endParaEl) return null;
   if (startParaEl !== endParaEl) return { error: "cross-paragraph" };
 
