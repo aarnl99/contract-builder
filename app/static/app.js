@@ -1848,18 +1848,29 @@ function DocumentsView() {
       // See RedlineSubmission.origin and #23/phase 5 -- you edited the
       // shared document directly, and since a client may already be
       // reviewing it, the change is queued for their approval instead of
-      // applying instantly (contrast with the older, no-longer-reachable
-      // "owner_edited" event type below, from before a document is shared).
+      // applying instantly (contrast with "owner_edited" below, from before
+      // a document is shared).
       dotClass = "pending"; dotLabel = "✎"; title = "You proposed a direct edit"; desc = "Queued for the client's approval -- they were emailed just this update.";
+    } else if (ev.type === "owner_edited") {
+      // #23 in the bug tracker -- a direct edit made on this document BEFORE
+      // it was ever shared, still just your own private draft, so it applied
+      // instantly with no approval step (contrast with owner_edit_proposed
+      // above). This is a real revision, same as drafted/redline_applied, so
+      // it gets the same "View"/"Download" treatment and can be the current
+      // version below -- it's just internal, so it's deliberately filtered
+      // out of the client's own activity history (_client_lineage_timeline
+      // in main.py) rather than labeled for them the way owner_edit_proposed
+      // is; the client never negotiated this, there's nothing for them to see.
+      dotClass = "final"; dotLabel = "✎"; title = "Direct edit"; desc = "You edited the document directly, before it was shared.";
     }
     const actions = [];
-    if (doc && (ev.type === "drafted" || ev.type === "redline_applied")) {
+    if (doc && (ev.type === "drafted" || ev.type === "redline_applied" || ev.type === "owner_edited")) {
       actions.push(el("a", { onclick: () => openDetail(doc) }, "View"));
       actions.push(el("a", { href: `/api/generated/${doc.id}/download` }, "Download .docx"));
     } else if (doc && (ev.type === "redline_submitted" || ev.type === "owner_reconsidered" || ev.type === "owner_edit_proposed")) {
       actions.push(el("a", { onclick: () => openRedlinesModal(doc.id) }, "View redlines"));
     }
-    const isCurrent = !!(doc && ev.type === "redline_applied" && doc.id === latestId);
+    const isCurrent = !!(doc && (ev.type === "redline_applied" || ev.type === "owner_edited") && doc.id === latestId);
     return el("div", { class: "chain-item" }, [
       el("div", { class: "chain-dot " + dotClass }, dotLabel),
       el("div", { class: "chain-body" }, [
