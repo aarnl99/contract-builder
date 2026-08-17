@@ -1692,7 +1692,24 @@ def apply_redline_submission(
     between rounds -- those are chained onto as well, not just other applied
     redline rounds. `chained_from` in the response tells the caller when
     either kind of chaining happened, so the UI can surface it rather than
-    applying silently."""
+    applying silently.
+
+    Separately: accepting a redline and applying it are two different
+    actions -- responding to a submission never bakes anything into a
+    document by itself, only clicking Apply does. That means an owner can
+    accept edits in one round, respond, and never click Apply for it before
+    a LATER round comes in and gets applied instead (this is exactly what
+    happens when a client accepts a countered redline -- that resubmits as
+    its own new submission). Without help, that later Apply would only
+    splice in its own round's edits, chained onto whatever was already
+    baked into a document -- and since the earlier round was never baked
+    in, its accepted decisions would be silently dropped even though the
+    database still faithfully records them as accepted. So beyond chaining
+    onto the base document, this also folds in every OTHER submission on
+    this same link that's been responded to but never applied, so whichever
+    round the owner eventually clicks Apply on picks up every decision made
+    so far, regardless of order. `folded_in_submissions` in the response
+    lists any such rounds that got swept in this way."""
     submission = session.get(RedlineSubmission, submission_id)
     if not submission:
         raise HTTPException(404, "Submission not found")
@@ -1748,6 +1765,32 @@ def apply_redline_submission(
         raise HTTPException(410, "This document is no longer available.")
 
     edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == submission.id)).all()
+
+    # Fold in every other submission on this link that's been responded to
+    # (the owner has decided on it) but never applied -- see the docstring
+    # above. edit_to_folded_sub tracks which sibling submission each folded
+    # edit came from, so we only mark THAT submission "reviewed" once we
+    # know at least one of its edits actually made it into this apply.
+    folded_in_subs = []
+    edit_to_folded_sub: dict = {}
+    if sibling_sub_ids:
+        other_unapplied = session.exec(
+            select(RedlineSubmission).where(
+                RedlineSubmission.id.in_(sibling_sub_ids),
+                RedlineSubmission.id != submission.id,
+                RedlineSubmission.status == "pending",
+                RedlineSubmission.responded_at.is_not(None),
+            )
+        ).all()
+        for s in other_unapplied:
+            s_edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all()
+            relevant = [e for e in s_edits if e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved")]
+            if relevant:
+                folded_in_subs.append(s)
+                for e in relevant:
+                    edit_to_folded_sub[e.id] = s
+                edits = edits + relevant
+
     to_apply = [e for e in edits if e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved")]
     if not to_apply:
         raise HTTPException(400, "No accepted edits to apply yet.")
@@ -1829,6 +1872,19 @@ def apply_redline_submission(
     submission.status = "reviewed"
     session.add(submission)
 
+    # Only mark a folded-in sibling submission "reviewed" once we know at
+    # least one of ITS edits actually landed in edit_targets (not just
+    # "was accepted") -- an edit can still get dropped here for a stale
+    # location, and a submission whose edits were all dropped shouldn't be
+    # marked applied when nothing of it actually made it in.
+    contributing_sub_ids = {edit_to_folded_sub[e.id].id for e, _ in edit_targets if e.id in edit_to_folded_sub}
+    folded_in_response = []
+    for s in folded_in_subs:
+        if s.id in contributing_sub_ids:
+            s.status = "reviewed"
+            session.add(s)
+            folded_in_response.append({"id": s.id, "submitted_at": s.submitted_at.isoformat()})
+
     # The client should be able to refresh this exact same link, re-enter
     # the same access code, and see the applied revision -- no brand-new
     # link needed. Mirrors edit_generated_document's direct-edit repoint
@@ -1850,6 +1906,7 @@ def apply_redline_submission(
         "name": new_gc.name,
         "html": de.render_paragraphs_html(preview_doc),
         "chained_from": chained_from,
+        "folded_in_submissions": folded_in_response,
     }
 
 
@@ -2020,6 +2077,18 @@ class ShareEditBody(BaseModel):
     # is used instead.
     label: str = ""
     location: Optional[EditLocationBody] = None
+    # Set when this edit is the client accepting a redline the owner
+    # countered (see share.js's acceptCounter) -- references the id of that
+    # earlier, now-"countered" RedlineEdit. _resolve_edits verifies this
+    # server-side (the referenced edit really is countered, on this same
+    # share link, with a counter_value matching proposed_value here) before
+    # trusting it; a mismatched or missing reference is silently ignored
+    # and this is treated as an ordinary new proposal instead of erroring
+    # the whole submission. When verified, the new edit is created already
+    # decided ("accepted") instead of "pending" -- there's nothing left for
+    # the owner to decide, since they're the one who dictated this exact
+    # value via their counter. See submit_redlines for what that unlocks.
+    accepting_edit_id: Optional[int] = None
 
 
 class ShareSubmitBody(BaseModel):
@@ -2027,13 +2096,22 @@ class ShareSubmitBody(BaseModel):
     note: str = ""
 
 
-def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[ShareEditBody]):
+def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[ShareEditBody], link_id: Optional[int] = None):
     """Shared between save-progress and submit: re-reads each proposed
     edit's *current* text directly from the generated document at its exact
     recorded location (rather than trusting whatever the browser sent) so a
     stale or malformed selection is rejected here, and computes each field
     edit's threshold evaluation. Returns a list of kwargs dicts ready for
-    RedlineEdit(...)."""
+    RedlineEdit(...).
+
+    Also resolves accepting_edit_id (see ShareEditBody): if set and it
+    checks out -- the referenced edit is really "countered", belongs to a
+    submission on this same link_id, and its counter_value exactly matches
+    what's being proposed here -- the returned kwargs carry decision=
+    "accepted" instead of the usual default. link_id is only needed for
+    that check, so callers that never pass accepting_edit_id (there are
+    none today, but save-progress passes it through for consistency) can
+    omit it."""
     tpl = session.get(Template, gc.template_id) if gc.template_id else None
     placeholders_by_key = {p.field_key: p for p in (tpl.placeholders if tpl else [])}
 
@@ -2070,6 +2148,22 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
                 excerpt = original_text.strip()
                 label = (excerpt[:57] + "…") if len(excerpt) > 57 else (excerpt or "Custom edit")
 
+        decision = "pending"
+        if e.accepting_edit_id is not None and link_id is not None:
+            prior = session.get(RedlineEdit, e.accepting_edit_id)
+            prior_sub = session.get(RedlineSubmission, prior.submission_id) if prior else None
+            if (
+                prior and prior_sub and prior_sub.share_link_id == link_id
+                and prior.decision == "countered"
+                and prior.counter_value.strip() == proposed
+            ):
+                decision = "accepted"
+            # A missing/mismatched reference isn't an error -- it just means
+            # this isn't (or is no longer) a pure counter-acceptance, so it
+            # falls through to the normal "pending, needs an owner decision"
+            # path, e.g. if the client edited the value via "Suggest edit"
+            # instead of taking the counter as-is.
+
         out.append(dict(
             field_key=e.field_key if ph else "",
             label=label,
@@ -2077,6 +2171,7 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
             proposed_value=proposed,
             comment=e.comment.strip()[:1000],
             evaluation=evaluation,
+            decision=decision,
             location_json=json.dumps({
                 "container_path": container_path,
                 "paragraph_index": e.location.paragraph_index,
@@ -2104,7 +2199,7 @@ def save_share_progress(token: str, body: ShareSubmitBody, request: Request, ses
     if not gc:
         raise HTTPException(410, "This document is no longer available.")
 
-    resolved = _resolve_edits(session, gc, body.edits)
+    resolved = _resolve_edits(session, gc, body.edits, link_id=link.id)
 
     draft = _existing_draft(session, link.id)
     if draft:
@@ -2134,7 +2229,7 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     if not body.edits and not body.note.strip():
         raise HTTPException(400, "No changes or comments were provided.")
 
-    resolved = _resolve_edits(session, gc, body.edits)
+    resolved = _resolve_edits(session, gc, body.edits, link_id=link.id)
 
     # Finalizing replaces any in-progress "Save progress" draft -- it's now
     # a real submission, not a draft anymore.
@@ -2146,6 +2241,17 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
         session.commit()
 
     submission = RedlineSubmission(share_link_id=link.id, note=body.note.strip()[:2000], status="pending")
+    # If every resolved edit is a verified counter-acceptance (see
+    # _resolve_edits/accepting_edit_id), there's nothing left for the owner
+    # to decide -- they're the one who proposed this exact value as their
+    # counter. Mark it responded immediately so it goes straight to
+    # "ready to apply" instead of sitting in the owner's queue asking them
+    # to re-approve their own counter. A submission that mixes a
+    # counter-acceptance with a genuinely new proposal still needs a real
+    # response for the new part, so this only fires when ALL of it resolved
+    # that way.
+    if resolved and all(kw["decision"] == "accepted" for kw in resolved):
+        submission.responded_at = datetime.utcnow()
     session.add(submission)
     session.commit()
     session.refresh(submission)
