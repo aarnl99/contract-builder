@@ -607,8 +607,22 @@ def get_document_types():
     return {"types": DOCUMENT_TYPES}
 
 
+# Word .docx templates are almost entirely text -- even a contract with a
+# letterhead logo or a couple of signature images rarely clears a few MB.
+# 20MB is generous headroom above any real template while still rejecting
+# something clearly not a normal contract (a video or image dump renamed to
+# .docx, or an attempted abuse upload). Enforced two ways below: an early
+# reject from the Content-Length header when the client sends an honest one
+# (avoids reading anything at all), and a hard cap while streaming to disk
+# as a backstop for chunked uploads that omit Content-Length -- without
+# that second check, a malicious upload could still write an arbitrarily
+# large file to disk before ever being rejected.
+MAX_TEMPLATE_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
 @app.post("/api/templates")
 def upload_template(
+    request: Request,
     name: str = Form(...),
     document_type: str = Form("Other"),
     file: UploadFile = File(...),
@@ -617,6 +631,14 @@ def upload_template(
 ):
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(400, "Please upload a .docx file (Word format).")
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_TEMPLATE_UPLOAD_BYTES:
+                raise HTTPException(400, f"That file is too large -- templates are limited to {MAX_TEMPLATE_UPLOAD_BYTES // (1024 * 1024)}MB.")
+        except ValueError:
+            pass  # malformed header -- fall through to the streaming check below
 
     tpl = Template(
         owner_id=user.id,
@@ -633,8 +655,22 @@ def upload_template(
     os.makedirs(tpl_dir, exist_ok=True)
     original_path = os.path.join(tpl_dir, "original.docx")
     working_path = os.path.join(tpl_dir, "working.docx")
-    with open(original_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    written = 0
+    try:
+        with open(original_path, "wb") as f:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_TEMPLATE_UPLOAD_BYTES:
+                    raise HTTPException(400, f"That file is too large -- templates are limited to {MAX_TEMPLATE_UPLOAD_BYTES // (1024 * 1024)}MB.")
+                f.write(chunk)
+    except HTTPException:
+        shutil.rmtree(tpl_dir, ignore_errors=True)
+        session.delete(tpl)
+        session.commit()
+        raise
     shutil.copyfile(original_path, working_path)
 
     # Validate it actually opens as a docx
