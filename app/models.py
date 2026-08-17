@@ -261,7 +261,9 @@ class RedlineSubmission(SQLModel, table=True):
     always the client (see `origin`), but as of the redline-negotiation
     overhaul phase 3 the owner can also originate one directly, to send a
     reconsidered decision back as its own scoped round -- see
-    main.reconsider_redline_edit."""
+    main.reconsider_redline_edit. Phase 5 adds a third originator: the
+    owner's own direct edits, once a document is shared -- see
+    main.edit_generated_document."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     share_link_id: int = Field(foreign_key="sharelink.id", index=True)
@@ -284,6 +286,21 @@ class RedlineSubmission(SQLModel, table=True):
     #           timeline in main.get_generated_history / app.js's
     #           chainItemFor -- gets its own "owner_reconsidered" event type
     #           there instead of "redline_submitted").
+    # owner_edit -- created directly by main.edit_generated_document when the
+    #           owner selects text and edits it on a document that's already
+    #           shared (bug tracker #23, phase 5 of the overhaul). Once
+    #           shared, a direct edit is never applied instantly -- it's
+    #           queued as exactly one client-approvable RedlineEdit, decision
+    #           "countered" from the moment it's created (the owner IS the
+    #           counter -- there's no preceding client ask), so it flows
+    #           through the exact same accept/reject/counter machinery as an
+    #           ordinary counter, arrives already responded_at-set like an
+    #           owner_reconsideration round, and counts toward phase 4's
+    #           "N unresolved, Finalize blocked" gate for free, since that
+    #           gate is keyed on any live "countered" edit regardless of
+    #           origin. Deliberately has no owner-side bypass to apply it
+    #           instantly instead -- see the phase 5 writeup in the Notion
+    #           bug tracker for why.
     origin: str = "client"
 
     # Set when the owner reviews every edit (accept/reject/counter) and hits

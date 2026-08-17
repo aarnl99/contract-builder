@@ -1298,11 +1298,18 @@ def _lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
             continue  # only saved-in-progress, never actually sent -- nothing happened yet
         link = link_by_id.get(s.share_link_id)
         # An owner_reconsideration round (see RedlineSubmission.origin) is
-        # the OWNER updating their own earlier decision, not the client
-        # sending anything -- give it its own event type so it isn't
-        # mislabeled "The client sent proposed changes for review" in the
-        # timeline (app.js's chainItemFor).
-        ev_type = "owner_reconsidered" if s.origin == "owner_reconsideration" else "redline_submitted"
+        # the OWNER updating their own earlier decision, and an owner_edit
+        # round (phase 5) is the OWNER proposing a direct edit for the
+        # client to approve -- neither is the client sending anything, so
+        # each gets its own event type instead of being mislabeled "The
+        # client sent proposed changes for review" in the timeline
+        # (app.js's chainItemFor).
+        if s.origin == "owner_reconsideration":
+            ev_type = "owner_reconsidered"
+        elif s.origin == "owner_edit":
+            ev_type = "owner_edit_proposed"
+        else:
+            ev_type = "redline_submitted"
         events.append({
             "type": ev_type, "at": s.submitted_at.isoformat() + "Z",
             "document_id": link.generated_contract_id if link else None,
@@ -1591,16 +1598,25 @@ class DirectEditBody(BaseModel):
 def edit_generated_document(
     generated_id: int,
     body: DirectEditBody,
+    request: Request,
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """Owner-side direct editing: select a chunk of text right in the
-    generated document and replace it, applied immediately -- no client
-    approval step, since it's the owner editing their own document. Reuses
-    the exact same docx-splicing engine as accepted redlines
-    (docx_engine.apply_text_edits), and saves the result as a new revision
-    so it slots into the same lineage/history trail as redlines do (see
-    GeneratedContract.source_generated_id)."""
+    generated document and replace it. Reuses the exact same docx-splicing
+    engine as accepted redlines (docx_engine.apply_text_edits), and saves
+    the result as a new revision so it slots into the same lineage/history
+    trail as redlines do (see GeneratedContract.source_generated_id).
+
+    Applied immediately -- no approval step -- UNLESS the document
+    currently has an open share link, in which case (bug tracker #23,
+    phase 5) the owner is editing something a client may already be
+    reviewing, so the edit is queued as a single client-approvable redline
+    instead of silently changing the doc out from under them. See
+    RedlineSubmission.origin == "owner_edit" for how that's modeled --
+    deliberately with no owner-side bypass to apply it instantly instead;
+    once shared, ALL edits (direct or via redline) go through the same
+    client-facing negotiation loop."""
     gc = _get_owned_generated(session, user, generated_id)
     if not os.path.exists(gc.file_path):
         raise HTTPException(410, "This file is no longer available.")
@@ -1611,6 +1627,56 @@ def edit_generated_document(
         [[int(x) for x in triple.split(",")] for triple in body.table_path.split(";")]
         if body.table_path else []
     )
+
+    open_link = session.exec(
+        select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
+    ).first()
+    if open_link:
+        doc = de.load(gc.file_path)
+        try:
+            original_text = de.extract_text_at(doc, container_path, body.paragraph_index, body.segments)
+        except de.MarkError as err:
+            raise HTTPException(400, f"That selection is no longer valid: {err}")
+        new_text = body.new_text.strip()
+        if new_text == original_text.strip():
+            raise HTTPException(400, "That's already the current text.")
+
+        excerpt = original_text.strip()
+        label = (excerpt[:57] + "…") if len(excerpt) > 57 else (excerpt or "Custom edit")
+
+        submission = RedlineSubmission(
+            share_link_id=open_link.id, status="pending", origin="owner_edit",
+            responded_at=datetime.utcnow(), client_ack_at=None,
+        )
+        session.add(submission)
+        session.commit()
+        session.refresh(submission)
+
+        edit = RedlineEdit(
+            submission_id=submission.id,
+            field_key="", label=label,
+            # proposed_value deliberately mirrors original_value (not
+            # new_text) -- the owner IS the counter, so there's no separate
+            # "what the client asked for" to record; keeping the two equal
+            # is also what lets share.js's existing counter-seeding logic
+            # (client_original_value = e.proposed_value) revert cleanly to
+            # the true original text if the client rejects this proposal.
+            original_value=original_text, proposed_value=original_text,
+            evaluation="needs_review",
+            decision="countered",
+            counter_value=new_text,
+            location_json=json.dumps({
+                "container_path": container_path,
+                "paragraph_index": body.paragraph_index,
+                "segments": body.segments,
+            }),
+        )
+        session.add(edit)
+        session.commit()
+        session.refresh(edit)
+
+        _send_owner_edit_email(request, user, gc, open_link, edit)
+        return {"queued_for_approval": True, "submission_id": submission.id, "edit_id": edit.id}
 
     doc = de.load(gc.file_path)
     try:
@@ -1653,22 +1719,11 @@ def edit_generated_document(
     session.flush()  # assigns new_gc.id, needed below, without ending the transaction
     _log_generation_event(session, user.id, new_gc.id)
 
-    # If the document just edited is the one an open share link currently
-    # points a client at, move the link onto this new revision -- so the
-    # client's next visit actually shows your edit, not just a notice about
-    # one -- and flag it so that visit also surfaces a "this was updated"
-    # banner instead of them silently landing on different text than they
-    # remember with no explanation. (A client's own free-text/field
-    # redlines are always re-extracted fresh from the live document at
-    # submit time -- see _resolve_edits -- so this never orphans a redline
-    # against text that's already moved on.)
-    open_link = session.exec(
-        select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
-    ).first()
-    if open_link:
-        open_link.generated_contract_id = new_gc.id
-        open_link.owner_edited_at = datetime.utcnow()
-        session.add(open_link)
+    # No open-link re-pointing needed here (unlike before phase 5): we
+    # already checked above, and this instant-apply path only runs when
+    # that check came back empty -- i.e. there is no open share link for
+    # this document to move forward. Once one exists, every direct edit
+    # takes the queued-for-approval branch above instead.
 
     session.commit()
     session.refresh(new_gc)
@@ -1873,6 +1928,38 @@ def _send_reconsideration_email(
         )
     except RuntimeError:
         pass  # SENDGRID_API_KEY not configured yet -- the reconsideration still applies, just wasn't emailed
+
+
+def _send_owner_edit_email(
+    request: Request, user: User, gc: GeneratedContract, link: ShareLink, edit: "RedlineEdit"
+) -> None:
+    """One email per owner direct edit made after a document is shared (bug
+    tracker #23, phase 5) -- the owner edited the shared document directly,
+    and instead of applying instantly (the pre-share behavior, still used
+    when there's no open link) it's queued as a single client-approvable
+    redline, arriving already in the "countered" state -- see
+    RedlineSubmission.origin == "owner_edit" and edit_generated_document.
+    The client needs to know a change is waiting on them the same way
+    they'd need to know about a counter to their own redline; email is the
+    only channel that reaches them at all (no account, no notification
+    center), same reasoning as _send_reconsideration_email above."""
+    sender_name = user.name.strip() or user.email
+    share_url = f"{_base_url(request)}/share/{link.token}"
+    body = (
+        f"Hi {link.client_first_name},\n\n"
+        f'{sender_name} made a change to "{gc.name}" for you to review: '
+        f'"{edit.label}" → "{edit.counter_value}".\n\n'
+        f"Open it here:\n{share_url}\n\n"
+        f"Access code: {link.access_code}\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(
+            link.client_email, f'{sender_name} made a change to "{gc.name}"', body,
+            reply_to=(link.sender_email.strip() or user.email),
+        )
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the edit still queues, just wasn't emailed
 
 
 class CreateShareBody(BaseModel):
@@ -2579,6 +2666,11 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
         response_payload = {
             "submission_id": responded.id,
             "responded_at": responded.responded_at.isoformat(),
+            # "client" | "owner_reconsideration" | "owner_edit" -- lets
+            # ResponseView (share.js) branch its copy for an owner_edit
+            # round, which isn't a response to anything the client sent
+            # (see RedlineSubmission.origin, phase 5).
+            "origin": responded.origin,
             "edits": [
                 {
                     "id": e.id, "field_key": e.field_key, "label": e.label,
