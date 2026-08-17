@@ -464,10 +464,22 @@ function DocumentView(data) {
 
   function commitSuggestion(key, location, fieldKey, label, originalText, value, comment) {
     const trimmed = (value || "").trim();
+    // Carry the chain reference forward if this spot already had one --
+    // see the sourceEditId comment above and bug tracker #20. Without
+    // this, suggesting a different value than the sender's counter (the
+    // "Suggest edit" button on a counterPending spot, as opposed to
+    // "Accept") rebuilt this entry from scratch and silently dropped the
+    // link back to the counter it was responding to, so the sender's next
+    // review saw an unrelated fresh redline instead of a continued
+    // negotiation.
+    const priorSourceEditId = (edits[key] || {}).sourceEditId || null;
     if (trimmed === (originalText || "").trim() && !(comment || "").trim()) {
       delete edits[key];
     } else {
-      edits[key] = { field_key: fieldKey, label, location, original_text: originalText, value: trimmed, comment: (comment || "").trim() };
+      edits[key] = {
+        field_key: fieldKey, label, location, original_text: originalText, value: trimmed,
+        comment: (comment || "").trim(), sourceEditId: priorSourceEditId,
+      };
     }
     hasUnsavedChanges = true;
     closePopover();
@@ -826,7 +838,7 @@ function DocumentView(data) {
   // for as long as the link is open, so what was approved/declined/
   // countered is never just gone. ----
   const redlineHistoryList = el("div", { style: "display:block;" });
-  function renderRedlineHistoryEdit(edit) {
+  function renderRedlineHistoryEdit(edit, subOrigin) {
     const rows = [
       el("div", { class: "rl-diff" }, [
         el("span", { class: "old" }, edit.original_value || "(blank)"),
@@ -842,13 +854,25 @@ function DocumentView(data) {
     else if (edit.decision === "countered") decisionEl = el("div", { class: "re-outcome outcome-countered" }, ["Countered with: ", el("strong", {}, edit.counter_value)]);
     else decisionEl = el("div", { class: "re-outcome outcome-pending" }, "Awaiting the sender's decision");
 
-    const row = el("div", { class: "redline-history-edit-row" }, [
+    const rowChildren = [
       el("div", { class: "rl-label" }, edit.label || "Custom edit"),
-      ...rows,
-      decisionEl,
-      buildCommentThread(edit, `/api/share/${TOKEN}/edits/${edit.id}/comments`),
-    ]);
-    return row;
+    ];
+    // See RedlineEdit.source_edit_id -- either the sender reconsidering an
+    // earlier decision on this same spot (#19, subOrigin ===
+    // "owner_reconsideration"), or this very edit having been the
+    // client's own response to one of the sender's counters (#20). Either
+    // way, surface the link instead of leaving it invisible.
+    if (edit.responding_to) {
+      rowChildren.push(
+        el("div", { class: "rl-chain-note" }, [
+          subOrigin === "owner_reconsideration" ? "↩ Updates the sender's earlier response: " : "↩ Responds to the sender's counter: ",
+          el("strong", {}, edit.responding_to.counter_value || edit.responding_to.proposed_value || edit.responding_to.label),
+        ])
+      );
+    }
+    rowChildren.push(...rows, decisionEl, buildCommentThread(edit, `/api/share/${TOKEN}/edits/${edit.id}/comments`));
+
+    return el("div", { class: "redline-history-edit-row" }, rowChildren);
   }
 
   function loadRedlineHistory() {
@@ -862,7 +886,12 @@ function DocumentView(data) {
           return;
         }
         data.submissions.forEach((sub) => {
-          const statusLabel = sub.status === "reviewed" ? "Applied" : sub.responded_at ? "Response sent" : "Awaiting response";
+          // See RedlineSubmission.origin -- an owner_reconsideration round
+          // is the sender updating their own earlier decision, not a
+          // round the client submitted, so it gets its own label.
+          const statusLabel = sub.origin === "owner_reconsideration"
+            ? "Sender updated a decision"
+            : sub.status === "reviewed" ? "Applied" : sub.responded_at ? "Response sent" : "Awaiting response";
           const subBox = el("div", { class: "redline-submission" }, [
             el("div", { class: "sub-header" }, [
               el("div", { style: "font-weight:700;font-size:13px;" }, statusLabel),
@@ -870,7 +899,7 @@ function DocumentView(data) {
             ]),
           ]);
           if (sub.note) subBox.appendChild(el("div", { class: "note-box" }, sub.note));
-          sub.edits.forEach((edit) => subBox.appendChild(renderRedlineHistoryEdit(edit)));
+          sub.edits.forEach((edit) => subBox.appendChild(renderRedlineHistoryEdit(edit, sub.origin)));
           redlineHistoryList.appendChild(subBox);
         });
       })
@@ -911,6 +940,11 @@ function DocumentView(data) {
           shared: ["→", "pending", "Shared for review"],
           viewed: ["○", "draft", "Viewed"],
           redline_submitted: ["✎", "pending", "Redline submitted"],
+          // The sender reconsidered an already-decided redline -- see
+          // RedlineSubmission.origin and #19 in the bug tracker. Distinct
+          // from redline_submitted since the client, not the sender, sent
+          // nothing here.
+          owner_reconsidered: ["↻", "pending", "Sender updated a decision"],
         };
         hist.timeline.forEach((ev) => {
           const [dot, cls, title] = LABELS[ev.type] || ["•", "draft", ev.type];

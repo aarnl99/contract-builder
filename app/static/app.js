@@ -1152,7 +1152,12 @@ async function openRedlinesModal(generatedId) {
         // later response for the rest of the round is always possible.
         const undecidedCount = sub.edits.filter((e) => e.decision === "pending").length;
         const awaitingResponse = sub.status === "pending" && undecidedCount > 0;
-        const statusLabel = sub.status === "reviewed"
+        // See RedlineSubmission.origin -- an owner_reconsideration round is
+        // your own updated decision, already fully resolved the moment you
+        // sent it, not a client submission awaiting review.
+        const statusLabel = sub.origin === "owner_reconsideration"
+          ? "You reconsidered a decision"
+          : sub.status === "reviewed"
           ? "Applied"
           : !sub.responded_at
           ? "Pending review"
@@ -1183,11 +1188,75 @@ async function openRedlinesModal(generatedId) {
           }
 
           let actions;
+          let reconsiderBox = null;
           if (already) {
             const summaryEl = edit.decision === "countered"
               ? el("div", { class: "decided-countered" }, ["Countered: ", el("strong", {}, edit.counter_value)])
               : el("div", { class: "decided " + edit.decision }, edit.decision);
-            actions = el("div", { class: "decision-row" }, [summaryEl]);
+            const reconsiderBtn = el("button", { class: "btn secondary small" }, "Reconsider");
+            actions = el("div", { class: "decision-row" }, [summaryEl, reconsiderBtn]);
+
+            // Reconsider: reopens accept/reject/counter controls for an
+            // already-decided edit and sends the new decision as its own
+            // scoped round -- see /api/redline-edits/{id}/reconsider and
+            // #19 in the bug tracker. Before this, a decision (especially
+            // a rejection) was permanent with no way back, even after the
+            // client pushed back in the comment thread below.
+            reconsiderBox = el("div", { style: "display:none;margin-top:8px;" });
+            let reconsiderOpen = false;
+            let reconsiderBuilt = false;
+            reconsiderBtn.addEventListener("click", () => {
+              reconsiderOpen = !reconsiderOpen;
+              reconsiderBox.style.display = reconsiderOpen ? "" : "none";
+              reconsiderBtn.textContent = reconsiderOpen ? "Cancel" : "Reconsider";
+              if (reconsiderOpen && !reconsiderBuilt) { reconsiderBuilt = true; buildReconsiderForm(); }
+            });
+
+            function buildReconsiderForm() {
+              const rstage = { decision: "pending", counter_value: "" };
+              const counterInput = el("input", { type: "text", placeholder: "Your counter value...", style: "display:none;margin-top:8px;" });
+              counterInput.addEventListener("input", () => { rstage.counter_value = counterInput.value; });
+              const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
+              const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
+              const acceptBtn = el("button", { class: "btn small" }, "Accept");
+              function setRStage(d) {
+                rstage.decision = rstage.decision === d ? "pending" : d;
+                counterInput.style.display = rstage.decision === "countered" ? "" : "none";
+                [rejectBtn, counterBtn, acceptBtn].forEach((b) => b.classList.remove("staged-active", "stage-accepted", "stage-rejected", "stage-countered"));
+                if (rstage.decision === "rejected") rejectBtn.classList.add("staged-active", "stage-rejected");
+                if (rstage.decision === "countered") { counterBtn.classList.add("staged-active", "stage-countered"); counterInput.focus(); }
+                if (rstage.decision === "accepted") acceptBtn.classList.add("staged-active", "stage-accepted");
+              }
+              rejectBtn.addEventListener("click", () => setRStage("rejected"));
+              counterBtn.addEventListener("click", () => setRStage("countered"));
+              acceptBtn.addEventListener("click", () => setRStage("accepted"));
+              const sendBtn = el("button", { class: "btn small" }, "Send new decision");
+              sendBtn.addEventListener("click", async () => {
+                if (rstage.decision === "pending") { alert("Pick accept, reject, or counter first."); return; }
+                if (rstage.decision === "countered" && !rstage.counter_value.trim()) { alert("Enter a counter value."); return; }
+                sendBtn.disabled = true;
+                sendBtn.textContent = "Sending...";
+                try {
+                  await api(`/api/redline-edits/${edit.id}/reconsider`, {
+                    method: "POST",
+                    body: { decision: rstage.decision, counter_value: rstage.counter_value || "" },
+                  });
+                  load();
+                } catch (e) {
+                  sendBtn.disabled = false;
+                  sendBtn.textContent = "Send new decision";
+                  alert(e.message);
+                }
+              });
+              reconsiderBox.appendChild(
+                el("div", {}, [
+                  el("div", { style: "font-size:12px;color:var(--muted);margin-bottom:6px;" }, "Change your decision -- sent to the client as its own update, by email, right away."),
+                  el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn]),
+                  counterInput,
+                  el("div", { style: "margin-top:8px;" }, [sendBtn]),
+                ])
+              );
+            }
           } else if (!awaitingResponse) {
             actions = el("div", { class: "decision-row" }, [el("div", { class: "decided pending" }, "No response yet")]);
           } else {
@@ -1219,6 +1288,19 @@ async function openRedlinesModal(generatedId) {
             el("div", { class: "redline-edit-row" }, [
               el("div", { class: "info" }, [
                 el("div", { class: "label" }, edit.label),
+                // See RedlineEdit.source_edit_id -- two different chain
+                // producers share this field (sub.origin tells them apart):
+                // the client responding to one of your counters (#20), or
+                // this very row being your own reconsideration of an
+                // earlier decision (#19, sub.origin === "owner_reconsideration").
+                // Either way, surface the link instead of leaving it
+                // invisible.
+                edit.responding_to
+                  ? el("div", { class: "rl-chain-note" }, [
+                      sub.origin === "owner_reconsideration" ? "↩ Updates your earlier decision on: " : "↩ Responds to your counter: ",
+                      el("strong", {}, edit.responding_to.counter_value || edit.responding_to.proposed_value || edit.responding_to.label),
+                    ])
+                  : null,
                 el("div", { class: "change" }, [el("span", { class: "from" }, edit.original_value || "(blank)"), " → ", el("span", { class: "to" }, edit.proposed_value)]),
                 edit.comment ? el("div", { class: "edit-comment" }, ["“", edit.comment, "”"]) : null,
                 ...thresholdLines,
@@ -1227,6 +1309,7 @@ async function openRedlinesModal(generatedId) {
               actions,
             ])
           );
+          if (reconsiderBox) subBox.appendChild(reconsiderBox);
           // Open comment thread, on ANY redline regardless of its decision
           // -- independent of the accept/reject/counter flow above, see
           // buildCommentThread and the redline-negotiation overhaul notes.
@@ -1703,12 +1786,17 @@ function DocumentsView() {
       dotClass = "draft"; dotLabel = "○"; title = "Client viewed"; desc = "The share link was opened.";
     } else if (ev.type === "redline_submitted") {
       dotClass = "pending"; dotLabel = "✎"; title = "Redline submitted"; desc = "The client sent proposed changes for review.";
+    } else if (ev.type === "owner_reconsidered") {
+      // See RedlineSubmission.origin and #19 in the bug tracker -- you
+      // changed your mind on an already-decided redline; distinct from
+      // redline_submitted since the client sent nothing here, you did.
+      dotClass = "pending"; dotLabel = "↻"; title = "You reconsidered a decision"; desc = "Sent as its own round -- the client was emailed just this update.";
     }
     const actions = [];
     if (doc && (ev.type === "drafted" || ev.type === "redline_applied")) {
       actions.push(el("a", { onclick: () => openDetail(doc) }, "View"));
       actions.push(el("a", { href: `/api/generated/${doc.id}/download` }, "Download .docx"));
-    } else if (doc && ev.type === "redline_submitted") {
+    } else if (doc && (ev.type === "redline_submitted" || ev.type === "owner_reconsidered")) {
       actions.push(el("a", { onclick: () => openRedlinesModal(doc.id) }, "View redlines"));
     }
     const isCurrent = !!(doc && ev.type === "redline_applied" && doc.id === latestId);
