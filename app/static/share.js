@@ -269,7 +269,10 @@ function DocumentView(data) {
     );
   }
   if (data.client_email) {
-    header.appendChild(el("div", { class: "rh-editing-as" }, `Editing as: ${data.client_email}`));
+    const fullName = [data.client_first_name, data.client_last_name].filter(Boolean).join(" ");
+    header.appendChild(
+      el("div", { class: "rh-editing-as" }, fullName ? `Editing as: ${fullName} (${data.client_email})` : `Editing as: ${data.client_email}`)
+    );
   }
   if (data.owner_updated_since_last_view) {
     header.appendChild(

@@ -839,8 +839,18 @@ async function openShareModal(generatedId) {
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
-  try {
-    const share = await api(`/api/generated/${generatedId}/share`, { method: "POST" });
+  // A share link is now only ever created with a real client attached --
+  // first name, last name, and a valid email are required (see
+  // main.create_share_link's docstring: comments need an attributed
+  // person, and so will e-signature down the line). An EXISTING link
+  // (created before this requirement, or just already set up) never gets
+  // blocked by this -- only the moment of creating a brand-new one does.
+  // So: try the plain lookup first; if the server says there's no link yet
+  // and it needs the client's info, show that intake form instead of a
+  // raw error.
+  const NEEDS_INTAKE = "Enter the client's first name, last name, and email";
+
+  function renderShareInfo(share) {
     const linkUrl = `${location.origin}${share.url}`;
     body.innerHTML = "";
     body.appendChild(el("p", { class: "subtitle" }, "Send the link and the access code to your client separately, a text or a call works well, the same way you'd share anything sensitive."));
@@ -856,26 +866,25 @@ async function openShareModal(generatedId) {
         ]),
       ])
     );
+    const firstNameInput = el("input", { type: "text", placeholder: "Jamie", value: share.client_first_name || "" });
+    const lastNameInput = el("input", { type: "text", placeholder: "Rivera", value: share.client_last_name || "" });
     const emailInput = el("input", { type: "email", placeholder: "client@company.com", value: share.client_email || "" });
-    const emailSavedNote = el("span", { style: "font-size:12px;color:var(--success);margin-left:8px;display:none;" }, "Saved");
+    const clientSavedNote = el("span", { style: "font-size:12px;color:var(--success);margin-left:8px;display:none;" }, "Saved");
     const senderInput = el("input", { type: "email", placeholder: "you@company.com (defaults to your login email)", value: share.sender_email || "" });
     const senderSavedNote = el("span", { style: "font-size:12px;color:var(--success);margin-left:8px;display:none;" }, "Saved");
-    async function saveShareFields() {
+    async function saveShareFields(noteEl) {
       await api(`/api/generated/${generatedId}/share`, {
         method: "POST",
-        body: { client_email: emailInput.value.trim(), sender_email: senderInput.value.trim() },
+        body: {
+          client_first_name: firstNameInput.value.trim(), client_last_name: lastNameInput.value.trim(),
+          client_email: emailInput.value.trim(), sender_email: senderInput.value.trim(),
+        },
       });
+      noteEl.style.display = "inline";
+      setTimeout(() => (noteEl.style.display = "none"), 1500);
     }
-    emailInput.addEventListener("change", async () => {
-      await saveShareFields();
-      emailSavedNote.style.display = "inline";
-      setTimeout(() => (emailSavedNote.style.display = "none"), 1500);
-    });
-    senderInput.addEventListener("change", async () => {
-      await saveShareFields();
-      senderSavedNote.style.display = "inline";
-      setTimeout(() => (senderSavedNote.style.display = "none"), 1500);
-    });
+    [firstNameInput, lastNameInput, emailInput].forEach((inp) => inp.addEventListener("change", () => saveShareFields(clientSavedNote)));
+    senderInput.addEventListener("change", () => saveShareFields(senderSavedNote));
     body.appendChild(
       el("div", { class: "form-row", style: "margin-top:14px;" }, [
         el("label", { class: "field-label" }, ["Your email (shown to the client)", senderSavedNote]),
@@ -885,9 +894,10 @@ async function openShareModal(generatedId) {
     );
     body.appendChild(
       el("div", { class: "form-row", style: "margin-top:14px;" }, [
-        el("label", { class: "field-label" }, ["Client email (optional)", emailSavedNote]),
+        el("label", { class: "field-label" }, ["Client name and email", clientSavedNote]),
+        el("div", { style: "display:flex;gap:8px;" }, [firstNameInput, lastNameInput]),
         emailInput,
-        el("div", { style: "font-size:12px;color:var(--muted);margin-top:4px;" }, "Shown to them on the review page as “Editing as”. Doesn't gate access — the access code still does that."),
+        el("div", { style: "font-size:12px;color:var(--muted);margin-top:4px;" }, "Who you're sharing this with -- shown on the review page, and used to send them the link and to attribute their comments."),
       ])
     );
     body.appendChild(
@@ -914,9 +924,67 @@ async function openShareModal(generatedId) {
         el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Close"),
       ])
     );
-  } catch (e) {
+  }
+
+  function renderIntakeForm(errMsg) {
     body.innerHTML = "";
-    body.appendChild(el("div", { class: "error-box" }, e.message));
+    body.appendChild(el("p", { class: "subtitle" }, "Who are you sharing this document with? We'll use this to send them the link and to attribute their comments when they redline it."));
+    const errBox = el("div", {});
+    if (errMsg) errBox.appendChild(el("div", { class: "error-box" }, errMsg));
+    const firstNameInput = el("input", { type: "text", placeholder: "Jamie" });
+    const lastNameInput = el("input", { type: "text", placeholder: "Rivera" });
+    const emailInput = el("input", { type: "email", placeholder: "client@company.com" });
+    body.appendChild(
+      el("div", { class: "form-row" }, [
+        el("label", { class: "field-label" }, "Client's name"),
+        el("div", { style: "display:flex;gap:8px;" }, [firstNameInput, lastNameInput]),
+      ])
+    );
+    body.appendChild(
+      el("div", { class: "form-row", style: "margin-top:14px;" }, [
+        el("label", { class: "field-label" }, "Client's email"),
+        emailInput,
+        el("div", { style: "font-size:12px;color:var(--muted);margin-top:4px;" }, "We'll email them the review link and access code."),
+      ])
+    );
+    body.appendChild(errBox);
+    const createBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Create share link");
+    createBtn.addEventListener("click", async () => {
+      errBox.innerHTML = "";
+      const first = firstNameInput.value.trim(), last = lastNameInput.value.trim(), email = emailInput.value.trim();
+      if (!first || !last || !email) {
+        errBox.appendChild(el("div", { class: "error-box" }, "First name, last name, and email are all required."));
+        return;
+      }
+      createBtn.disabled = true;
+      createBtn.textContent = "Creating...";
+      try {
+        const share = await api(`/api/generated/${generatedId}/share`, {
+          method: "POST",
+          body: { client_first_name: first, client_last_name: last, client_email: email },
+        });
+        renderShareInfo(share);
+      } catch (err) {
+        errBox.appendChild(el("div", { class: "error-box" }, err.message));
+        createBtn.disabled = false;
+        createBtn.textContent = "Create share link";
+      }
+    });
+    body.appendChild(
+      el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), createBtn])
+    );
+  }
+
+  try {
+    const share = await api(`/api/generated/${generatedId}/share`, { method: "POST" });
+    renderShareInfo(share);
+  } catch (e) {
+    if ((e.message || "").includes(NEEDS_INTAKE)) {
+      renderIntakeForm();
+    } else {
+      body.innerHTML = "";
+      body.appendChild(el("div", { class: "error-box" }, e.message));
+    }
   }
 }
 
