@@ -696,9 +696,32 @@ a.link:hover { text-decoration: underline; }
 /* ---- Redline history / client replies to a declined redline ---- */
 .redline-history-edit-row { padding: 10px 0; border-top: 1px solid var(--border-soft); }
 .redline-history-edit-row:first-of-type { border-top: none; }
+/* .client-reply-* kept for old rows rendered before the Phase 2 comment
+   thread replaced this -- nothing writes these classes anymore, see
+   .comment-thread below. */
 .client-reply-box { background: var(--bg); border-radius: var(--radius-sm); padding: 8px 10px; margin-top: 8px; font-size: 12.5px; }
 .client-reply-label { font-weight: 700; color: var(--ink-soft); margin-bottom: 2px; }
 .client-reply-text { color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+
+/* ---- Open comment thread on a redline (Google-Docs-suggest-edit-style,
+   any redline regardless of decision) -- shared look between app.js
+   (owner) and share.js (client); "mine"/"theirs" flips per side. ---- */
+.comment-thread { margin-top: 10px; }
+.comment-thread-toggle-row { display: flex; align-items: center; gap: 8px; }
+.comment-toggle-btn { background: none; border: none; padding: 0; font-size: 12.5px; font-weight: 600; color: var(--accent-dark); cursor: pointer; }
+.comment-toggle-btn:hover { text-decoration: underline; }
+.comment-resolved-badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; background: var(--success-soft); color: var(--success); }
+.comment-thread-body { margin-top: 8px; background: var(--bg); border-radius: var(--radius-sm); padding: 10px 12px; }
+.comment-list { display: flex; flex-direction: column; gap: 8px; }
+.comment-empty { font-size: 12px; color: var(--muted); }
+.comment-bubble { max-width: 88%; padding: 7px 10px; border-radius: var(--radius-sm); background: var(--panel); border: 1px solid var(--border-soft); }
+.comment-bubble.mine { align-self: flex-end; background: var(--accent-soft); border-color: transparent; }
+.comment-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+.comment-meta .comment-author { font-weight: 700; color: var(--ink-soft); }
+.comment-body-text { font-size: 12.5px; color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.comment-resolve-row { margin-top: 8px; }
+.comment-composer { display: flex; gap: 8px; margin-top: 8px; align-items: flex-start; }
+.comment-composer-input { flex: 1; min-height: 34px; resize: vertical; font-size: 12.5px; }
 
 /* ---- Admin dashboard ---- */
 .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }

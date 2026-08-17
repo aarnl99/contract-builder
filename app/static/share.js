@@ -721,13 +721,110 @@ function DocumentView(data) {
   );
   docCard.appendChild(errBox);
 
+  // ---- Shared: open comment thread on a redline (client side). Same
+  // widget as app.js's buildCommentThread (owner side) -- kept in sync by
+  // hand since the two files have no module system between them and
+  // different api()/auth patterns. Open on ANY redline regardless of its
+  // accept/reject/counter decision; "Resolved" is independent of that
+  // decision, and posting into a resolved thread auto-reopens it (server
+  // does this, we just mirror the flag locally after each call). ----
+  function buildCommentThread(edit, editPath) {
+    let comments = (edit.comments || []).slice();
+    let resolved = !!edit.comments_resolved;
+    let expanded = false;
+
+    const toggleBtn = el("button", { class: "comment-toggle-btn" }, "");
+    const resolvedBadge = el("span", { class: "comment-resolved-badge", style: "display:none;" }, "Resolved");
+    const bodyEl = el("div", { class: "comment-thread-body", style: "display:none;" });
+    const wrap = el("div", { class: "comment-thread" }, [
+      el("div", { class: "comment-thread-toggle-row" }, [toggleBtn, resolvedBadge]),
+      bodyEl,
+    ]);
+
+    function renderToggle() {
+      toggleBtn.textContent = comments.length
+        ? `💬 ${comments.length} comment${comments.length === 1 ? "" : "s"}`
+        : "💬 Add a comment";
+      resolvedBadge.style.display = resolved ? "" : "none";
+    }
+
+    function renderBody() {
+      bodyEl.innerHTML = "";
+      const list = el("div", { class: "comment-list" });
+      if (!comments.length) {
+        list.appendChild(el("div", { class: "comment-empty" }, "No comments yet."));
+      } else {
+        comments.forEach((c) => {
+          list.appendChild(
+            el("div", { class: "comment-bubble " + (c.author_type === "client" ? "mine" : "theirs") }, [
+              el("div", { class: "comment-meta" }, [
+                el("span", { class: "comment-author" }, c.author_name),
+                el("span", { class: "comment-time" }, new Date(c.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
+              ]),
+              el("div", { class: "comment-body-text" }, c.body),
+            ])
+          );
+        });
+      }
+      bodyEl.appendChild(list);
+
+      const resolveBtn = el("button", { class: "btn secondary small" }, resolved ? "Reopen" : "Mark resolved");
+      resolveBtn.addEventListener("click", async () => {
+        resolveBtn.disabled = true;
+        try {
+          const res = await api(`${editPath}/${resolved ? "reopen" : "resolve"}`, { method: "POST" });
+          resolved = res.comments_resolved;
+          renderToggle();
+          renderBody();
+        } catch (e) {
+          alert(e.message);
+          resolveBtn.disabled = false;
+        }
+      });
+      bodyEl.appendChild(el("div", { class: "comment-resolve-row" }, [resolveBtn]));
+
+      const textarea = el("textarea", { class: "comment-composer-input", placeholder: "Reply..." });
+      const sendBtn = el("button", { class: "btn small" }, "Send");
+      async function send() {
+        const text = textarea.value.trim();
+        if (!text) return;
+        sendBtn.disabled = true;
+        sendBtn.textContent = "Sending...";
+        try {
+          const c = await api(editPath, { method: "POST", body: { body: text } });
+          comments = comments.concat([c]);
+          resolved = false; // mirrors the server's auto-reopen-on-reply
+          renderToggle();
+          renderBody();
+        } catch (e) {
+          alert(e.message);
+        } finally {
+          sendBtn.disabled = false;
+          sendBtn.textContent = "Send";
+        }
+      }
+      sendBtn.addEventListener("click", send);
+      bodyEl.appendChild(el("div", { class: "comment-composer" }, [textarea, sendBtn]));
+    }
+
+    toggleBtn.addEventListener("click", () => {
+      expanded = !expanded;
+      bodyEl.style.display = expanded ? "" : "none";
+      if (expanded) renderBody();
+    });
+
+    renderToggle();
+    return wrap;
+  }
+
   // ---- redline history: every round of redlines ever submitted through
   // this link, with the sender's decision on each one -- accepted,
-  // declined, or countered -- and, on a declined one, the client's own
-  // reply. Unlike ResponseView (which only shows up once, right after a
-  // fresh response, and disappears for good once "Continue redlining" is
-  // clicked), this stays available on every visit for as long as the link
-  // is open, so what was approved/declined/countered is never just gone. ----
+  // declined, or countered -- and an open comment thread on every edit,
+  // regardless of that decision. Unlike ResponseView (which only shows up
+  // once, right after a fresh response, and disappears for good once
+  // "Continue redlining" is clicked), this stays available on every visit
+  // for as long as the link is open, so what was approved/declined/
+  // countered is never just gone. ----
   const redlineHistoryList = el("div", { style: "display:block;" });
   function renderRedlineHistoryEdit(edit) {
     const rows = [
@@ -749,64 +846,9 @@ function DocumentView(data) {
       el("div", { class: "rl-label" }, edit.label || "Custom edit"),
       ...rows,
       decisionEl,
+      buildCommentThread(edit, `/api/share/${TOKEN}/edits/${edit.id}/comments`),
     ]);
-
-    if (edit.decision === "rejected") {
-      const replyHolder = el("div", {});
-      row.appendChild(replyHolder);
-      renderReplyArea(edit, replyHolder);
-    }
     return row;
-  }
-
-  function renderReplyArea(edit, holder) {
-    holder.innerHTML = "";
-    if (edit.client_reply) {
-      const editLink = el("a", { class: "link", style: "font-size:12px;" }, "Edit comment");
-      editLink.addEventListener("click", () => showReplyForm(edit, holder));
-      holder.appendChild(
-        el("div", { class: "client-reply-box" }, [
-          el("div", { class: "client-reply-label" }, "Your comment:"),
-          el("div", { class: "client-reply-text" }, edit.client_reply),
-        ])
-      );
-      holder.appendChild(el("div", { style: "margin-top:4px;" }, editLink));
-    } else {
-      const replyBtn = el("button", { class: "btn secondary small", style: "margin-top:8px;" }, "Leave a comment");
-      replyBtn.addEventListener("click", () => showReplyForm(edit, holder));
-      holder.appendChild(replyBtn);
-    }
-  }
-
-  function showReplyForm(edit, holder) {
-    holder.innerHTML = "";
-    const textarea = el("textarea", { class: "rp-comment", placeholder: "Why should this be reconsidered?" }, edit.client_reply || "");
-    const sendBtn = el("button", { class: "btn small" }, "Send");
-    const cancelBtn = el("button", { class: "btn secondary small" }, "Cancel");
-    sendBtn.addEventListener("click", async () => {
-      const reply = textarea.value.trim();
-      if (!reply) return;
-      sendBtn.disabled = true;
-      sendBtn.textContent = "Sending...";
-      try {
-        const res = await api(`/api/share/${TOKEN}/edits/${edit.id}/reply`, { method: "POST", body: { reply } });
-        edit.client_reply = res.client_reply;
-        edit.client_reply_at = res.client_reply_at;
-        renderReplyArea(edit, holder);
-      } catch (e) {
-        alert(e.message);
-        sendBtn.disabled = false;
-        sendBtn.textContent = "Send";
-      }
-    });
-    cancelBtn.addEventListener("click", () => renderReplyArea(edit, holder));
-    holder.appendChild(
-      el("div", { style: "margin-top:8px;" }, [
-        textarea,
-        el("div", { style: "display:flex;gap:8px;margin-top:6px;" }, [sendBtn, cancelBtn]),
-      ])
-    );
-    textarea.focus();
   }
 
   function loadRedlineHistory() {

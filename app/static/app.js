@@ -240,15 +240,17 @@ function toggleAvatarMenu() {
   }
   api("/api/account/email-alias").then((res) => paintAliasRow(res.address));
 
-  // ---- notification settings: per-type opt-out for both the bell and the
-  // matching email a client's action can trigger. Each toggle saves
-  // immediately on change (same pattern as the plan row above), no
-  // separate save step. ----
+  // ---- notification settings: per-type opt-out. redline_submitted still
+  // gates both the bell and a matching email; redline_comment now only
+  // gates the in-app bell -- comment-thread replies (Phase 2 of the
+  // redline-negotiation overhaul) never send email, on any redline, not
+  // just a declined one. Each toggle saves immediately on change (same
+  // pattern as the plan row above), no separate save step. ----
   const notifRow = el("div", { class: "plan-row" });
   notifRow.appendChild(el("div", { class: "label" }, "Notifications"));
   const NOTIF_TOGGLES = [
     { key: "redline_submitted", label: "Someone sends redlines" },
-    { key: "redline_comment", label: "Client comments on a declined redline" },
+    { key: "redline_comment", label: "Client comments on a redline" },
   ];
   const notifList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:2px;" }, [
     el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."),
@@ -988,6 +990,108 @@ async function openShareModal(generatedId) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Shared: open comment thread on a redline (owner side). Lightweight,
+// Google-Docs-suggest-edit-style back-and-forth on ANY redline regardless of
+// its accept/reject/counter decision -- see RedlineComment and the
+// redline-negotiation overhaul notes. "Resolved" is independent of the
+// decision: a thread can be resolved on a pending, accepted, rejected, or
+// countered edit, and posting into a resolved thread auto-reopens it (the
+// server does this; we just mirror the flag locally after each call).
+// share.js has a near-identical copy for the client side -- kept in sync by
+// hand, not shared code, since the two files have no module system between
+// them and different api()/auth patterns.
+// ---------------------------------------------------------------------------
+
+function buildCommentThread(edit, { editPath, myAuthorType }) {
+  let comments = (edit.comments || []).slice();
+  let resolved = !!edit.comments_resolved;
+  let expanded = false;
+
+  const toggleBtn = el("button", { class: "comment-toggle-btn" }, "");
+  const resolvedBadge = el("span", { class: "comment-resolved-badge", style: "display:none;" }, "Resolved");
+  const bodyEl = el("div", { class: "comment-thread-body", style: "display:none;" });
+  const wrap = el("div", { class: "comment-thread" }, [
+    el("div", { class: "comment-thread-toggle-row" }, [toggleBtn, resolvedBadge]),
+    bodyEl,
+  ]);
+
+  function renderToggle() {
+    toggleBtn.textContent = comments.length
+      ? `💬 ${comments.length} comment${comments.length === 1 ? "" : "s"}`
+      : "💬 Add a comment";
+    resolvedBadge.style.display = resolved ? "" : "none";
+  }
+
+  function renderBody() {
+    bodyEl.innerHTML = "";
+    const list = el("div", { class: "comment-list" });
+    if (!comments.length) {
+      list.appendChild(el("div", { class: "comment-empty" }, "No comments yet."));
+    } else {
+      comments.forEach((c) => {
+        list.appendChild(
+          el("div", { class: "comment-bubble " + (c.author_type === myAuthorType ? "mine" : "theirs") }, [
+            el("div", { class: "comment-meta" }, [
+              el("span", { class: "comment-author" }, c.author_name),
+              el("span", { class: "comment-time" }, new Date(c.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })),
+            ]),
+            el("div", { class: "comment-body-text" }, c.body),
+          ])
+        );
+      });
+    }
+    bodyEl.appendChild(list);
+
+    const resolveBtn = el("button", { class: "btn secondary small" }, resolved ? "Reopen" : "Mark resolved");
+    resolveBtn.addEventListener("click", async () => {
+      resolveBtn.disabled = true;
+      try {
+        const res = await api(`${editPath}/${resolved ? "reopen" : "resolve"}`, { method: "POST" });
+        resolved = res.comments_resolved;
+        renderToggle();
+        renderBody();
+      } catch (e) {
+        alert(e.message);
+        resolveBtn.disabled = false;
+      }
+    });
+    bodyEl.appendChild(el("div", { class: "comment-resolve-row" }, [resolveBtn]));
+
+    const textarea = el("textarea", { class: "comment-composer-input", placeholder: "Reply..." });
+    const sendBtn = el("button", { class: "btn small" }, "Send");
+    async function send() {
+      const text = textarea.value.trim();
+      if (!text) return;
+      sendBtn.disabled = true;
+      sendBtn.textContent = "Sending...";
+      try {
+        const c = await api(editPath, { method: "POST", body: { body: text } });
+        comments = comments.concat([c]);
+        resolved = false; // mirrors the server's auto-reopen-on-reply
+        renderToggle();
+        renderBody();
+      } catch (e) {
+        alert(e.message);
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = "Send";
+      }
+    }
+    sendBtn.addEventListener("click", send);
+    bodyEl.appendChild(el("div", { class: "comment-composer" }, [textarea, sendBtn]));
+  }
+
+  toggleBtn.addEventListener("click", () => {
+    expanded = !expanded;
+    bodyEl.style.display = expanded ? "" : "none";
+    if (expanded) renderBody();
+  });
+
+  renderToggle();
+  return wrap;
+}
+
 async function openRedlinesModal(generatedId) {
   // See the matching comment in openShareModal -- a leftover detail panel
   // would otherwise render on top of this modal (panel-overlay's z-index
@@ -1083,20 +1187,7 @@ async function openRedlinesModal(generatedId) {
             const summaryEl = edit.decision === "countered"
               ? el("div", { class: "decided-countered" }, ["Countered: ", el("strong", {}, edit.counter_value)])
               : el("div", { class: "decided " + edit.decision }, edit.decision);
-            const actionChildren = [summaryEl];
-            // The client can leave a comment on any redline the owner
-            // declined (see share.js's renderReplyArea) -- surface it here
-            // so the owner sees the pushback without having to go dig for
-            // it, styled the same way it appears on the client's side.
-            if (edit.decision === "rejected" && edit.client_reply) {
-              actionChildren.push(
-                el("div", { class: "client-reply-box" }, [
-                  el("div", { class: "client-reply-label" }, "Client's comment:"),
-                  el("div", { class: "client-reply-text" }, edit.client_reply),
-                ])
-              );
-            }
-            actions = el("div", { class: "decision-row" }, actionChildren);
+            actions = el("div", { class: "decision-row" }, [summaryEl]);
           } else if (!awaitingResponse) {
             actions = el("div", { class: "decision-row" }, [el("div", { class: "decided pending" }, "No response yet")]);
           } else {
@@ -1136,6 +1227,10 @@ async function openRedlinesModal(generatedId) {
               actions,
             ])
           );
+          // Open comment thread, on ANY redline regardless of its decision
+          // -- independent of the accept/reject/counter flow above, see
+          // buildCommentThread and the redline-negotiation overhaul notes.
+          subBox.appendChild(buildCommentThread(edit, { editPath: `/api/redline-edits/${edit.id}/comments`, myAuthorType: "owner" }));
         });
 
         const footerActions = el("div", { style: "display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;" });
