@@ -127,7 +127,23 @@ function ThanksView() {
 // accept the counter as-is or adjust it further before the next round.
 function ResponseView(data, onContinue) {
   const resp = data.response;
+  // See RedlineSubmission.origin, phase 5 (#23): an "owner_edit" round
+  // isn't a response to anything you sent -- the sender edited the shared
+  // document directly, and it's queued here for your decision, same as a
+  // fresh counter. No "you proposed" line (you didn't) and no outcome
+  // badge (nothing's decided yet); just what changed.
+  const isOwnerEdit = resp.origin === "owner_edit";
   const rows = resp.edits.map((e) => {
+    if (isOwnerEdit) {
+      return el("div", { class: "response-edit-row" }, [
+        el("div", { class: "re-label" }, e.label),
+        el("div", { class: "re-diff" }, [
+          el("span", { class: "old" }, e.original_value || "(blank)"),
+          " → ",
+          el("span", { class: "new" }, e.counter_value || "(blank)"),
+        ]),
+      ]);
+    }
     let outcomeEl;
     if (e.decision === "accepted") {
       outcomeEl = el("div", { class: "re-outcome outcome-accepted" }, "Accepted");
@@ -148,8 +164,10 @@ function ResponseView(data, onContinue) {
 
   return el("div", { class: "share-main" }, [
     el("div", { class: "card response-card" }, [
-      el("h1", {}, "The sender responded to your redlines"),
-      el("p", { class: "subtitle" }, "Here's what happened to each one. Anything countered becomes a new suggestion you can accept or adjust."),
+      el("h1", {}, isOwnerEdit ? "The sender made a change for you to review" : "The sender responded to your redlines"),
+      el("p", { class: "subtitle" }, isOwnerEdit
+        ? "They edited the document directly. Review it below, then accept it, decline it, or suggest something different."
+        : "Here's what happened to each one. Anything countered becomes a new suggestion you can accept or adjust."),
       el("div", { class: "response-edit-list" }, rows),
       continueBtn,
     ]),
@@ -839,17 +857,28 @@ function DocumentView(data) {
   // countered is never just gone. ----
   const redlineHistoryList = el("div", { style: "display:block;" });
   function renderRedlineHistoryEdit(edit, subOrigin) {
+    // See RedlineSubmission.origin, phase 5 (#23): an owner_edit edit's
+    // proposed_value deliberately mirrors original_value (there's no
+    // separate "what the client asked for" -- the sender IS the counter),
+    // so the diff has to read against counter_value instead, or it'd show
+    // "X → X".
+    const isOwnerEdit = subOrigin === "owner_edit";
     const rows = [
       el("div", { class: "rl-diff" }, [
         el("span", { class: "old" }, edit.original_value || "(blank)"),
         " → ",
-        el("span", { class: "new" }, edit.proposed_value || "(blank)"),
+        el("span", { class: "new" }, (isOwnerEdit ? edit.counter_value : edit.proposed_value) || "(blank)"),
       ]),
     ];
     if (edit.comment) rows.push(el("div", { class: "rl-comment" }, [`"${edit.comment}"`]));
 
     let decisionEl;
-    if (edit.decision === "accepted") decisionEl = el("div", { class: "re-outcome outcome-accepted" }, "Accepted");
+    if (isOwnerEdit) {
+      // The diff above already shows the sender's actual change -- no
+      // separate "Countered with" line needed, since this isn't a counter
+      // to anything the client proposed.
+      decisionEl = el("div", { class: "re-outcome outcome-countered" }, "Proposed by the sender");
+    } else if (edit.decision === "accepted") decisionEl = el("div", { class: "re-outcome outcome-accepted" }, "Accepted");
     else if (edit.decision === "rejected") decisionEl = el("div", { class: "re-outcome outcome-rejected" }, "Declined");
     else if (edit.decision === "countered") decisionEl = el("div", { class: "re-outcome outcome-countered" }, ["Countered with: ", el("strong", {}, edit.counter_value)]);
     else decisionEl = el("div", { class: "re-outcome outcome-pending" }, "Awaiting the sender's decision");
@@ -887,10 +916,14 @@ function DocumentView(data) {
         }
         data.submissions.forEach((sub) => {
           // See RedlineSubmission.origin -- an owner_reconsideration round
-          // is the sender updating their own earlier decision, not a
-          // round the client submitted, so it gets its own label.
+          // is the sender updating their own earlier decision, and an
+          // owner_edit round (phase 5) is the sender proposing a direct
+          // edit -- neither is a round the client submitted, so each gets
+          // its own label.
           const statusLabel = sub.origin === "owner_reconsideration"
             ? "Sender updated a decision"
+            : sub.origin === "owner_edit"
+            ? "Sender proposed a change"
             : sub.status === "reviewed" ? "Applied" : sub.responded_at ? "Response sent" : "Awaiting response";
           const subBox = el("div", { class: "redline-submission" }, [
             el("div", { class: "sub-header" }, [
@@ -945,6 +978,9 @@ function DocumentView(data) {
           // from redline_submitted since the client, not the sender, sent
           // nothing here.
           owner_reconsidered: ["↻", "pending", "Sender updated a decision"],
+          // The sender edited the shared document directly -- see
+          // RedlineSubmission.origin and #23/phase 5 in the bug tracker.
+          owner_edit_proposed: ["✎", "pending", "Sender proposed a change"],
         };
         hist.timeline.forEach((ev) => {
           const [dot, cls, title] = LABELS[ev.type] || ["•", "draft", ev.type];

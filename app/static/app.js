@@ -745,7 +745,10 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
   box.appendChild(headerRow);
 
   if (editable && generatedId) {
-    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:-8px 0 10px;" }, "Select any text below to edit it directly -- saved instantly as a new revision, no approval needed."));
+    // Phase 5 (#23): once a document is shared, a direct edit is no longer
+    // instant -- it's queued as a redline the client has to approve, same
+    // as the copy in showResult/openDetail's confirmation below.
+    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:-8px 0 10px;" }, "Select any text below to edit it directly -- saved instantly as a new revision if this document hasn't been shared yet, or sent to the client for approval if it has."));
   }
 
   const preview = el("div", { class: "contract-view compact", style: "max-height:52vh;overflow-y:auto;" });
@@ -785,6 +788,11 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
             });
             closePop();
             overlay.remove();
+            if (editRes.queued_for_approval) {
+              // Document is shared -- see edit_generated_document. Nothing
+              // changed yet; the client has to approve it first.
+              alert("Sent to the client for approval -- it'll apply once they accept it.");
+            }
             if (typeof onEdited === "function") onEdited(editRes);
           } catch (e) {
             errBox.appendChild(el("div", { class: "error-box" }, e.message));
@@ -1167,9 +1175,15 @@ async function openRedlinesModal(generatedId) {
         const awaitingResponse = sub.status === "pending" && undecidedCount > 0;
         // See RedlineSubmission.origin -- an owner_reconsideration round is
         // your own updated decision, already fully resolved the moment you
-        // sent it, not a client submission awaiting review.
+        // sent it, not a client submission awaiting review. An owner_edit
+        // round (phase 5) is the opposite: you proposed something and it's
+        // the CLIENT's decision to make, not yours -- its one edit arrives
+        // already "countered" (see edit_generated_document), so it would
+        // otherwise fall through to "Response sent" below, which is wrong.
         const statusLabel = sub.origin === "owner_reconsideration"
           ? "You reconsidered a decision"
+          : sub.origin === "owner_edit"
+          ? "Waiting on the client's decision"
           : sub.status === "reviewed"
           ? "Applied"
           : !sub.responded_at
@@ -1314,7 +1328,15 @@ async function openRedlinesModal(generatedId) {
                       el("strong", {}, edit.responding_to.counter_value || edit.responding_to.proposed_value || edit.responding_to.label),
                     ])
                   : null,
-                el("div", { class: "change" }, [el("span", { class: "from" }, edit.original_value || "(blank)"), " → ", el("span", { class: "to" }, edit.proposed_value)]),
+                // For an owner_edit-origin edit (phase 5, #23), proposed_value
+                // deliberately mirrors original_value (see
+                // edit_generated_document) -- the actual change is in
+                // counter_value, or this would read "30 days → 30 days".
+                el("div", { class: "change" }, [
+                  el("span", { class: "from" }, edit.original_value || "(blank)"),
+                  " → ",
+                  el("span", { class: "to" }, sub.origin === "owner_edit" ? edit.counter_value : edit.proposed_value),
+                ]),
                 edit.comment ? el("div", { class: "edit-comment" }, ["“", edit.comment, "”"]) : null,
                 ...thresholdLines,
                 el("div", { style: "margin-top:6px;" }, el("span", { class: "eval-badge " + edit.evaluation }, edit.evaluation === "auto_approved" ? "Auto-approved" : "Needs review")),
@@ -1586,6 +1608,12 @@ function DraftView(preselectId) {
       extraButtons: [editBtn, libBtn, shareBtn, redlinesBtn],
       editable: true,
       onEdited: (editRes) => {
+        // Edge case: this dialog only shows right after a fresh generation,
+        // but the doc could already be shared (e.g. reopened via "Edit
+        // values" on one that was). A queued edit (phase 5) has no new
+        // revision -- and no editRes.id -- to re-fetch, so there's nothing
+        // to re-render; the alert in showPreviewOverlay already covered it.
+        if (editRes.queued_for_approval) return;
         // A direct edit creates a new revision rather than modifying this one
         // in place -- re-fetch it and re-render so the buttons above (Share,
         // Redlines, further edits) all point at the document you're actually
@@ -1804,12 +1832,19 @@ function DocumentsView() {
       // changed your mind on an already-decided redline; distinct from
       // redline_submitted since the client sent nothing here, you did.
       dotClass = "pending"; dotLabel = "↻"; title = "You reconsidered a decision"; desc = "Sent as its own round -- the client was emailed just this update.";
+    } else if (ev.type === "owner_edit_proposed") {
+      // See RedlineSubmission.origin and #23/phase 5 -- you edited the
+      // shared document directly, and since a client may already be
+      // reviewing it, the change is queued for their approval instead of
+      // applying instantly (contrast with the older, no-longer-reachable
+      // "owner_edited" event type below, from before a document is shared).
+      dotClass = "pending"; dotLabel = "✎"; title = "You proposed a direct edit"; desc = "Queued for the client's approval -- they were emailed just this update.";
     }
     const actions = [];
     if (doc && (ev.type === "drafted" || ev.type === "redline_applied")) {
       actions.push(el("a", { onclick: () => openDetail(doc) }, "View"));
       actions.push(el("a", { href: `/api/generated/${doc.id}/download` }, "Download .docx"));
-    } else if (doc && (ev.type === "redline_submitted" || ev.type === "owner_reconsidered")) {
+    } else if (doc && (ev.type === "redline_submitted" || ev.type === "owner_reconsidered" || ev.type === "owner_edit_proposed")) {
       actions.push(el("a", { onclick: () => openRedlinesModal(doc.id) }, "View redlines"));
     }
     const isCurrent = !!(doc && ev.type === "redline_applied" && doc.id === latestId);
