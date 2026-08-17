@@ -1622,6 +1622,15 @@ def edit_generated_document(
         raise HTTPException(410, "This file is no longer available.")
     if not body.segments:
         raise HTTPException(400, "No selection to edit.")
+    # A click-to-insert (see computeCursorPosition in app.js) sends one
+    # zero-width segment (start == end) instead of a real range -- unlike a
+    # replace, where an empty new_text is a legitimate deletion, "insert
+    # nothing at a point" has no meaningful effect, so reject it up front
+    # rather than silently writing a no-op revision. Applies to both the
+    # instant-apply and queued-for-approval paths below.
+    is_insert = all(seg["start"] == seg["end"] for seg in body.segments)
+    if is_insert and not body.new_text.strip():
+        raise HTTPException(400, "Type something to insert.")
 
     container_path = (
         [[int(x) for x in triple.split(",")] for triple in body.table_path.split(";")]
@@ -1637,12 +1646,31 @@ def edit_generated_document(
             original_text = de.extract_text_at(doc, container_path, body.paragraph_index, body.segments)
         except de.MarkError as err:
             raise HTTPException(400, f"That selection is no longer valid: {err}")
-        new_text = body.new_text.strip()
-        if new_text == original_text.strip():
+        # Deliberately NOT .strip()'d -- unlike the no-op/label checks below
+        # (which only care whether there's meaningful content), the actual
+        # value spliced into the document has to preserve exact whitespace,
+        # matching the instant-apply path below which never stripped it
+        # either. Stripping here silently ate leading/trailing spaces off
+        # otherwise-meaningful text -- harmless-looking on a replace, but a
+        # real word-mashing bug for an insert (e.g. typing "written " to
+        # read "...the written effective date" came out "writteneffective").
+        new_text = body.new_text
+        if new_text.strip() == original_text.strip():
+            # is_insert is already ruled out above (empty insert rejected
+            # earlier), so reaching here with new_text == original_text
+            # only happens on a replace typed back to its own starting text.
             raise HTTPException(400, "That's already the current text.")
 
         excerpt = original_text.strip()
-        label = (excerpt[:57] + "…") if len(excerpt) > 57 else (excerpt or "Custom edit")
+        if excerpt:
+            label = (excerpt[:57] + "…") if len(excerpt) > 57 else excerpt
+        else:
+            # Insert (see above) -- there's no original text to summarize,
+            # so fall back to an excerpt of what's actually being inserted
+            # instead of a generic "Custom edit."
+            inserted_stripped = new_text.strip()
+            inserted = inserted_stripped[:47] + "…" if len(inserted_stripped) > 47 else inserted_stripped
+            label = f"Inserted: {inserted}" if inserted else "Custom edit"
 
         submission = RedlineSubmission(
             share_link_id=open_link.id, status="pending", origin="owner_edit",
@@ -2784,21 +2812,28 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
             raise HTTPException(400, f"That selection is no longer valid: {err}")
 
         proposed = e.proposed_value.strip()
-        if proposed == original_text.strip():
-            continue  # not actually a change
 
-        ph = placeholders_by_key.get(e.field_key) if e.field_key else None
-        evaluation = rl.evaluate_edit(ph.threshold_type, ph.threshold_config, proposed) if ph else rl.NEEDS_REVIEW
-        if ph:
-            label = ph.label
-        else:
-            label = e.label.strip()[:80]
-            if not label:
-                excerpt = original_text.strip()
-                label = (excerpt[:57] + "…") if len(excerpt) > 57 else (excerpt or "Custom edit")
-
+        # Resolve accepting_edit_id BEFORE the no-op check below -- an
+        # explicit response to a live counter (accepting it, or rejecting it
+        # by reverting to the original value) is a real decision even when
+        # the resulting proposed value happens to equal the document's
+        # current text, and must not be silently dropped as "not actually a
+        # change." Discovered testing "Reject" on an owner_edit-origin
+        # counter (phase 5, the click-to-insert follow-up): that counter's
+        # client_original_value ALWAYS equals the original/current text
+        # (nothing was ever applied -- it's queued, not instant), so a
+        # rejection always hit the no-op skip below, was silently dropped,
+        # never chained via source_edit_id, and so never resolved phase 4's
+        # unresolved-counter hard block -- Finalize stayed blocked forever
+        # even after the client explicitly rejected it.
         decision = "pending"
         source_edit_id = None
+        is_explicit_counter_response = False
+        # What actually gets stored/applied for this edit's proposed_value.
+        # Defaults to the stripped client input (existing behavior, fine for
+        # a genuinely new client-typed proposal) but gets overridden below
+        # for an accept or reject -- see the whitespace note just under.
+        final_value = proposed
         if e.accepting_edit_id is not None and link_id is not None:
             prior = session.get(RedlineEdit, e.accepting_edit_id)
             prior_sub = session.get(RedlineSubmission, prior.submission_id) if prior else None
@@ -2815,18 +2850,49 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
                 # taking it as-is) lost the link back to the negotiation
                 # entirely, and the sender saw an unrelated fresh redline.
                 source_edit_id = e.accepting_edit_id
+                is_explicit_counter_response = True
                 if prior.counter_value.strip() == proposed:
+                    # Accepting the sender's counter verbatim -- use their
+                    # exact counter_value (unstripped), not the generically
+                    # re-.strip()'d client echo of it. Matters most for a
+                    # click-to-insert counter (phase 5 follow-up), where the
+                    # counter is very often JUST a leading/trailing space
+                    # (e.g. inserting "written " before a word) -- stripping
+                    # it here silently mashed the inserted word into its
+                    # neighbor with no error, even though
+                    # edit_generated_document itself already preserves that
+                    # whitespace correctly when the counter is first created.
                     decision = "accepted"
+                    final_value = prior.counter_value
+                elif proposed == original_text.strip():
+                    # Reverted back to the original/current value -- an
+                    # explicit rejection of the counter, not a fresh ask.
+                    # Use the exact live text, not a re-derived/stripped copy.
+                    decision = "rejected"
+                    final_value = original_text
             # A missing/mismatched reference isn't an error -- it just means
             # this isn't (or is no longer) a response to a live counter, so
             # it falls through to the normal "pending, needs an owner
             # decision" path with no chain recorded.
 
+        if proposed == original_text.strip() and not is_explicit_counter_response:
+            continue  # not actually a change, and not an explicit decision on a live counter either
+
+        ph = placeholders_by_key.get(e.field_key) if e.field_key else None
+        evaluation = rl.evaluate_edit(ph.threshold_type, ph.threshold_config, proposed) if ph else rl.NEEDS_REVIEW
+        if ph:
+            label = ph.label
+        else:
+            label = e.label.strip()[:80]
+            if not label:
+                excerpt = original_text.strip()
+                label = (excerpt[:57] + "…") if len(excerpt) > 57 else (excerpt or "Custom edit")
+
         out.append(dict(
             field_key=e.field_key if ph else "",
             label=label,
             original_value=original_text,
-            proposed_value=proposed,
+            proposed_value=final_value,
             comment=e.comment.strip()[:1000],
             evaluation=evaluation,
             decision=decision,
