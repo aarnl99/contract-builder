@@ -970,6 +970,37 @@ def generate_contract(
         for p in tpl.placeholders
     ]
     parties = [p.strip() for p in body.parties if p.strip()][:6]
+    values_json = json.dumps(values_snapshot)
+    parties_json = json.dumps(parties)
+
+    # Defense-in-depth against duplicate rows from a double-submit (double
+    # click, or a slow first request plus a retry) -- the client already
+    # disables the Generate button while a request is in flight, but that
+    # can't be relied on alone (e.g. two near-simultaneous requests racing
+    # past the disabled check). If an identical draft from this user/template
+    # with the same field values was created in the last few seconds, treat
+    # this as a repeat of that request and hand back the existing row
+    # instead of creating a second document.
+    dedup_window = datetime.utcnow() - timedelta(seconds=15)
+    recent_dupe = session.exec(
+        select(GeneratedContract).where(
+            GeneratedContract.owner_id == user.id,
+            GeneratedContract.template_id == tpl.id,
+            GeneratedContract.values_json == values_json,
+            GeneratedContract.parties_json == parties_json,
+            GeneratedContract.created_at >= dedup_window,
+        )
+    ).first()
+    if recent_dupe is not None:
+        preview_doc = de.load(recent_dupe.file_path)
+        return {
+            "generated_id": recent_dupe.id,
+            "name": recent_dupe.name,
+            "document_type": recent_dupe.document_type,
+            "html": de.render_paragraphs_html(preview_doc),
+            "plan": _plan_info(session, user),
+        }
+
     gc = GeneratedContract(
         owner_id=user.id,
         template_id=tpl.id,
@@ -977,9 +1008,9 @@ def generate_contract(
         document_type=tpl.document_type,
         name=display_name,
         file_path=out_path,
-        values_json=json.dumps(values_snapshot),
+        values_json=values_json,
         field_positions_json=json.dumps(field_positions),
-        parties_json=json.dumps(parties),
+        parties_json=parties_json,
     )
     session.add(gc)
     session.commit()
