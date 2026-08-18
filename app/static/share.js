@@ -431,9 +431,14 @@ function DocumentView(data) {
   function repaint() {
     preview.innerHTML = pristineHtml;
     const byPara = {};
-    Object.values(edits).forEach((e) => {
+    // Carry each edit's key along (not just its value) so the fv-del/fv-ins
+    // spans below can be tagged with data-edit-key -- handleRunClick needs
+    // that to find exactly this edit's span(s) within a run that might
+    // otherwise span a whole clause. See the click-to-decide highlight fix
+    // just below.
+    Object.entries(edits).forEach(([key, e]) => {
       const pk = `${e.location.table_path || ""} ${e.location.paragraph_index}`;
-      (byPara[pk] = byPara[pk] || []).push(e);
+      (byPara[pk] = byPara[pk] || []).push({ key, edit: e });
     });
     Object.entries(byPara).forEach(([pk, list]) => {
       const [tablePath, pIdxStr] = pk.split(" ");
@@ -441,9 +446,9 @@ function DocumentView(data) {
       if (!paraEl) return;
       const runEls = Array.from(paraEl.querySelectorAll(".run"));
       const byRun = {};
-      list.forEach((e) => {
-        e.location.segments.forEach((seg) => {
-          (byRun[seg.r] = byRun[seg.r] || []).push({ seg, edit: e });
+      list.forEach(({ key, edit }) => {
+        edit.location.segments.forEach((seg) => {
+          (byRun[seg.r] = byRun[seg.r] || []).push({ seg, edit, key });
         });
       });
       Object.entries(byRun).forEach(([rIdxStr, segEdits]) => {
@@ -454,18 +459,20 @@ function DocumentView(data) {
         const frag = document.createDocumentFragment();
         const seen = new Set();
         let cursor = 0;
-        segEdits.forEach(({ seg, edit }) => {
+        segEdits.forEach(({ seg, edit, key }) => {
           if (seg.start > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, seg.start)));
           // The counter-pending indicator is scoped to just the del/ins pair
           // for THIS edit, not the whole .run -- a run can span an entire
           // clause (Word often merges a whole sentence into one run when
           // there's no formatting boundary), so marking the run itself
           // visually underlined every word in it, not just the countered
-          // one. See has-counter-pending's CSS comment.
+          // one. See has-counter-pending's CSS comment. data-edit-key is
+          // the same scoping fix applied to the click-to-decide highlight
+          // -- see handleRunClick.
           const pendingCls = edit.counterPending ? " counter-pending" : "";
-          frag.appendChild(el("span", { class: "fv-del" + pendingCls }, text.slice(seg.start, seg.end)));
+          frag.appendChild(el("span", { class: "fv-del" + pendingCls, "data-edit-key": key }, text.slice(seg.start, seg.end)));
           if (!seen.has(edit)) {
-            frag.appendChild(el("span", { class: "fv-ins" + pendingCls }, edit.value || "(blank)"));
+            frag.appendChild(el("span", { class: "fv-ins" + pendingCls, "data-edit-key": key }, edit.value || "(blank)"));
             seen.add(edit);
           }
           cursor = seg.end;
@@ -645,18 +652,30 @@ function DocumentView(data) {
     if (found) {
       const [key, e] = found;
       deselectField();
-      runEl.classList.add("selected");
-      selectedEls = [runEl];
+      // Highlight and anchor on just THIS edit's fv-del/fv-ins span(s), not
+      // the whole run -- a run can span an entire clause (Word merges a
+      // whole sentence into one run with no formatting break), so marking
+      // .selected on runEl made deciding on a single inserted word look
+      // like the entire clause was up for review. data-edit-key is set by
+      // repaint() precisely so this lookup can be exact. Falls back to the
+      // run itself only if something's out of sync (shouldn't happen --
+      // repaint() always tags every edit's spans before this can be
+      // clicked).
+      const spans = Array.from(runEl.querySelectorAll(`[data-edit-key="${cssEscape(key)}"]`));
+      const targets = spans.length ? spans : [runEl];
+      targets.forEach((t) => t.classList.add("selected"));
+      selectedEls = targets;
+      const anchorRect = targets[targets.length - 1].getBoundingClientRect();
       if (e.counterPending) {
-        showDecisionChip(runEl.getBoundingClientRect(), {
+        showDecisionChip(anchorRect, {
           onAccept: () => acceptCounter(key),
           onReject: () => rejectCounter(key),
-          onSuggest: () => openSuggestPopoverForKey(key, runEl.getBoundingClientRect()),
+          onSuggest: () => openSuggestPopoverForKey(key, anchorRect),
         });
         return;
       }
-      showActionChip(runEl.getBoundingClientRect(), "Edit suggestion ✎", () => {
-        openSuggestPopoverForKey(key, runEl.getBoundingClientRect());
+      showActionChip(anchorRect, "Edit suggestion ✎", () => {
+        openSuggestPopoverForKey(key, anchorRect);
       });
       return;
     }

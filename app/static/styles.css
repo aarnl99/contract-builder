@@ -528,6 +528,24 @@ a.link:hover { text-decoration: underline; }
   background: var(--success-soft); border-radius: 3px; padding: 0 4px;
 }
 
+/* Owner click-to-insert: a live ghost-text span spliced into the document
+   at the exact click point, mirroring the popover textarea as you type --
+   see showPreviewOverlay in app.js. Reused .fv-ins-style coloring so an
+   in-progress insert reads the same way an already-applied insertion does
+   elsewhere in the app. The blinking bar shows the empty state (before
+   anything's been typed yet) so the insertion point itself is never
+   invisible, even with zero characters in it. */
+.insert-ghost-marker {
+  color: var(--success); font-weight: 700; text-decoration: underline; text-underline-offset: 2px;
+  background: var(--success-soft); border-radius: 3px; padding: 0 2px;
+}
+.insert-ghost-marker:empty::after {
+  content: ""; display: inline-block; width: 1px; height: 1em; margin: 0 1px;
+  background: var(--success); vertical-align: text-bottom;
+  animation: insert-caret-blink 1s step-end infinite;
+}
+@keyframes insert-caret-blink { 50% { opacity: 0; } }
+
 .redline-popover {
   position: fixed; z-index: 60; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
   box-shadow: var(--shadow-lg); padding: 16px; width: 280px;
@@ -610,6 +628,16 @@ a.link:hover { text-decoration: underline; }
 .contract-view .run.selected:not(.field-value) {
   background: var(--accent-soft-border) !important; box-shadow: 0 0 0 2px var(--accent) inset !important;
   border-radius: 3px; padding: 0 2px;
+}
+/* Selecting a pending edit to decide on it (Accept/Reject/Suggest) or
+   re-suggest it highlights just its own fv-del/fv-ins span(s), not the
+   whole .run -- see handleRunClick's data-edit-key lookup. A run can span
+   an entire clause, so the whole-run .selected rule above (still used for
+   marked-field selection, where a field IS the whole run) would otherwise
+   make deciding on a single inserted word look like the entire clause was
+   up for review. */
+.contract-view .fv-del.selected, .contract-view .fv-ins.selected {
+  box-shadow: 0 0 0 2px var(--accent) inset !important; border-radius: 3px;
 }
 /* Precise highlight for a free-text drag-selection, drawn from the Range's
    own client rects (see share.js's highlightRange) instead of shading a

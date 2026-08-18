@@ -823,7 +823,18 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
 
   if (editable && generatedId) {
     let activePopover = null;
-    const closePop = () => { if (activePopover) { activePopover.remove(); activePopover = null; } };
+    // Reported bug: clicking to insert opened a popover with no visible
+    // anchor in the document itself -- you typed into a floating box with
+    // no way to see where, exactly, the new text would land relative to
+    // the surrounding words. activeMarker is a live ghost-text span
+    // spliced into the document AT the click point (see range.insertNode
+    // below); the textarea's input mirrors into it as you type, so the
+    // insertion is visible in place, in context, the whole time.
+    let activeMarker = null;
+    const closePop = () => {
+      if (activePopover) { activePopover.remove(); activePopover = null; }
+      if (activeMarker) { activeMarker.remove(); activeMarker = null; }
+    };
     preview.addEventListener("mouseup", () => {
       setTimeout(() => {
         const sel = window.getSelection();
@@ -841,7 +852,22 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
         if (!info) return;
         if (info.error === "cross-paragraph") { alert("Please select text within a single paragraph."); return; }
         closePop();
+        // Splice the ghost marker in at the exact click point BEFORE the
+        // popover is built -- range is still a live, valid Range (clearing
+        // the Selection above doesn't invalidate Ranges obtained from it),
+        // and it's still collapsed to the click position since nothing has
+        // mutated the DOM yet.
+        let marker = null;
+        if (isInsert) {
+          marker = document.createElement("span");
+          marker.className = "insert-ghost-marker";
+          try { range.insertNode(marker); } catch (e) { marker = null; }
+          activeMarker = marker;
+        }
         const input = el("textarea", { rows: "2", placeholder: isInsert ? "Type text to insert here..." : "" }, info.text);
+        if (marker) {
+          input.addEventListener("input", () => { marker.textContent = input.value; });
+        }
         const errBox = el("div");
         const saveBtn = el("button", { class: "btn" }, isInsert ? "Insert" : "Save as new revision");
         saveBtn.addEventListener("click", async () => {
