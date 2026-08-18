@@ -34,10 +34,27 @@ def test_numeric_range_outside_bounds_needs_review():
     assert rl.evaluate_edit("numeric_range", config, "1000") == rl.NEEDS_REVIEW
 
 
-def test_numeric_range_extracts_number_from_free_text():
+def test_numeric_range_accepts_currency_and_percent_decoration():
+    # A number plus only currency/percent/thousands-separator decoration
+    # still auto-approves -- the whole submitted value is nothing but the
+    # number itself, so splicing it in verbatim is safe.
     config = json.dumps({"min": 30, "max": 45})
-    assert rl.evaluate_edit("numeric_range", config, "Net 40 days") == rl.AUTO_APPROVED
-    assert rl.evaluate_edit("numeric_range", config, "$45,000") == rl.NEEDS_REVIEW  # 45000 > 45
+    assert rl.evaluate_edit("numeric_range", config, "$40") == rl.AUTO_APPROVED
+    assert rl.evaluate_edit("numeric_range", config, "40%") == rl.AUTO_APPROVED
+    assert rl.evaluate_edit("numeric_range", config, "  40  ") == rl.AUTO_APPROVED
+    assert rl.evaluate_edit("numeric_range", config, "$45,000") == rl.NEEDS_REVIEW  # 45000 > 45, out of range
+
+
+def test_numeric_range_rejects_prose_around_a_matching_number():
+    # #27: a value that CONTAINS an in-range number but is otherwise real
+    # prose must NOT auto-approve -- auto-approval applies the whole
+    # proposed_value string verbatim, so "Net 40 days" auto-approving would
+    # splice that literal sentence into the contract unreviewed, past a
+    # control the owner built specifically to skip manual review.
+    config = json.dumps({"min": 30, "max": 45})
+    assert rl.evaluate_edit("numeric_range", config, "Net 40 days") == rl.NEEDS_REVIEW
+    assert rl.evaluate_edit("numeric_range", config, "$40, due immediately") == rl.NEEDS_REVIEW
+    assert rl.evaluate_edit("numeric_range", config, "40 (approx)") == rl.NEEDS_REVIEW
 
 
 def test_numeric_range_open_ended_bounds():
