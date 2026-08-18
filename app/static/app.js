@@ -797,13 +797,47 @@ function ResetPasswordView() {
 // Shared: document preview overlay
 // ---------------------------------------------------------------------------
 
+function _findParaEl(container, tablePath, pIndex) {
+  const paras = container.querySelectorAll(".para");
+  for (const p of paras) {
+    if (parseInt(p.dataset.p, 10) === pIndex && (p.dataset.path || "") === (tablePath || "")) return p;
+  }
+  return null;
+}
+
+// Short human-readable summary of one staged direct edit, for the pending-
+// changes list below the preview -- an insert reads as "Insert: ...", a
+// replace as "original" → "new".
+function _describeStagedEdit(e) {
+  const shorten = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
+  if (e.segments.every((s) => s.start === s.end)) {
+    return "Insert: " + shorten(e.new_text.trim(), 60);
+  }
+  return `"${shorten((e.originalText || "").trim(), 30)}" → "${shorten(e.new_text.trim(), 30)}"`;
+}
+
 function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, editable, onEdited }) {
   const overlay = el("div", { class: "modal-overlay" });
   const box = el("div", { class: "modal", style: "width:720px;" });
 
+  // Multiple direct edits are staged locally here and only sent to the
+  // server as one batch, via the "Save changes" button below -- see
+  // DirectEditsBody in main.py. Before this (ad hoc user report: "you
+  // should be able to see everything live first, in case you want to do
+  // more than one, and THEN get the opportunity to submit it"), every
+  // click posted its own edit immediately, one at a time.
+  const staged = [];
+  let stagedSeq = 0;
+  const pristineHtml = html || "<p style='color:var(--muted);'>No preview available.</p>";
+
+  const closeOverlay = () => {
+    if (staged.length && !confirm(`You have ${staged.length} unsaved change${staged.length === 1 ? "" : "s"} that will be lost. Close anyway?`)) return;
+    overlay.remove();
+  };
+
   const headerRow = el("div", { style: "display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;" }, [
     el("div", {}, [el("h2", {}, title), subtitle ? el("p", { class: "subtitle", style: "margin:2px 0 0;" }, subtitle) : null]),
-    el("button", { class: "btn ghost small", onclick: () => overlay.remove() }, "Close"),
+    el("button", { class: "btn ghost small", onclick: () => closeOverlay() }, "Close"),
   ]);
   box.appendChild(headerRow);
 
@@ -814,14 +848,130 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
     // insert (no selection needed) added right after Phase 5 shipped, once
     // it was clear "select something to edit it" left no way to just add
     // new text -- see computeCursorPosition.
-    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:-8px 0 10px;" }, "Select text to edit it, or click anywhere to insert something new -- saved instantly as a new revision if this document hasn't been shared yet, or sent to the client for approval if it has."));
+    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:-8px 0 10px;" }, "Select text to edit it, or click anywhere to insert something new. Stage as many changes as you like, then save them all at once -- applied instantly as one new revision if this document hasn't been shared yet, or sent to the client for approval if it has."));
   }
 
   const preview = el("div", { class: "contract-view compact", style: "max-height:52vh;overflow-y:auto;" });
-  preview.innerHTML = html || "<p style='color:var(--muted);'>No preview available.</p>";
+  preview.innerHTML = pristineHtml;
   box.appendChild(preview);
 
+  const stagedBar = el("div", { style: "display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);" });
+  box.appendChild(stagedBar);
+
   if (editable && generatedId) {
+    // Rebuilds the preview from the pristine (server-rendered) HTML, then
+    // splices every staged edit's fv-del/fv-ins decoration back in -- the
+    // exact same pattern share.js's repaint() uses to show a client their
+    // pending redlines in place, in the actual document text, rather than
+    // only in a separate list. Reusing .fv-del/.fv-ins here (not a new
+    // class) is deliberate: it's already styled, and an in-progress owner
+    // edit reads the same way an already-applied one does elsewhere.
+    function repaintStaged() {
+      preview.innerHTML = pristineHtml;
+      const byPara = {};
+      staged.forEach((e) => {
+        const pk = `${e.table_path || ""} ${e.paragraph_index}`;
+        (byPara[pk] = byPara[pk] || []).push(e);
+      });
+      Object.entries(byPara).forEach(([pk, list]) => {
+        const sp = pk.lastIndexOf(" ");
+        const tablePath = pk.slice(0, sp);
+        const pIdx = parseInt(pk.slice(sp + 1), 10);
+        const paraEl = _findParaEl(preview, tablePath, pIdx);
+        if (!paraEl) return;
+        const runEls = Array.from(paraEl.querySelectorAll(".run"));
+        const byRun = {};
+        list.forEach((e) => {
+          e.segments.forEach((seg) => {
+            (byRun[seg.r] = byRun[seg.r] || []).push({ seg, e });
+          });
+        });
+        const seen = new Set();
+        Object.entries(byRun).forEach(([rIdxStr, segEdits]) => {
+          const runEl = runEls[parseInt(rIdxStr, 10)];
+          if (!runEl) return;
+          segEdits.sort((a, b) => a.seg.start - b.seg.start);
+          const text = runEl.textContent;
+          const frag = document.createDocumentFragment();
+          let cursor = 0;
+          segEdits.forEach(({ seg, e }) => {
+            if (seg.start > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, seg.start)));
+            if (seg.start < seg.end) {
+              frag.appendChild(el("span", { class: "fv-del", "data-staged-id": String(e.localId) }, text.slice(seg.start, seg.end)));
+            }
+            // A multi-run edit (a drag-selection spanning several runs)
+            // shares one new_text across all its segments -- only show it
+            // once, at the first run it touches, not once per run.
+            if (!seen.has(e)) {
+              frag.appendChild(el("span", { class: "fv-ins", "data-staged-id": String(e.localId) }, e.new_text || "(blank)"));
+              seen.add(e);
+            }
+            cursor = Math.max(cursor, seg.end);
+          });
+          if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+          runEl.innerHTML = "";
+          runEl.appendChild(frag);
+        });
+      });
+      renderStagedBar();
+    }
+
+    function renderStagedBar() {
+      stagedBar.innerHTML = "";
+      if (!staged.length) { stagedBar.style.display = "none"; return; }
+      stagedBar.style.display = "";
+      const list = el("div", { style: "display:flex;flex-direction:column;gap:6px;margin-bottom:10px;" });
+      staged.forEach((e) => {
+        const removeBtn = el("span", { class: "staged-edit-remove" }, "Remove");
+        removeBtn.addEventListener("click", () => {
+          const idx = staged.indexOf(e);
+          if (idx !== -1) staged.splice(idx, 1);
+          repaintStaged();
+        });
+        list.appendChild(
+          el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12.5px;background:var(--panel-2, var(--panel));border:1px solid var(--border);border-radius:6px;padding:6px 10px;" }, [
+            el("div", { style: "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" }, _describeStagedEdit(e)),
+            removeBtn,
+          ])
+        );
+      });
+      stagedBar.appendChild(list);
+      const errBox = el("div");
+      const saveBtn = el("button", { class: "btn" }, `Save ${staged.length} change${staged.length === 1 ? "" : "s"}`);
+      saveBtn.addEventListener("click", async () => {
+        errBox.innerHTML = "";
+        saveBtn.disabled = true;
+        saveBtn.textContent = "Saving...";
+        try {
+          const editRes = await api(`/api/generated/${generatedId}/edit`, {
+            method: "POST",
+            body: {
+              edits: staged.map((e) => ({
+                table_path: e.table_path,
+                paragraph_index: e.paragraph_index,
+                segments: e.segments,
+                new_text: e.new_text,
+              })),
+            },
+          });
+          overlay.remove();
+          if (editRes.queued_for_approval) {
+            // Document is shared -- see edit_generated_document. Nothing
+            // changed yet; the client has to approve it first.
+            const n = staged.length;
+            alert(`Sent ${n} change${n === 1 ? "" : "s"} to the client for approval -- ${n === 1 ? "it'll" : "they'll"} apply once accepted.`);
+          }
+          if (typeof onEdited === "function") onEdited(editRes);
+        } catch (e2) {
+          errBox.appendChild(el("div", { class: "error-box" }, e2.message));
+          saveBtn.disabled = false;
+          saveBtn.textContent = `Save ${staged.length} change${staged.length === 1 ? "" : "s"}`;
+        }
+      });
+      stagedBar.appendChild(errBox);
+      stagedBar.appendChild(el("div", { style: "display:flex;justify-content:flex-end;" }, saveBtn));
+    }
+
     let activePopover = null;
     // Reported bug: clicking to insert opened a popover with no visible
     // anchor in the document itself -- you typed into a floating box with
@@ -829,7 +979,10 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
     // the surrounding words. activeMarker is a live ghost-text span
     // spliced into the document AT the click point (see range.insertNode
     // below); the textarea's input mirrors into it as you type, so the
-    // insertion is visible in place, in context, the whole time.
+    // insertion is visible in place, in context, the whole time. It's
+    // distinct from a staged edit's own fv-ins decoration (see
+    // repaintStaged) -- this one only exists while THIS popover is open,
+    // and is discarded (not staged) on Cancel.
     let activeMarker = null;
     const closePop = () => {
       if (activePopover) { activePopover.remove(); activePopover = null; }
@@ -851,6 +1004,7 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
         sel.removeAllRanges();
         if (!info) return;
         if (info.error === "cross-paragraph") { alert("Please select text within a single paragraph."); return; }
+        if (info.error === "inside-pending-edit") { alert("That's part of a change you've already staged below -- remove it first if you want to change that spot again."); return; }
         closePop();
         // Splice the ghost marker in at the exact click point BEFORE the
         // popover is built -- range is still a live, valid Range (clearing
@@ -869,36 +1023,31 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
           input.addEventListener("input", () => { marker.textContent = input.value; });
         }
         const errBox = el("div");
-        const saveBtn = el("button", { class: "btn" }, isInsert ? "Insert" : "Save as new revision");
-        saveBtn.addEventListener("click", async () => {
+        const saveBtn = el("button", { class: "btn" }, isInsert ? "Insert" : "Stage edit");
+        saveBtn.addEventListener("click", () => {
           errBox.innerHTML = "";
           if (isInsert && !input.value.trim()) {
             errBox.appendChild(el("div", { class: "error-box" }, "Type something to insert."));
             return;
           }
-          saveBtn.disabled = true;
-          try {
-            const editRes = await api(`/api/generated/${generatedId}/edit`, {
-              method: "POST",
-              body: {
-                table_path: info.table_path,
-                paragraph_index: info.paragraph_index,
-                segments: info.segments,
-                new_text: input.value,
-              },
-            });
-            closePop();
-            overlay.remove();
-            if (editRes.queued_for_approval) {
-              // Document is shared -- see edit_generated_document. Nothing
-              // changed yet; the client has to approve it first.
-              alert("Sent to the client for approval -- it'll apply once they accept it.");
-            }
-            if (typeof onEdited === "function") onEdited(editRes);
-          } catch (e) {
-            errBox.appendChild(el("div", { class: "error-box" }, e.message));
-            saveBtn.disabled = false;
+          if (!isInsert && input.value.trim() === (info.text || "").trim()) {
+            errBox.appendChild(el("div", { class: "error-box" }, "That's already the current text."));
+            return;
           }
+          staged.push({
+            localId: ++stagedSeq,
+            table_path: info.table_path,
+            paragraph_index: info.paragraph_index,
+            segments: info.segments,
+            new_text: input.value,
+            originalText: info.text || "",
+          });
+          closePop();
+          // repaintStaged() rebuilds the preview from pristineHtml and
+          // reapplies every staged edit's decoration -- including the one
+          // just pushed above, so the ghost marker's job is done the
+          // moment this fires; it's already been removed by closePop().
+          repaintStaged();
         });
         const pop = el("div", { class: "redline-popover" }, [
           el("div", { class: "rp-label" }, isInsert ? "Insert text" : "Edit text"),
@@ -923,11 +1072,11 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
     actions.appendChild(el("a", { class: "btn", href: `/api/generated/${generatedId}/download` }, "Download .docx"));
   }
   if (extraButtons) extraButtons.forEach((b) => actions.appendChild(b));
-  actions.appendChild(el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Close"));
+  actions.appendChild(el("button", { class: "btn secondary", onclick: () => closeOverlay() }, "Close"));
   box.appendChild(actions);
 
   overlay.appendChild(box);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeOverlay(); });
   document.body.appendChild(overlay);
   return overlay;
 }
@@ -1323,9 +1472,38 @@ async function openRedlinesModal(generatedId) {
             );
           }
 
+          // See RedlineSubmission.origin -- an owner_edit row is the
+          // owner's own proposal, arriving already "countered" (the owner
+          // IS the counter, there's no client ask preceding it). Ad hoc
+          // user report: "why would you need to reconsider your own text
+          // that you just added -- you should just have the opportunity to
+          // remove it instead." Unlike an ordinary decided edit, there's no
+          // accept/reject/counter *decision* here to revisit -- only a
+          // still-pending proposal to withdraw, while the client hasn't
+          // yet responded to it (edit.superseded means they have, via the
+          // same source_edit_id chaining reconsideration uses -- see #26).
+          const isRemovableOwnerEdit = sub.origin === "owner_edit" && !edit.superseded;
+
           let actions;
           let reconsiderBox = null;
-          if (already) {
+          if (isRemovableOwnerEdit) {
+            const summaryEl = el("div", { class: "decided pending" }, "Proposed — awaiting the client's decision");
+            const removeBtn = el("button", { class: "btn secondary small" }, "Remove");
+            removeBtn.addEventListener("click", async () => {
+              if (!confirm("Remove this change? The client will no longer see it.")) return;
+              removeBtn.disabled = true;
+              removeBtn.textContent = "Removing...";
+              try {
+                await api(`/api/redline-edits/${edit.id}/withdraw`, { method: "DELETE" });
+                load();
+              } catch (e) {
+                removeBtn.disabled = false;
+                removeBtn.textContent = "Remove";
+                alert(e.message);
+              }
+            });
+            actions = el("div", { class: "decision-row" }, [summaryEl, removeBtn]);
+          } else if (already) {
             const summaryEl = edit.decision === "countered"
               ? el("div", { class: "decided-countered" }, ["Countered: ", el("strong", {}, edit.counter_value)])
               : el("div", { class: "decided " + edit.decision }, edit.decision);
@@ -2312,6 +2490,69 @@ function _findAncestorWithClass(node, cls) {
   return e;
 }
 
+// A run that has one or more staged direct edits gets decoration spliced
+// into it by showPreviewOverlay's repaint() -- .fv-ins (a staged edit's new
+// text, not part of the actual document yet) and .insert-ghost-marker (the
+// live typing preview for the popover that's currently open). Both are
+// zero-width as far as the ORIGINAL document text is concerned, so offset
+// math below has to skip them rather than counting their characters --
+// otherwise a second click in an already-decorated run would compute a
+// position that's off by however many characters the decoration added.
+function _isDecorationEl(node) {
+  return !!(node && node.nodeType === 1 && node.classList && (node.classList.contains("fv-ins") || node.classList.contains("insert-ghost-marker")));
+}
+
+// True if `node` sits inside a decoration element (up to, but not
+// including, `stopEl`) -- used to reject a click/selection that lands on
+// already-staged new text, where there's no meaningful "original document
+// position" to report. The caller should ask the person to remove the
+// existing staged edit first rather than silently computing something
+// wrong.
+function _insideDecoration(node, stopEl) {
+  let e = node.nodeType === 3 ? node.parentElement : node;
+  while (e && e !== stopEl) {
+    if (_isDecorationEl(e)) return true;
+    e = e.parentElement;
+  }
+  return false;
+}
+
+// Maps a live DOM (textNode, localOffset) position back to an offset
+// relative to the RUN's ORIGINAL text -- i.e. as if no decoration had ever
+// been spliced in. Walks the run's subtree in document order, skipping
+// decoration elements entirely (their text doesn't count -- see
+// _isDecorationEl) and summing every other text node's length until it
+// reaches `textNode`. Plain text nodes and .fv-del spans (the original
+// text of an already-staged replacement, still shown struck-through) both
+// count normally, since both really are original document text.
+function _runRelativeOffset(runEl, textNode, localOffset) {
+  let total = 0;
+  let found = false;
+  (function walk(node) {
+    if (found) return;
+    if (node === textNode) { total += localOffset; found = true; return; }
+    if (node.nodeType === 3) { total += node.textContent.length; return; }
+    if (_isDecorationEl(node)) return;
+    for (const child of node.childNodes) { walk(child); if (found) return; }
+  })(runEl);
+  return found ? total : null;
+}
+
+// Same original-text-only accounting as _runRelativeOffset, but for the
+// run's total length -- used when a multi-run selection spans this run
+// entirely (computeSelectionSegments' "middle run" case) or ends inside a
+// following run. runEl.textContent alone would over-count once decoration
+// has spliced staged .fv-ins text into the run.
+function _originalRunLength(runEl) {
+  let total = 0;
+  (function walk(node) {
+    if (node.nodeType === 3) { total += node.textContent.length; return; }
+    if (_isDecorationEl(node)) return;
+    for (const child of node.childNodes) walk(child);
+  })(runEl);
+  return total;
+}
+
 // Cursor-position variant of computeSelectionSegments: a plain click (no
 // drag) is a collapsed selection, which computeSelectionSegments always
 // rejects -- correct for field-marking and redlining (you must select real
@@ -2333,11 +2574,19 @@ function computeCursorPosition(containerEl) {
   const runEl = _findAncestorWithClass(tn.node, "run");
   const paraEl = _findAncestorWithClass(tn.node, "para");
   if (!runEl || !paraEl) return null;
+  // Clicking inside a run's own already-staged decoration (see
+  // _isDecorationEl) has no meaningful "original document position" to
+  // report -- direct the caller to remove that staged edit first instead
+  // of silently computing a wrong offset.
+  if (_insideDecoration(tn.node, runEl)) return { error: "inside-pending-edit" };
+
+  const offset = _runRelativeOffset(runEl, tn.node, tn.offset);
+  if (offset === null) return null;
 
   const pIndex = parseInt(paraEl.dataset.p, 10);
   const tablePath = paraEl.dataset.path || "";
   const r = parseInt(runEl.dataset.r, 10);
-  return { paragraph_index: pIndex, table_path: tablePath, segments: [{ r, start: tn.offset, end: tn.offset }], text: "" };
+  return { paragraph_index: pIndex, table_path: tablePath, segments: [{ r, start: offset, end: offset }], text: "" };
 }
 
 function computeSelectionSegments(containerEl) {
@@ -2356,6 +2605,11 @@ function computeSelectionSegments(containerEl) {
   const endParaEl = _findAncestorWithClass(endTN.node, "para");
   if (!startRunEl || !endRunEl || !startParaEl || !endParaEl) return null;
   if (startParaEl !== endParaEl) return { error: "cross-paragraph" };
+  // See computeCursorPosition -- a selection that touches already-staged
+  // decoration has no clean original-text mapping either.
+  if (_insideDecoration(startTN.node, startRunEl) || _insideDecoration(endTN.node, endRunEl)) {
+    return { error: "inside-pending-edit" };
+  }
 
   const pIndex = parseInt(startParaEl.dataset.p, 10);
   const tablePath = startParaEl.dataset.path || "";
@@ -2363,7 +2617,9 @@ function computeSelectionSegments(containerEl) {
 
   if (startRunEl === endRunEl) {
     const r = parseInt(startRunEl.dataset.r, 10);
-    let s = startTN.offset, e = endTN.offset;
+    let s = _runRelativeOffset(startRunEl, startTN.node, startTN.offset);
+    let e = _runRelativeOffset(endRunEl, endTN.node, endTN.offset);
+    if (s === null || e === null) return null;
     if (s > e) [s, e] = [e, s];
     return { paragraph_index: pIndex, table_path: tablePath, segments: [{ r, start: s, end: e }], text };
   }
@@ -2377,11 +2633,12 @@ function computeSelectionSegments(containerEl) {
   for (let i = startIdx; i <= endIdx; i++) {
     const runEl = allRuns[i];
     const r = parseInt(runEl.dataset.r, 10);
-    const runLen = (runEl.textContent || "").length;
+    const runLen = _originalRunLength(runEl);
     let s, e;
-    if (i === startIdx) { s = startTN.offset; e = runLen; }
-    else if (i === endIdx) { s = 0; e = endTN.offset; }
+    if (i === startIdx) { s = _runRelativeOffset(runEl, startTN.node, startTN.offset); e = runLen; }
+    else if (i === endIdx) { s = 0; e = _runRelativeOffset(runEl, endTN.node, endTN.offset); }
     else { s = 0; e = runLen; }
+    if (s === null || e === null) return null;
     if (s < e) segments.push({ r, start: s, end: e });
   }
   if (!segments.length) return null;

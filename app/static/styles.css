@@ -556,6 +556,14 @@ a.link:hover { text-decoration: underline; }
 .redline-popover .rp-actions .btn { flex: 1; }
 .redline-popover .rp-remove { margin-top: 10px; font-size: 12.5px; color: var(--danger); cursor: pointer; text-align: center; }
 
+/* Owner's staged-but-not-yet-saved direct edits, listed below the preview
+   in showPreviewOverlay -- see the `staged` array + renderStagedBar in
+   app.js. Same "Remove" link styling as .rp-remove above, just not scoped
+   under .redline-popover since this list lives directly in the modal body,
+   not inside a popover. */
+.staged-edit-remove { font-size: 12.5px; color: var(--danger); cursor: pointer; white-space: nowrap; flex-shrink: 0; }
+.staged-edit-remove:hover { text-decoration: underline; }
+
 .suggestions-panel { margin-top: 24px; }
 .suggestions-panel h2 { font-size: 15px; margin-bottom: 4px; }
 .suggestion-row {
