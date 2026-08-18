@@ -1622,32 +1622,48 @@ def _client_lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
     }
 
 
-class DirectEditBody(BaseModel):
+class DirectEditItem(BaseModel):
     table_path: str = ""
     paragraph_index: int
     segments: list  # [{"r": int, "start": int, "end": int}, ...] -- same shape the browser already captures for template field-marking and redlining
     new_text: str
 
 
+class DirectEditsBody(BaseModel):
+    # A batch of direct edits staged locally in the preview (see
+    # showPreviewOverlay's `staged` list + repaint() in app.js) and
+    # submitted together. Before this (ad hoc user report: "you don't want
+    # to have to draft a new document for every edit"), every click posted
+    # its own edit immediately -- on an unshared document that meant a
+    # brand-new revision per click, and on a shared one, a separate
+    # client-facing round (and email) per click. Always a list now, even
+    # for a single edit, so both paths below apply the whole batch as one
+    # unit -- one new revision, or one RedlineSubmission with one
+    # RedlineEdit per item.
+    edits: list[DirectEditItem]
+
+
 @app.post("/api/generated/{generated_id}/edit")
 def edit_generated_document(
     generated_id: int,
-    body: DirectEditBody,
+    body: DirectEditsBody,
     request: Request,
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    """Owner-side direct editing: select a chunk of text right in the
-    generated document and replace it. Reuses the exact same docx-splicing
-    engine as accepted redlines (docx_engine.apply_text_edits), and saves
-    the result as a new revision so it slots into the same lineage/history
+    """Owner-side direct editing: select chunks of text right in the
+    generated document and replace/insert them, staged locally and sent
+    here as one batch. Reuses the exact same docx-splicing engine as
+    accepted redlines (docx_engine.apply_text_edits, which already groups
+    a batch by paragraph in one pass -- see its docstring), and saves the
+    result as a new revision so it slots into the same lineage/history
     trail as redlines do (see GeneratedContract.source_generated_id).
 
     Applied immediately -- no approval step -- UNLESS the document
     currently has an open share link, in which case (bug tracker #23,
     phase 5) the owner is editing something a client may already be
-    reviewing, so the edit is queued as a single client-approvable redline
-    instead of silently changing the doc out from under them. See
+    reviewing, so the whole batch is queued as one client-approvable
+    round instead of silently changing the doc out from under them. See
     RedlineSubmission.origin == "owner_edit" for how that's modeled --
     deliberately with no owner-side bypass to apply it instantly instead;
     once shared, ALL edits (direct or via redline) go through the same
@@ -1655,58 +1671,63 @@ def edit_generated_document(
     gc = _get_owned_generated(session, user, generated_id)
     if not os.path.exists(gc.file_path):
         raise HTTPException(410, "This file is no longer available.")
-    if not body.segments:
-        raise HTTPException(400, "No selection to edit.")
-    # A click-to-insert (see computeCursorPosition in app.js) sends one
-    # zero-width segment (start == end) instead of a real range -- unlike a
-    # replace, where an empty new_text is a legitimate deletion, "insert
-    # nothing at a point" has no meaningful effect, so reject it up front
-    # rather than silently writing a no-op revision. Applies to both the
-    # instant-apply and queued-for-approval paths below.
-    is_insert = all(seg["start"] == seg["end"] for seg in body.segments)
-    if is_insert and not body.new_text.strip():
-        raise HTTPException(400, "Type something to insert.")
-
-    container_path = (
-        [[int(x) for x in triple.split(",")] for triple in body.table_path.split(";")]
-        if body.table_path else []
-    )
+    if not body.edits:
+        raise HTTPException(400, "No changes to apply.")
 
     open_link = session.exec(
         select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
     ).first()
-    if open_link:
-        doc = de.load(gc.file_path)
+
+    # Validate and resolve every item up front, against the CURRENT
+    # document (read-only at this point in both branches below) -- so a
+    # batch lands whole or not at all, never half-applied because item 3
+    # turned out stale while items 1-2 had already gone through.
+    doc_for_read = de.load(gc.file_path)
+    resolved = []
+    for item in body.edits:
+        if not item.segments:
+            raise HTTPException(400, "No selection to edit.")
+        # A click-to-insert (see computeCursorPosition in app.js) sends one
+        # zero-width segment (start == end) instead of a real range --
+        # unlike a replace, where an empty new_text is a legitimate
+        # deletion, "insert nothing at a point" has no meaningful effect,
+        # so reject it up front rather than silently writing a no-op.
+        is_insert = all(seg["start"] == seg["end"] for seg in item.segments)
+        if is_insert and not item.new_text.strip():
+            raise HTTPException(400, "Type something to insert.")
+
+        container_path = (
+            [[int(x) for x in triple.split(",")] for triple in item.table_path.split(";")]
+            if item.table_path else []
+        )
         try:
-            original_text = de.extract_text_at(doc, container_path, body.paragraph_index, body.segments)
+            original_text = de.extract_text_at(doc_for_read, container_path, item.paragraph_index, item.segments)
         except de.MarkError as err:
             raise HTTPException(400, f"That selection is no longer valid: {err}")
         # Deliberately NOT .strip()'d -- unlike the no-op/label checks below
         # (which only care whether there's meaningful content), the actual
         # value spliced into the document has to preserve exact whitespace,
-        # matching the instant-apply path below which never stripped it
-        # either. Stripping here silently ate leading/trailing spaces off
-        # otherwise-meaningful text -- harmless-looking on a replace, but a
-        # real word-mashing bug for an insert (e.g. typing "written " to
-        # read "...the written effective date" came out "writteneffective").
-        new_text = body.new_text
+        # matching apply_text_edits below which never strips it either.
+        # Stripping here silently ate leading/trailing spaces off otherwise-
+        # meaningful text -- harmless-looking on a replace, but a real
+        # word-mashing bug for an insert (e.g. typing "written " to read
+        # "...the written effective date" came out "writteneffective").
+        new_text = item.new_text
         if new_text.strip() == original_text.strip():
             # is_insert is already ruled out above (empty insert rejected
             # earlier), so reaching here with new_text == original_text
             # only happens on a replace typed back to its own starting text.
             raise HTTPException(400, "That's already the current text.")
 
-        excerpt = original_text.strip()
-        if excerpt:
-            label = (excerpt[:57] + "…") if len(excerpt) > 57 else excerpt
-        else:
-            # Insert (see above) -- there's no original text to summarize,
-            # so fall back to an excerpt of what's actually being inserted
-            # instead of a generic "Custom edit."
-            inserted_stripped = new_text.strip()
-            inserted = inserted_stripped[:47] + "…" if len(inserted_stripped) > 47 else inserted_stripped
-            label = f"Inserted: {inserted}" if inserted else "Custom edit"
+        resolved.append({
+            "container_path": container_path,
+            "paragraph_index": item.paragraph_index,
+            "segments": item.segments,
+            "new_text": new_text,
+            "original_text": original_text,
+        })
 
+    if open_link:
         submission = RedlineSubmission(
             share_link_id=open_link.id, status="pending", origin="owner_edit",
             responded_at=datetime.utcnow(), client_ack_at=None,
@@ -1715,40 +1736,63 @@ def edit_generated_document(
         session.commit()
         session.refresh(submission)
 
-        edit = RedlineEdit(
-            submission_id=submission.id,
-            field_key="", label=label,
-            # proposed_value deliberately mirrors original_value (not
-            # new_text) -- the owner IS the counter, so there's no separate
-            # "what the client asked for" to record; keeping the two equal
-            # is also what lets share.js's existing counter-seeding logic
-            # (client_original_value = e.proposed_value) revert cleanly to
-            # the true original text if the client rejects this proposal.
-            original_value=original_text, proposed_value=original_text,
-            evaluation="needs_review",
-            decision="countered",
-            counter_value=new_text,
-            location_json=json.dumps({
-                "container_path": container_path,
-                "paragraph_index": body.paragraph_index,
-                "segments": body.segments,
-            }),
-        )
-        session.add(edit)
-        session.commit()
-        session.refresh(edit)
+        edits_created = []
+        for r in resolved:
+            excerpt = r["original_text"].strip()
+            if excerpt:
+                label = (excerpt[:57] + "…") if len(excerpt) > 57 else excerpt
+            else:
+                # Insert (see above) -- there's no original text to
+                # summarize, so fall back to an excerpt of what's actually
+                # being inserted instead of a generic "Custom edit."
+                inserted_stripped = r["new_text"].strip()
+                inserted = inserted_stripped[:47] + "…" if len(inserted_stripped) > 47 else inserted_stripped
+                label = f"Inserted: {inserted}" if inserted else "Custom edit"
 
-        _send_owner_edit_email(request, user, gc, open_link, edit)
-        return {"queued_for_approval": True, "submission_id": submission.id, "edit_id": edit.id}
+            edit = RedlineEdit(
+                submission_id=submission.id,
+                field_key="", label=label,
+                # proposed_value deliberately mirrors original_value (not
+                # new_text) -- the owner IS the counter, so there's no
+                # separate "what the client asked for" to record; keeping
+                # the two equal is also what lets share.js's existing
+                # counter-seeding logic (client_original_value =
+                # e.proposed_value) revert cleanly to the true original
+                # text if the client rejects this proposal.
+                original_value=r["original_text"], proposed_value=r["original_text"],
+                evaluation="needs_review",
+                decision="countered",
+                counter_value=r["new_text"],
+                location_json=json.dumps({
+                    "container_path": r["container_path"],
+                    "paragraph_index": r["paragraph_index"],
+                    "segments": r["segments"],
+                }),
+            )
+            session.add(edit)
+            edits_created.append(edit)
+        session.commit()
+        for edit in edits_created:
+            session.refresh(edit)
+
+        _send_owner_edit_email(request, user, gc, open_link, edits_created)
+        return {
+            "queued_for_approval": True,
+            "submission_id": submission.id,
+            "edit_ids": [e.id for e in edits_created],
+        }
 
     doc = de.load(gc.file_path)
     try:
-        de.apply_text_edits(doc, [{
-            "container_path": container_path,
-            "paragraph_index": body.paragraph_index,
-            "segments": body.segments,
-            "new_text": body.new_text,
-        }])
+        de.apply_text_edits(doc, [
+            {
+                "container_path": r["container_path"],
+                "paragraph_index": r["paragraph_index"],
+                "segments": r["segments"],
+                "new_text": r["new_text"],
+            }
+            for r in resolved
+        ])
     except de.MarkError as err:
         raise HTTPException(400, f"Couldn't apply that edit: {err}")
 
@@ -1994,35 +2038,40 @@ def _send_reconsideration_email(
 
 
 def _send_owner_edit_email(
-    request: Request, user: User, gc: GeneratedContract, link: ShareLink, edit: "RedlineEdit"
+    request: Request, user: User, gc: GeneratedContract, link: ShareLink, edits: "list[RedlineEdit]"
 ) -> None:
-    """One email per owner direct edit made after a document is shared (bug
-    tracker #23, phase 5) -- the owner edited the shared document directly,
-    and instead of applying instantly (the pre-share behavior, still used
-    when there's no open link) it's queued as a single client-approvable
-    redline, arriving already in the "countered" state -- see
+    """One email per batch of owner direct edits made after a document is
+    shared (bug tracker #23, phase 5; extended to whole batches once direct
+    edits could be staged and sent together -- see DirectEditsBody) -- the
+    owner edited the shared document directly, and instead of applying
+    instantly (the pre-share behavior, still used when there's no open
+    link) the whole batch is queued as one round of client-approvable
+    redlines, each arriving already in the "countered" state -- see
     RedlineSubmission.origin == "owner_edit" and edit_generated_document.
-    The client needs to know a change is waiting on them the same way
+    The client needs to know changes are waiting on them the same way
     they'd need to know about a counter to their own redline; email is the
     only channel that reaches them at all (no account, no notification
     center), same reasoning as _send_reconsideration_email above."""
     sender_name = user.name.strip() or user.email
     share_url = f"{_base_url(request)}/share/{link.token}"
+    if len(edits) == 1:
+        subject = f'{sender_name} made a change to "{gc.name}"'
+        intro = f'{sender_name} made a change to "{gc.name}" for you to review: "{edits[0].label}" → "{edits[0].counter_value}".'
+    else:
+        subject = f'{sender_name} made {len(edits)} changes to "{gc.name}"'
+        change_lines = "\n".join(f'- "{e.label}" → "{e.counter_value}"' for e in edits)
+        intro = f'{sender_name} made {len(edits)} changes to "{gc.name}" for you to review:\n\n{change_lines}'
     body = (
         f"Hi {link.client_first_name},\n\n"
-        f'{sender_name} made a change to "{gc.name}" for you to review: '
-        f'"{edit.label}" → "{edit.counter_value}".\n\n'
+        f"{intro}\n\n"
         f"Open it here:\n{share_url}\n\n"
         f"Access code: {link.access_code}\n\n"
         "- Rotely"
     )
     try:
-        ee.send_email(
-            link.client_email, f'{sender_name} made a change to "{gc.name}"', body,
-            reply_to=(link.sender_email.strip() or user.email),
-        )
+        ee.send_email(link.client_email, subject, body, reply_to=(link.sender_email.strip() or user.email))
     except RuntimeError:
-        pass  # SENDGRID_API_KEY not configured yet -- the edit still queues, just wasn't emailed
+        pass  # SENDGRID_API_KEY not configured yet -- the edits still queue, just weren't emailed
 
 
 class CreateShareBody(BaseModel):
@@ -3293,6 +3342,59 @@ def reconsider_redline_edit(
 
     _send_reconsideration_email(request, user, gc, link, new_edit)
     return {"id": new_edit.id, "submission_id": new_sub.id, "decision": new_edit.decision}
+
+
+@app.delete("/api/redline-edits/{edit_id}/withdraw")
+def withdraw_owner_edit(
+    edit_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Lets the owner pull back their own still-pending direct edit --
+    RedlineSubmission.origin == "owner_edit", see edit_generated_document --
+    before the client has acted on it. Ad hoc user report: "why would you
+    need to reconsider your own text that you just added -- and have the
+    chance to reject or approve it -- you should just have the opportunity
+    to remove it instead." Unlike Reconsider (which records a NEW decision
+    on top of something the CLIENT already decided), the owner's own
+    just-proposed edit was never the owner's call to accept/reject/counter
+    in the first place -- the owner IS the counter -- so the only sensible
+    action here is to take it back outright, not decide on it again.
+
+    Deletes the RedlineEdit (and its comment thread, if any) outright
+    rather than chaining a new decision the way Reconsider does -- there's
+    nothing for the client to see or respond to once it's gone, so unlike a
+    reconsideration there's no reason to leave a record behind. If it was
+    the submission's only edit, the now-empty RedlineSubmission is deleted
+    too, so it simply vanishes rather than lingering as an empty round in
+    the client's history."""
+    edit = _get_owned_edit(session, user, edit_id)
+    submission = session.get(RedlineSubmission, edit.submission_id)
+    if not submission or submission.origin != "owner_edit":
+        raise HTTPException(400, "Only your own pending direct edits can be removed this way.")
+    if edit.decision != "countered":
+        raise HTTPException(400, "This edit has already been resolved.")
+    # Same chain check as #26's reconsider guard just above: if a
+    # RedlineEdit has since chained back to this one via source_edit_id,
+    # the client has already responded to it (accepted/rejected/countered
+    # back), so it's no longer just sitting there waiting -- it can't be
+    # silently withdrawn out from under a response that already exists.
+    newer = session.exec(
+        select(RedlineEdit).where(RedlineEdit.source_edit_id == edit.id)
+    ).first()
+    if newer is not None:
+        raise HTTPException(400, "The client has already responded to this -- it can no longer be removed.")
+
+    for c in session.exec(select(RedlineComment).where(RedlineComment.edit_id == edit.id)).all():
+        session.delete(c)
+    session.delete(edit)
+    session.commit()
+
+    remaining = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == submission.id)).first()
+    if remaining is None:
+        session.delete(submission)
+        session.commit()
+    return {"removed": True}
 
 
 @app.get("/api/redline-edits/{edit_id}/comments")
