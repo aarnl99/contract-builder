@@ -17,16 +17,31 @@ AUTO_APPROVED = "auto_approved"
 NEEDS_REVIEW = "needs_review"
 
 _NUMERIC_RE = re.compile(r"-?\d+(\.\d+)?")
+# Characters allowed to surround the number itself: currency symbols,
+# percent sign, and whitespace. Anything else left over after the number
+# is removed means the value contains real prose, not just a decorated
+# number -- see _extract_number below.
+_DECORATION_ONLY_RE = re.compile(r"^[\s$€£%,]*$")
 
 
 def _extract_number(value: str) -> Optional[float]:
-    """Pull the first number out of a free-form value like "$45,000" or
-    "Net 45 days". Returns None if nothing numeric is found."""
+    """Pull the number out of a value like "$45,000" or "45%", but ONLY
+    when the value is nothing more than that number plus common
+    currency/percent/thousands-separator decoration. "Net 45 days" or
+    "$50,000, due within 30 days" return None (not auto-approvable) even
+    though a number is present, because auto-approval must never let text
+    the client wrote beyond the number itself get spliced into the
+    document verbatim -- see evaluate_edit, which applies the full
+    proposed_value string once this returns a number. Returns None if the
+    value doesn't unambiguously reduce to a single number."""
     if value is None:
         return None
     cleaned = value.replace(",", "")
     m = _NUMERIC_RE.search(cleaned)
     if not m:
+        return None
+    remainder = cleaned[: m.start()] + cleaned[m.end() :]
+    if not _DECORATION_ONLY_RE.match(remainder):
         return None
     try:
         return float(m.group(0))

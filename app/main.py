@@ -2302,7 +2302,14 @@ def respond_to_submission(
         if item.decision == "countered" and not item.counter_value.strip():
             raise HTTPException(400, f"Enter a counter value for \"{edit.label}\" or choose accept/reject instead.")
         edit.decision = item.decision
-        edit.counter_value = item.counter_value.strip() if item.decision == "countered" else ""
+        # #25/F7-class bug: this used to .strip() the owner's counter text
+        # before storing it, eating meaningful leading/trailing whitespace
+        # (e.g. countering with a leading space to read "...the written
+        # effective date" instead of mashing two words together). The
+        # emptiness check above deliberately still uses .strip() -- that's
+        # just "did they type anything real" -- but what gets stored/applied
+        # must be the exact value the owner typed.
+        edit.counter_value = item.counter_value if item.decision == "countered" else ""
         session.add(edit)
 
     submission.responded_at = datetime.utcnow()
@@ -2904,10 +2911,16 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
         source_edit_id = None
         is_explicit_counter_response = False
         # What actually gets stored/applied for this edit's proposed_value.
-        # Defaults to the stripped client input (existing behavior, fine for
-        # a genuinely new client-typed proposal) but gets overridden below
-        # for an accept or reject -- see the whitespace note just under.
-        final_value = proposed
+        # Defaults to the exact, UNSTRIPPED client input -- #25/F7-class bug:
+        # this used to default to the stripped comparison copy (`proposed`),
+        # silently eating a genuinely meaningful leading/trailing space on an
+        # ordinary client-typed proposal (e.g. inserting "written " before a
+        # word came out "writteneffective date" once applied). `proposed`
+        # remains the right value for the no-op/threshold-evaluation checks
+        # below, just never for what gets stored. Overridden below for an
+        # explicit accept/reject of a counter, which already used the exact
+        # unstripped value.
+        final_value = e.proposed_value
         if e.accepting_edit_id is not None and link_id is not None:
             prior = session.get(RedlineEdit, e.accepting_edit_id)
             prior_sub = session.get(RedlineSubmission, prior.submission_id) if prior else None
@@ -3233,6 +3246,22 @@ def reconsider_redline_edit(
     if edit.decision == "pending":
         raise HTTPException(400, "This redline hasn't been decided yet -- respond to it normally instead of reconsidering.")
 
+    # #26: reject reconsidering an edit that's already been reconsidered once.
+    # Without this, two separate Reconsider calls on the same edit each chain
+    # back to it via source_edit_id, producing sibling edits rather than a
+    # linear chain. superseded_edit_ids (see get_redlines and
+    # apply_redline_submission) only marks an edit superseded when something
+    # ELSE points back to it -- it can't tell a fork (two children of the same
+    # parent) from a normal chain, so neither sibling would ever be marked
+    # superseded and either could end up applied, unpredictably overriding
+    # the owner's actual latest decision. Enforcing a strictly linear chain
+    # here keeps that computation accurate.
+    newer = session.exec(
+        select(RedlineEdit).where(RedlineEdit.source_edit_id == edit.id)
+    ).first()
+    if newer is not None:
+        raise HTTPException(400, "This redline already has a newer decision -- reconsider that one instead.")
+
     submission = session.get(RedlineSubmission, edit.submission_id)
     link = session.get(ShareLink, submission.share_link_id)
     gc = session.get(GeneratedContract, link.generated_contract_id)
@@ -3251,7 +3280,10 @@ def reconsider_redline_edit(
         original_value=edit.original_value, proposed_value=edit.proposed_value,
         evaluation=edit.evaluation,
         decision=body.decision,
-        counter_value=body.counter_value.strip() if body.decision == "countered" else "",
+        # #25/F7-class bug: same fix as respond_to_submission just above --
+        # store the owner's exact reconsidered counter text, not a
+        # .strip()'d copy that silently eats meaningful whitespace.
+        counter_value=body.counter_value if body.decision == "countered" else "",
         location_json=edit.location_json,
         source_edit_id=edit.id,
     )
