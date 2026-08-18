@@ -1313,7 +1313,15 @@ async function openRedlinesModal(generatedId) {
             const supersededNote = edit.superseded
               ? el("div", { class: "decided pending", style: "font-size:11px;" }, "Superseded by a later decision below")
               : null;
-            const reconsiderBtn = el("button", { class: "btn secondary small" }, "Reconsider");
+            // #26: a superseded edit already has a newer reconsideration
+            // chained to it (see the server-side guard in
+            // reconsider_redline_edit) -- reconsidering it again would just
+            // 400. Don't offer the button at all on a row that's already
+            // been superseded; only the still-live row (the newest one in
+            // the chain) gets a working Reconsider control.
+            const reconsiderBtn = edit.superseded
+              ? null
+              : el("button", { class: "btn secondary small" }, "Reconsider");
             actions = el("div", { class: "decision-row" }, [summaryEl, supersededNote, reconsiderBtn]);
 
             // Reconsider: reopens accept/reject/counter controls for an
@@ -1322,6 +1330,7 @@ async function openRedlinesModal(generatedId) {
             // #19 in the bug tracker. Before this, a decision (especially
             // a rejection) was permanent with no way back, even after the
             // client pushed back in the comment thread below.
+            if (reconsiderBtn) {
             reconsiderBox = el("div", { style: "display:none;margin-top:8px;" });
             let reconsiderOpen = false;
             let reconsiderBuilt = false;
@@ -1376,6 +1385,7 @@ async function openRedlinesModal(generatedId) {
                   el("div", { style: "margin-top:8px;" }, [sendBtn]),
                 ])
               );
+            }
             }
           } else if (!awaitingResponse) {
             actions = el("div", { class: "decision-row" }, [el("div", { class: "decided pending" }, "No response yet")]);
