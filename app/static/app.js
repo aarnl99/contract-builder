@@ -2299,11 +2299,28 @@ function DocumentsView() {
     return folder;
   }
 
+  // #34: load() re-fires on every tab click (Active/Archived) and after
+  // every archive/delete action, and each call races an in-flight fetch
+  // from whichever tab the user was just on. Two clicks in quick
+  // succession -- Active then Archived -- send two overlapping requests,
+  // and network timing (not click order) decides which response lands
+  // last; if the slower Active response resolves after the faster
+  // Archived one, its .then callback overwrites the list with the wrong
+  // tab's documents while the tab buttons themselves still correctly show
+  // "Archived" selected -- the UI silently disagrees with itself, no error,
+  // nothing to retry. loadSeq is a monotonic "which call is this" counter:
+  // every load() bumps it and captures its own value, and both the success
+  // and error handlers bail out without touching the DOM if a newer call
+  // has since started. Whichever request is actually still the latest one
+  // requested is the only one ever allowed to render.
+  let loadSeq = 0;
   function load() {
+    const mySeq = ++loadSeq;
     listWrap.innerHTML = "";
     listWrap.appendChild(el("div", { style: "color:var(--muted);font-size:13px;" }, "Loading..."));
     api(`/api/generated?archived=${showArchived}`)
       .then((docs) => {
+        if (mySeq !== loadSeq) return; // a newer load() has since superseded this one
         listWrap.innerHTML = "";
         if (!docs.length) {
           listWrap.appendChild(
@@ -2352,6 +2369,7 @@ function DocumentsView() {
         });
       })
       .catch((e) => {
+        if (mySeq !== loadSeq) return; // a newer load() has since superseded this one -- see #34 above
         // This is the whole Documents library -- without this, a failed
         // request left it silently blank forever, indistinguishable from
         // "you have no documents."

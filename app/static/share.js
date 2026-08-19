@@ -1046,7 +1046,15 @@ function DocumentView(data) {
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving...";
     try {
-      const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null }));
+      // counter_decided: #32 -- accepting_edit_id alone doesn't tell the
+      // server whether this row was actually decided; sourceEditId stays
+      // set on a countered row from the moment it's loaded, whether or not
+      // the client has clicked Accept/Reject. counterPending only ever
+      // flips to false via acceptCounter/rejectCounter, so !counterPending
+      // is the accurate "did the client actually decide this" signal --
+      // without it, Save progress on an untouched counter used to get
+      // silently recorded server-side as accepted.
+      const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null, counter_decided: !e.counterPending }));
       await api(`/api/share/${TOKEN}/save-progress`, { method: "POST", body: { edits: editList, note: noteInput.value.trim() } });
       hasUnsavedChanges = false;
       saveNote.textContent = "Saved — come back anytime with your access code.";
@@ -1105,7 +1113,12 @@ function DocumentView(data) {
       );
       return;
     }
-    const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null }));
+    // counter_decided -- see the same field on the Save-progress payload
+    // above (#32). Every row here has already passed the stillPending
+    // check, so this is always true at Finalize; sent anyway so the
+    // server's own hard-block (submit_redlines) doesn't have to trust
+    // anything this endpoint wasn't explicitly told.
+    const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null, counter_decided: !e.counterPending }));
     if (!editList.length && !noteInput.value.trim()) {
       errBox.appendChild(el("div", { class: "error-box" }, "Suggest a change or add a comment before submitting."));
       return;
