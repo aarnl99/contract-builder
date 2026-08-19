@@ -93,7 +93,22 @@ async function api(path, opts = {}) {
 
 const app = document.getElementById("app");
 
-function render(view) {
+// Bug tracker #36: the one place every view swap in this app funnels
+// through (hashchange -> router() -> render(), but also a couple of direct
+// router() calls elsewhere, e.g. after a plan change -- see router()'s own
+// callers), so it's also the one correct place to tear down anything a view
+// attached OUTSIDE its own root element (document-level listeners, nodes
+// appended straight to document.body) that app.innerHTML = "" below won't
+// reach on its own. Optional and additive: a view that doesn't need this
+// just omits the second argument, exactly as every existing render(view)
+// call site already does.
+let _currentViewTeardown = null;
+
+function render(view, teardown) {
+  if (_currentViewTeardown) {
+    try { _currentViewTeardown(); } catch (e) { /* best-effort cleanup */ }
+  }
+  _currentViewTeardown = teardown || null;
   app.innerHTML = "";
   app.appendChild(view);
 }
@@ -2675,7 +2690,19 @@ function EditorView(templateId) {
   const contractView = el("div", { class: "contract-view" });
   contractPanel.appendChild(contractView);
   const toolbar = el("div", { class: "mark-toolbar" }, [el("button", {}, "Mark as placeholder")]);
-  document.body.appendChild(toolbar);
+  // Bug tracker #36: this used to be document.body.appendChild(toolbar) --
+  // .mark-toolbar is position:fixed, so viewport-relative placement doesn't
+  // actually need it to live outside the view's own tree, and appending it
+  // to document.body meant it (and the document-level mousedown listener
+  // below that closes over it) never got cleaned up by render()'s
+  // app.innerHTML = "" on navigation -- both just lingered forever,
+  // leaking one more dangling toolbar node and listener per visit to this
+  // page (e.g. via the Back button or any other nav away and back).
+  // Appending it to wrap instead means it's removed for free the moment
+  // this view is torn down; the listener itself is still handled
+  // separately below via wrap._teardown, since a plain DOM removal doesn't
+  // detach listeners registered on `document`.
+  wrap.appendChild(toolbar);
 
   const sidebar = el("div", { class: "sidebar" });
   const sidebarCard = el("div", { class: "card" });
@@ -2743,10 +2770,21 @@ function EditorView(templateId) {
     }, 0);
   });
 
-  document.addEventListener("mousedown", (e) => {
+  // Named (not an inline arrow) so it can actually be removed -- see
+  // wrap._teardown below and the #36 comment on the toolbar's own
+  // appendChild above.
+  function onDocMousedown(e) {
     if (e.target === toolbar || toolbar.contains(e.target)) return;
     if (!contractView.contains(e.target)) hideToolbar();
-  });
+  }
+  document.addEventListener("mousedown", onDocMousedown);
+  // Bug tracker #36: picked up by router()'s editorMatch branch and handed
+  // to render(), which calls this right before tearing down this view for
+  // whatever comes next -- without it, this listener (and its closure over
+  // toolbar/contractView, keeping both retained in memory) accumulated one
+  // more copy every time this page was visited, each one still firing on
+  // every future mousedown anywhere in the app.
+  wrap._teardown = () => document.removeEventListener("mousedown", onDocMousedown);
 
   toolbar.querySelector("button").addEventListener("click", () => {
     if (!currentSelection) return;
@@ -3568,7 +3606,14 @@ async function router() {
   if (hash.startsWith("#/draft")) return render(shell(DraftView()));
 
   const editorMatch = hash.match(/^#\/editor\/(\d+)/);
-  if (editorMatch) return render(shell(EditorView(parseInt(editorMatch[1], 10))));
+  if (editorMatch) {
+    // See render()'s #36 comment -- EditorView attaches a document-level
+    // listener that needs explicit teardown, captured here (before shell()
+    // wraps it in a fresh outer div) via the _teardown property EditorView
+    // sets on its own root element.
+    const editorView = EditorView(parseInt(editorMatch[1], 10));
+    return render(shell(editorView), editorView._teardown);
+  }
 
   location.hash = "#/draft";
 }
