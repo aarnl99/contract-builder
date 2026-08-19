@@ -3993,39 +3993,51 @@ def _process_draft_request(session: Session, user: User, req: EmailDraftRequest,
         _send_missing_info_reply(req, alias, labels, no_template=False)
         return
 
-    plan = _plan_info(session, user)
-    if plan["limit"] is not None and plan["used"] >= plan["limit"]:
-        req.status = "failed"
+    # Bug tracker #42 (found on independent review after #39 shipped): this
+    # check-then-write quota sequence is the exact same race #39 fixed in
+    # generate_contract, just reached via the inbound-email draft path
+    # instead of the Generate button. Same fix, same lock: everything from
+    # the plan check through the commit that actually spends a slot must be
+    # atomic per-user, or a user's in-flight email draft can race their own
+    # concurrent Generate call (different threads -- this endpoint's caller,
+    # inbound_email, is async/event-loop; generate_contract is sync/thread-
+    # pool) and both slip through even when only one slot remains. Reusing
+    # _generation_lock_for keeps both paths serialized against each other,
+    # not just against themselves.
+    with _generation_lock_for(user.id):
+        plan = _plan_info(session, user)
+        if plan["limit"] is not None and plan["used"] >= plan["limit"]:
+            req.status = "failed"
+            session.add(req)
+            session.commit()
+            _send_plan_limit_email(user, req)
+            return
+
+        doc = de.load(tpl.working_path)
+        field_positions = de.fill_template_tracked(doc, known_values)
+        gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
+        os.makedirs(gen_dir, exist_ok=True)
+        out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
+        de.save(doc, out_path)
+
+        safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
+        display_name = f"{safe_name} - {datetime.utcnow().strftime('%b %d, %Y')}"
+        values_snapshot = [{"label": p.label, "field_key": p.field_key, "value": known_values.get(p.field_key, "")} for p in tpl.placeholders]
+        gc = GeneratedContract(
+            owner_id=user.id, template_id=tpl.id, template_name=tpl.name, document_type=tpl.document_type,
+            name=display_name, file_path=out_path, values_json=json.dumps(values_snapshot),
+            field_positions_json=json.dumps(field_positions),
+        )
+        session.add(gc)
+        session.flush()
+        _log_generation_event(session, user.id, gc.id)
+        req.status = "done"
         session.add(req)
         session.commit()
-        _send_plan_limit_email(user, req)
-        return
-
-    doc = de.load(tpl.working_path)
-    field_positions = de.fill_template_tracked(doc, known_values)
-    gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
-    os.makedirs(gen_dir, exist_ok=True)
-    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
-    de.save(doc, out_path)
-
-    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
-    display_name = f"{safe_name} - {datetime.utcnow().strftime('%b %d, %Y')}"
-    values_snapshot = [{"label": p.label, "field_key": p.field_key, "value": known_values.get(p.field_key, "")} for p in tpl.placeholders]
-    gc = GeneratedContract(
-        owner_id=user.id, template_id=tpl.id, template_name=tpl.name, document_type=tpl.document_type,
-        name=display_name, file_path=out_path, values_json=json.dumps(values_snapshot),
-        field_positions_json=json.dumps(field_positions),
-    )
-    session.add(gc)
-    session.flush()
-    _log_generation_event(session, user.id, gc.id)
-    req.status = "done"
-    session.add(req)
-    session.commit()
-    session.refresh(gc)
-    req.generated_contract_id = gc.id
-    session.add(req)
-    session.commit()
+        session.refresh(gc)
+        req.generated_contract_id = gc.id
+        session.add(req)
+        session.commit()
 
     _send_ready_notification(user, gc, out_path)
 
