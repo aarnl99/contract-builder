@@ -4,6 +4,7 @@ import json
 import shutil
 import secrets
 import string
+import threading
 import httpx
 from collections import Counter
 from datetime import datetime, timedelta
@@ -435,6 +436,25 @@ def _plan_info(session: Session, user: User) -> dict:
         "used": used,
         "remaining": None if limit is None else max(0, limit - used),
     }
+
+
+# Bug tracker #39: per-user locks guarding generate_contract's dedup+quota
+# check against its own commit (see the long comment at that call site).
+# One Lock object per user who has ever generated a document, for the life
+# of the process -- unbounded growth in principle, but trivial in practice
+# (a plain threading.Lock is a few dozen bytes, and this is a small app,
+# not something serving millions of distinct users per process lifetime).
+_generation_locks: dict[int, threading.Lock] = {}
+_generation_locks_guard = threading.Lock()
+
+
+def _generation_lock_for(user_id: int) -> threading.Lock:
+    with _generation_locks_guard:
+        lock = _generation_locks.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            _generation_locks[user_id] = lock
+        return lock
 
 
 def _is_admin(user: Optional[User]) -> bool:
@@ -1113,61 +1133,77 @@ def generate_contract(
     # twice. Checking dedup first also means a duplicate never generates or
     # saves a second .docx to begin with, instead of generating one and
     # discarding it.
-    dedup_window = datetime.utcnow() - timedelta(seconds=15)
-    recent_dupe = session.exec(
-        select(GeneratedContract).where(
-            GeneratedContract.owner_id == user.id,
-            GeneratedContract.template_id == tpl.id,
-            GeneratedContract.values_json == values_json,
-            GeneratedContract.parties_json == parties_json,
-            GeneratedContract.created_at >= dedup_window,
+    # Bug tracker #39: everything from here through the commit below --
+    # the dedup check, the quota check, and the row that actually spends a
+    # slot -- must be atomic per-user, or two truly concurrent requests can
+    # both read the same "used" count before either has committed its new
+    # GenerationEvent, and both slip through even when only one slot (or
+    # zero) actually remains. SQLite gives no row-level "SELECT ... FOR
+    # UPDATE" to lean on here, but this whole app runs as a single Python
+    # process (one uvicorn worker, per render.yaml) with sync endpoints
+    # dispatched to a real thread pool, so a plain in-process lock, scoped
+    # per user so unrelated users' requests never wait on each other, fully
+    # closes the window. Reproduced live pre-fix with two real concurrent
+    # HTTP requests against a running server and a forced rendezvous at the
+    # quota check (deterministic, not timing-dependent): both got 200 and
+    # usage ended up over the plan limit. Verified fixed the same way:
+    # exactly one succeeds, the other gets a clean 402.
+    with _generation_lock_for(user.id):
+        dedup_window = datetime.utcnow() - timedelta(seconds=15)
+        recent_dupe = session.exec(
+            select(GeneratedContract).where(
+                GeneratedContract.owner_id == user.id,
+                GeneratedContract.template_id == tpl.id,
+                GeneratedContract.values_json == values_json,
+                GeneratedContract.parties_json == parties_json,
+                GeneratedContract.created_at >= dedup_window,
+            )
+        ).first()
+        if recent_dupe is not None:
+            preview_doc = de.load(recent_dupe.file_path)
+            return {
+                "generated_id": recent_dupe.id,
+                "name": recent_dupe.name,
+                "document_type": recent_dupe.document_type,
+                "html": de.render_paragraphs_html(preview_doc),
+                "plan": _plan_info(session, user),
+            }
+
+        plan = _plan_info(session, user)
+        if plan["limit"] is not None and plan["used"] >= plan["limit"]:
+            raise HTTPException(
+                402,
+                f"You have used all {plan['limit']} contracts included in your {user.plan} plan this month. "
+                f"Upgrade your plan to draft more.",
+            )
+
+        doc = de.load(tpl.working_path)
+        field_positions = de.fill_template_tracked(doc, body.values)
+
+        gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
+        os.makedirs(gen_dir, exist_ok=True)
+        out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
+        de.save(doc, out_path)
+
+        safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
+        display_name = f"{safe_name} - {datetime.utcnow().strftime('%b %d, %Y')}"
+
+        gc = GeneratedContract(
+            owner_id=user.id,
+            template_id=tpl.id,
+            template_name=tpl.name,
+            document_type=tpl.document_type,
+            name=display_name,
+            file_path=out_path,
+            values_json=values_json,
+            field_positions_json=json.dumps(field_positions),
+            parties_json=parties_json,
         )
-    ).first()
-    if recent_dupe is not None:
-        preview_doc = de.load(recent_dupe.file_path)
-        return {
-            "generated_id": recent_dupe.id,
-            "name": recent_dupe.name,
-            "document_type": recent_dupe.document_type,
-            "html": de.render_paragraphs_html(preview_doc),
-            "plan": _plan_info(session, user),
-        }
-
-    plan = _plan_info(session, user)
-    if plan["limit"] is not None and plan["used"] >= plan["limit"]:
-        raise HTTPException(
-            402,
-            f"You have used all {plan['limit']} contracts included in your {user.plan} plan this month. "
-            f"Upgrade your plan to draft more.",
-        )
-
-    doc = de.load(tpl.working_path)
-    field_positions = de.fill_template_tracked(doc, body.values)
-
-    gen_dir = os.path.join(_template_dir(user.id, tpl.id), "generated")
-    os.makedirs(gen_dir, exist_ok=True)
-    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
-    de.save(doc, out_path)
-
-    safe_name = re.sub(r"[^A-Za-z0-9 _\-]+", "", tpl.name).strip() or "Contract"
-    display_name = f"{safe_name} - {datetime.utcnow().strftime('%b %d, %Y')}"
-
-    gc = GeneratedContract(
-        owner_id=user.id,
-        template_id=tpl.id,
-        template_name=tpl.name,
-        document_type=tpl.document_type,
-        name=display_name,
-        file_path=out_path,
-        values_json=values_json,
-        field_positions_json=json.dumps(field_positions),
-        parties_json=parties_json,
-    )
-    session.add(gc)
-    session.flush()
-    _log_generation_event(session, user.id, gc.id)
-    session.commit()
-    session.refresh(gc)
+        session.add(gc)
+        session.flush()
+        _log_generation_event(session, user.id, gc.id)
+        session.commit()
+        session.refresh(gc)
 
     preview_doc = de.load(out_path)
     return {
@@ -3081,7 +3117,14 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
     keeps decision="pending" until the client has actually said so. link_id
     is only needed for the accepting_edit_id check, so callers that never
     pass it (there are none today, but save-progress passes it through for
-    consistency) can omit it."""
+    consistency) can omit it.
+
+    An edit whose proposed value exactly matches the current text is
+    dropped as a no-op UNLESS it carries a comment or is an explicit
+    counter response (bug tracker #35) -- share.js's commitSuggestion keeps
+    a redline client-side under that same either/or rule, so a comment-only
+    note (no value change) must still make it through here to reach the
+    owner, not be silently discarded alongside genuine no-ops."""
     tpl = session.get(Template, gc.template_id) if gc.template_id else None
     placeholders_by_key = {p.field_key: p for p in (tpl.placeholders if tpl else [])}
 
@@ -3194,8 +3237,16 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
             # it falls through to the normal "pending, needs an owner
             # decision" path with no chain recorded.
 
-        if proposed == original_text.strip() and not is_explicit_counter_response:
-            continue  # not actually a change, and not an explicit decision on a live counter either
+        # Bug tracker #35: a comment-only redline (no value change, just a
+        # note) is exactly what share.js's commitSuggestion keeps client-side
+        # for -- it stores an edit if EITHER the value changed OR a comment
+        # was entered (see share.js's commitSuggestion). This check used to
+        # test only the value, so a comment with no accompanying value change
+        # was silently dropped here before the owner ever saw it, with no
+        # error and no indication to the client that their note didn't land.
+        has_comment = bool(e.comment and e.comment.strip())
+        if proposed == original_text.strip() and not is_explicit_counter_response and not has_comment:
+            continue  # not actually a change, no comment either, and not an explicit decision on a live counter either
 
         ph = placeholders_by_key.get(e.field_key) if e.field_key else None
         evaluation = rl.evaluate_edit(ph.threshold_type, ph.threshold_config, proposed) if ph else rl.NEEDS_REVIEW
@@ -3326,16 +3377,26 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
         session.commit()
 
     submission = RedlineSubmission(share_link_id=link.id, note=body.note.strip()[:2000], status="pending")
-    # If every resolved edit is a verified counter-acceptance (see
-    # _resolve_edits/accepting_edit_id), there's nothing left for the owner
-    # to decide -- they're the one who proposed this exact value as their
-    # counter. Mark it responded immediately so it goes straight to
-    # "ready to apply" instead of sitting in the owner's queue asking them
-    # to re-approve their own counter. A submission that mixes a
-    # counter-acceptance with a genuinely new proposal still needs a real
-    # response for the new part, so this only fires when ALL of it resolved
-    # that way.
-    if resolved and all(kw["decision"] == "accepted" for kw in resolved):
+    # If every resolved edit already carries a final decision -- accepted OR
+    # rejected, via _resolve_edits/accepting_edit_id's counter-response
+    # handling -- there's nothing left for the owner to decide -- either
+    # they're the one who proposed this exact value as their counter
+    # (accepted), or the client just explicitly declined it (rejected), and
+    # either way no further response is needed. Mark it responded
+    # immediately so it goes straight to "ready to apply"/resolved instead
+    # of sitting in the owner's queue forever asking them to review a round
+    # that's already fully decided. Bug tracker #37: this used to only check
+    # for all-accepted, so a round of pure explicit counter-rejections
+    # (nothing accepted, nothing pending) never got this treatment --
+    # responded_at stayed unset forever, which stuck the owner's dashboard
+    # on "submitted, awaiting your review" and the client's own Redline
+    # History panel on "Awaiting response" for a round that was actually
+    # already fully resolved on the client's end. A submission that mixes a
+    # counter-response with a genuinely new (still-pending) proposal, or
+    # includes a comment-only edit (#35, also left "pending"), still needs
+    # a real response for that part, so this only fires when NOTHING in the
+    # round is still "pending".
+    if resolved and all(kw["decision"] != "pending" for kw in resolved):
         submission.responded_at = datetime.utcnow()
     session.add(submission)
     session.commit()
@@ -4229,7 +4290,8 @@ def admin_delete_user(
 ):
     """Permanently deletes a user account and everything that traces back to
     it: templates, generated contracts, share links + their views, redline
-    submissions/edits, email alias, and draft requests -- plus their uploads
+    submissions/edits + comment threads, generation-quota log rows, in-app
+    notifications, email alias, and draft requests -- plus their uploads
     folder on disk. Irreversible; there's no undo/soft-delete for this."""
     target = _get_admin_target(session, admin, user_id, block_self=True)
 
@@ -4250,6 +4312,17 @@ def admin_delete_user(
             ).all()
         ]
         if submission_ids:
+            edit_ids = [
+                e.id for e in session.exec(select(RedlineEdit).where(RedlineEdit.submission_id.in_(submission_ids))).all()
+            ]
+            if edit_ids:
+                # Bug tracker #38: comment threads (phase 2 of the redline
+                # overhaul) are keyed off RedlineEdit.id, not off this user
+                # directly -- deleting the edits below without first
+                # clearing their comments left every RedlineComment row
+                # dangling on a redlineedit.id that no longer existed.
+                for comment in session.exec(select(RedlineComment).where(RedlineComment.edit_id.in_(edit_ids))).all():
+                    session.delete(comment)
             for edit in session.exec(select(RedlineEdit).where(RedlineEdit.submission_id.in_(submission_ids))).all():
                 session.delete(edit)
             for sub in session.exec(select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(share_link_ids))).all():
@@ -4269,6 +4342,15 @@ def admin_delete_user(
         session.delete(alias)
     for req in session.exec(select(EmailDraftRequest).where(EmailDraftRequest.user_id == user_id)).all():
         session.delete(req)
+    # Bug tracker #38: this docstring always claimed "everything that traces
+    # back to" the user, but these two were never actually deleted --
+    # GenerationEvent (the immutable per-generation quota log) and
+    # Notification (in-app bell notifications) both carry a direct FK to
+    # this user and were left behind as orphaned rows on every deletion.
+    for event in session.exec(select(GenerationEvent).where(GenerationEvent.owner_id == user_id)).all():
+        session.delete(event)
+    for notif in session.exec(select(Notification).where(Notification.user_id == user_id)).all():
+        session.delete(notif)
 
     session.delete(target)
     session.commit()
