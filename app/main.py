@@ -417,9 +417,12 @@ def _usage_this_month(session: Session, user_id: int) -> int:
 
 def _log_generation_event(session: Session, owner_id: int, generated_contract_id: Optional[int]) -> None:
     """Call once for every successful path that creates a new
-    GeneratedContract row (fresh draft, owner edit, applied redline round,
-    inbound-email draft) -- NOT for a deduped repeat that hands back an
-    existing row without creating a new one."""
+    GeneratedContract row AND should count against the monthly plan limit:
+    fresh draft, owner edit, inbound-email draft. NOT for a deduped repeat
+    that hands back an existing row without creating a new one, and NOT for
+    an applied redline round (see apply_redline_submission's docstring --
+    that's finishing a document already in progress, not starting a new
+    one; bug tracker #29)."""
     session.add(GenerationEvent(owner_id=owner_id, generated_contract_id=generated_contract_id))
 
 
@@ -1674,8 +1677,17 @@ def edit_generated_document(
     if not body.edits:
         raise HTTPException(400, "No changes to apply.")
 
+    # Matched against the whole lineage family, not just this exact
+    # revision's id (bug tracker #28) -- an applied redline repoints the
+    # link forward to the newest revision, so checking only gc.id would
+    # miss an open link entirely when editing an older revision (e.g.
+    # reached through document history), letting the edit apply instantly
+    # instead of being queued for the client who may still be reviewing
+    # the family under that link. Same pattern get_redlines already uses.
     open_link = session.exec(
-        select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
+        select(ShareLink)
+        .where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)), ShareLink.status == "open")
+        .order_by(ShareLink.created_at.desc())
     ).first()
 
     # Validate and resolve every item up front, against the CURRENT
@@ -2035,6 +2047,16 @@ def _send_reconsideration_email(
         )
     except RuntimeError:
         pass  # SENDGRID_API_KEY not configured yet -- the reconsideration still applies, just wasn't emailed
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        # Bug tracker #33: a legacy share link (created before client email
+        # was required) can have link.client_email == "" -- SendGrid then
+        # rejects the send with a 4xx, which used to propagate as an
+        # unhandled exception AFTER the reconsideration was already
+        # committed, so the owner saw a 500 for a change that actually
+        # went through. Same "still applies, just wasn't emailed" handling
+        # as the RuntimeError case above, now covering a real send failure
+        # too, not just missing config.
+        pass
 
 
 def _send_owner_edit_email(
@@ -2072,6 +2094,52 @@ def _send_owner_edit_email(
         ee.send_email(link.client_email, subject, body, reply_to=(link.sender_email.strip() or user.email))
     except RuntimeError:
         pass  # SENDGRID_API_KEY not configured yet -- the edits still queue, just weren't emailed
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        # Bug tracker #33: see the identical comment in
+        # _send_reconsideration_email -- a legacy link's blank client_email
+        # made SendGrid reject the send, which used to blow up as an
+        # unhandled exception after the edits were already committed.
+        pass
+
+
+def _send_response_email(
+    request: Request, user: User, gc: GeneratedContract, link: ShareLink, edits: "list[RedlineEdit]"
+) -> None:
+    """One email per owner response to a client's redline round (bug
+    tracker #31) -- respond_to_submission batches the owner's accept/
+    reject/counter calls and used to just commit them with no notification
+    at all, even though the client has no account and no other way to find
+    out their round was answered (same reasoning as _send_reconsideration_
+    email and _send_owner_edit_email, which is why this mirrors their
+    shape almost exactly)."""
+    sender_name = user.name.strip() or user.email
+    share_url = f"{_base_url(request)}/share/{link.token}"
+
+    def _outcome(e: "RedlineEdit") -> str:
+        if e.decision == "countered":
+            return f'countered with "{e.counter_value}"'
+        return str(e.decision)
+
+    if len(edits) == 1:
+        subject = f'{sender_name} responded to your redline on "{gc.name}"'
+        intro = f'{sender_name} responded to your suggested change on "{gc.name}": "{edits[0].label}" is {_outcome(edits[0])}.'
+    else:
+        subject = f'{sender_name} responded to your redlines on "{gc.name}"'
+        change_lines = "\n".join(f'- "{e.label}" is {_outcome(e)}' for e in edits)
+        intro = f'{sender_name} responded to your suggested changes on "{gc.name}":\n\n{change_lines}'
+    body = (
+        f"Hi {link.client_first_name},\n\n"
+        f"{intro}\n\n"
+        f"Open it here:\n{share_url}\n\n"
+        f"Access code: {link.access_code}\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(link.client_email, subject, body, reply_to=(link.sender_email.strip() or user.email))
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the response still applies, just wasn't emailed
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        pass  # bug tracker #33 -- see _send_reconsideration_email's identical comment
 
 
 class CreateShareBody(BaseModel):
@@ -2109,11 +2177,24 @@ def create_share_link(
     client_first_name = body.client_first_name.strip()[:100]
     client_last_name = body.client_last_name.strip()[:100]
     sender_email = body.sender_email.strip()[:200]
+    # Matched against the whole lineage family (bug tracker #28), not just
+    # this exact revision's id -- otherwise sharing from a revision the
+    # link isn't currently pointed at (e.g. an older one reached through
+    # history) would miss the family's real open link and create a second,
+    # simultaneously-open one that close_share_link's own exact-id lookup
+    # could never fully close either. If the found link is pointed at a
+    # different revision, repoint it here too (mirrors apply_redline_
+    # submission's own forward-repoint) instead of leaving two open links.
     existing = session.exec(
-        select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
+        select(ShareLink)
+        .where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)), ShareLink.status == "open")
+        .order_by(ShareLink.created_at.desc())
     ).first()
     if existing:
         changed = False
+        if existing.generated_contract_id != gc.id:
+            existing.generated_contract_id = gc.id
+            changed = True
         if client_email and client_email != existing.client_email:
             existing.client_email = client_email
             changed = True
@@ -2156,13 +2237,22 @@ def close_share_link(
     session: Session = Depends(get_session),
 ):
     gc = _get_owned_generated(session, user, generated_id)
-    link = session.exec(
-        select(ShareLink).where(ShareLink.generated_contract_id == gc.id, ShareLink.status == "open")
-    ).first()
-    if not link:
+    # Matched (and closed) across the whole lineage family (bug tracker
+    # #28), not just this exact revision's id -- otherwise closing from a
+    # revision the link isn't currently pointed at would 404 with an open
+    # link still live elsewhere in the family, and a pre-existing second
+    # open link (from before create_share_link's own #28 fix) could never
+    # be closed at all through this endpoint. Closes every open link found,
+    # not just the newest, so "close" really means closed.
+    links = session.exec(
+        select(ShareLink)
+        .where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)), ShareLink.status == "open")
+    ).all()
+    if not links:
         raise HTTPException(404, "No open review link for this document.")
-    link.status = "closed"
-    session.add(link)
+    for link in links:
+        link.status = "closed"
+        session.add(link)
     session.commit()
     return {"ok": True}
 
@@ -2324,6 +2414,7 @@ class RespondBody(BaseModel):
 def respond_to_submission(
     submission_id: int,
     body: RespondBody,
+    request: Request,
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
@@ -2342,6 +2433,7 @@ def respond_to_submission(
     if not body.decisions:
         raise HTTPException(400, "Decide on at least one redline before sending a response.")
 
+    responded_edits = []
     for item in body.decisions:
         if item.decision not in ("accepted", "rejected", "countered"):
             raise HTTPException(400, "decision must be 'accepted', 'rejected', or 'countered'")
@@ -2360,11 +2452,21 @@ def respond_to_submission(
         # must be the exact value the owner typed.
         edit.counter_value = item.counter_value if item.decision == "countered" else ""
         session.add(edit)
+        responded_edits.append(edit)
 
     submission.responded_at = datetime.utcnow()
     submission.client_ack_at = None  # a new response always needs a fresh look from the client
     session.add(submission)
     session.commit()
+    for edit in responded_edits:
+        session.refresh(edit)
+    # Bug tracker #31: this used to just commit and return, with no email
+    # at all -- only the narrower reconsider/direct-edit paths notified the
+    # client. The client has no account and no other way to learn their
+    # redline round was answered, so a normal response went completely
+    # unnoticed unless they happened to revisit the link on their own.
+    if link:
+        _send_response_email(request, user, gc, link, responded_edits)
     return {"id": submission.id, "responded_at": submission.responded_at.isoformat()}
 
 
@@ -2617,7 +2719,13 @@ def apply_redline_submission(
     # shift that field's run index -- a known, narrow limitation of
     # carrying positions forward this way rather than recomputing them.
     new_gc = GeneratedContract(
-        owner_id=user.id, template_id=tpl.id, template_name=tpl.name, document_type=tpl.document_type,
+        # document_type inherited from gc (the source revision), not
+        # tpl.document_type (bug tracker #30) -- the template's type can be
+        # relabeled mid-negotiation, and stamping the CURRENT template type
+        # onto a document that was drafted and shared under the OLD type
+        # split its family across two type groups on the Documents page,
+        # with "archive/delete whole family" only ever touching one half.
+        owner_id=user.id, template_id=tpl.id, template_name=tpl.name, document_type=gc.document_type,
         name=display_name, file_path=out_path, values_json=json.dumps(values_snapshot),
         field_positions_json=gc.field_positions_json,
         parties_json=gc.parties_json,  # carry the parties forward from the original draft
@@ -2637,7 +2745,11 @@ def apply_redline_submission(
     )
     session.add(new_gc)
     session.flush()  # assigns new_gc.id, needed below to repoint the share link
-    _log_generation_event(session, user.id, new_gc.id)
+    # Deliberately NOT logged against quota (bug tracker #29) -- this
+    # function's own docstring says so ("finishing a document already in
+    # progress, not starting a new one"), but a _log_generation_event call
+    # was left in anyway, silently contradicting it and burning a plan slot
+    # every time a redline round got applied.
 
     applied_ids = {e.id for e, _ in edit_targets}
     for e in to_apply:
@@ -2799,6 +2911,22 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
                     # submit it as an ordinary fresh proposal on the next
                     # Finalize and lose the auto-decided treatment.
                     "source_edit_id": e.source_edit_id,
+                    # #32: a countered edit chained via source_edit_id but
+                    # still decision=="pending" is one the client saved
+                    # progress on WITHOUT explicitly accepting or rejecting
+                    # (see counter_decided in ShareEditBody/_resolve_edits).
+                    # share.js's draft-resume loader reads is_counter to
+                    # restore counterPending, and client_original_value as
+                    # what Reject should revert to -- without sending both
+                    # back here, resuming this draft made an untouched
+                    # counter look like an ordinary, already-settled
+                    # suggestion, silently defeating the Phase 4 Finalize
+                    # hard block the client-side counterPending check exists
+                    # to enforce. Once decided (accepted/rejected), it's
+                    # correctly resolved and shouldn't be re-asked, so
+                    # is_counter is false for those.
+                    "is_counter": bool(e.source_edit_id) and e.decision == "pending",
+                    "client_original_value": e.original_value if (e.source_edit_id and e.decision == "pending") else None,
                 }
                 for e in draft_edits
             ],
@@ -2884,18 +3012,35 @@ class ShareEditBody(BaseModel):
     # is used instead.
     label: str = ""
     location: Optional[EditLocationBody] = None
-    # Set when this edit is the client accepting a redline the owner
-    # countered (see share.js's acceptCounter) -- references the id of that
-    # earlier, now-"countered" RedlineEdit. _resolve_edits verifies this
+    # Set when this edit *originated from* a redline the owner countered --
+    # references the id of that earlier, now-"countered" RedlineEdit. Sent
+    # for every such row on every save-progress/submit call, whether or not
+    # the client has actually decided it yet (share.js keeps the row's
+    # sourceEditId set from the moment the counter is loaded). Because of
+    # that, accepting_edit_id ALONE cannot mean "the client explicitly
+    # accepted or rejected this" -- see counter_decided below, which is
+    # what actually gates that. _resolve_edits verifies the reference
     # server-side (the referenced edit really is countered, on this same
     # share link, with a counter_value matching proposed_value here) before
     # trusting it; a mismatched or missing reference is silently ignored
     # and this is treated as an ordinary new proposal instead of erroring
-    # the whole submission. When verified, the new edit is created already
-    # decided ("accepted") instead of "pending" -- there's nothing left for
-    # the owner to decide, since they're the one who dictated this exact
-    # value via their counter. See submit_redlines for what that unlocks.
+    # the whole submission. See submit_redlines for what a real decision
+    # unlocks.
     accepting_edit_id: Optional[int] = None
+    # True only when the client has explicitly clicked Accept or Reject on
+    # this countered row (share.js sends `!counterPending`, and counterPending
+    # only ever flips to false via acceptCounter/rejectCounter -- never by
+    # merely saving progress with the row untouched). #32: before this flag
+    # existed, _resolve_edits inferred "the client accepted this counter"
+    # purely from accepting_edit_id being present and the value still
+    # matching the counter -- true by default for a counter the client had
+    # never even looked at, so hitting "Save progress" on a document with an
+    # untouched counter silently recorded it as accepted, defeating the
+    # Phase 4 Finalize hard block the moment the client resumed that draft
+    # (see the /api/share/{token} draft-resume payload below, which restores
+    # counterPending from decision=="pending" + a source_edit_id, not from
+    # this flag -- this flag only matters for the save/submit direction).
+    counter_decided: bool = False
 
 
 class ShareSubmitBody(BaseModel):
@@ -2914,11 +3059,15 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
     Also resolves accepting_edit_id (see ShareEditBody): if set and it
     checks out -- the referenced edit is really "countered", belongs to a
     submission on this same link_id, and its counter_value exactly matches
-    what's being proposed here -- the returned kwargs carry decision=
-    "accepted" instead of the usual default. link_id is only needed for
-    that check, so callers that never pass accepting_edit_id (there are
-    none today, but save-progress passes it through for consistency) can
-    omit it."""
+    what's being proposed here -- the returned kwargs are chained to it via
+    source_edit_id. Whether that also resolves the decision to "accepted"/
+    "rejected" (instead of leaving it "pending") depends on counter_decided
+    (see ShareEditBody and #32) -- an unresolved counter still gets chained
+    (so submit's hard-block and the draft-resume payload can find it) but
+    keeps decision="pending" until the client has actually said so. link_id
+    is only needed for the accepting_edit_id check, so callers that never
+    pass it (there are none today, but save-progress passes it through for
+    consistency) can omit it."""
     tpl = session.get(Template, gc.template_id) if gc.template_id else None
     placeholders_by_key = {p.field_key: p for p in (tpl.placeholders if tpl else [])}
 
@@ -2985,9 +3134,24 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
                 # client who countered the sender's counter (rather than
                 # taking it as-is) lost the link back to the negotiation
                 # entirely, and the sender saw an unrelated fresh redline.
+                # Chained even when the client hasn't decided yet (see
+                # counter_decided just below) -- #32: submit's hard-block and
+                # the draft-resume payload both need to find this row via
+                # source_edit_id regardless of whether it's resolved, or an
+                # unresolved counter saved via Save-progress would come back
+                # from resume looking like an ordinary, already-settled edit.
                 source_edit_id = e.accepting_edit_id
                 is_explicit_counter_response = True
-                if prior.counter_value.strip() == proposed:
+                if not e.counter_decided:
+                    # #32: the client hasn't clicked Accept or Reject on this
+                    # row -- it's chained (above) so it isn't lost, but stays
+                    # "pending" rather than being inferred as accepted just
+                    # because the untouched value still equals the counter.
+                    # That inference used to fire unconditionally here,
+                    # which is exactly what let a plain "Save progress" on an
+                    # untouched counter silently record it as accepted.
+                    pass
+                elif prior.counter_value.strip() == proposed:
                     # Accepting the sender's counter verbatim -- use their
                     # exact counter_value (unstripped), not the generically
                     # re-.strip()'d client echo of it. Matters most for a
@@ -3006,6 +3170,11 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
                     # Use the exact live text, not a re-derived/stripped copy.
                     decision = "rejected"
                     final_value = original_text
+                # else: counter_decided but neither an exact accept nor a
+                # plain revert-to-original -- the client suggested something
+                # else entirely (the "Suggest edit" option). Falls through
+                # as a fresh pending proposal for the owner, still chained
+                # via source_edit_id so the negotiation history stays intact.
             # A missing/mismatched reference isn't an error -- it just means
             # this isn't (or is no longer) a response to a live counter, so
             # it falls through to the normal "pending, needs an owner
@@ -3120,7 +3289,16 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     # error surfaces as soon as the client clicks Finalize, but the real
     # gate is here: nothing this endpoint accepts can leave a counter
     # silently unresolved.
-    still_unresolved = _unresolved_countered_edit_ids(session, link.id) - {kw["source_edit_id"] for kw in resolved if kw["source_edit_id"]}
+    #
+    # #32: being *referenced* via accepting_edit_id isn't enough on its own
+    # -- share.js sends that reference for a still-undecided counter row
+    # too (see counter_decided on ShareEditBody), so gating on "referenced
+    # by something in `resolved`" alone would let an untouched counter slip
+    # through this exact endpoint. Read counter_decided straight off the
+    # submitted body (not off `resolved`, which only carries the fields a
+    # RedlineEdit row itself stores) for what actually counts as decided.
+    decided_source_ids = {e.accepting_edit_id for e in body.edits if e.accepting_edit_id is not None and e.counter_decided}
+    still_unresolved = _unresolved_countered_edit_ids(session, link.id) - decided_source_ids
     if still_unresolved:
         raise HTTPException(400, "Decide on the sender's countered change(s) before finalizing -- accept, reject, or suggest something else for each one.")
 
