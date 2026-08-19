@@ -2182,9 +2182,7 @@ def create_share_link(
     # link isn't currently pointed at (e.g. an older one reached through
     # history) would miss the family's real open link and create a second,
     # simultaneously-open one that close_share_link's own exact-id lookup
-    # could never fully close either. If the found link is pointed at a
-    # different revision, repoint it here too (mirrors apply_redline_
-    # submission's own forward-repoint) instead of leaving two open links.
+    # could never fully close either.
     existing = session.exec(
         select(ShareLink)
         .where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)), ShareLink.status == "open")
@@ -2193,8 +2191,24 @@ def create_share_link(
     if existing:
         changed = False
         if existing.generated_contract_id != gc.id:
-            existing.generated_contract_id = gc.id
-            changed = True
+            # Repoint FORWARD only -- never backward. This endpoint is also
+            # what the Share modal calls (with no client fields) just to
+            # fetch/display the current link whenever it's opened, and the
+            # modal is reachable from ANY revision's detail panel, including
+            # an older one sitting in the document's history. Repointing
+            # unconditionally here (as an earlier version of this fix did)
+            # meant simply *opening* the Share modal from an old revision --
+            # not even submitting anything -- silently dragged a link a
+            # client might be mid-negotiation on backward to a stale
+            # document, with no "updated since your last visit" flag either
+            # (unlike apply_redline_submission's own forward-repoint, which
+            # is safe by construction since its new revision is always the
+            # newest). Only move the pointer if gc is actually at least as
+            # new as whatever the link currently targets.
+            current_target = session.get(GeneratedContract, existing.generated_contract_id)
+            if current_target is None or gc.created_at >= current_target.created_at:
+                existing.generated_contract_id = gc.id
+                changed = True
         if client_email and client_email != existing.client_email:
             existing.client_email = client_email
             changed = True
