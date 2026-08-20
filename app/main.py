@@ -457,6 +457,29 @@ def _generation_lock_for(user_id: int) -> threading.Lock:
         return lock
 
 
+# Bug tracker #48: mark_placeholder's field_key uniqueness is only enforced
+# by a check-then-insert (_unique_field_key SELECTs existing keys, the
+# caller INSERTs several lines later, with a docx load/mutate/save in
+# between) and Placeholder.field_key has no DB-level unique constraint. Two
+# genuinely concurrent /mark requests on the same template (double-submit,
+# two tabs) can both compute the same field_key and both insert it -- and,
+# separately, both read-modify-write the same working_path .docx file, so
+# whichever save lands second silently clobbers the first mark. Same shape
+# of bug as #39/#42, same fix: a per-template lock around the whole
+# read-check-mutate-write-commit critical section.
+_template_mutation_locks: dict[int, threading.Lock] = {}
+_template_mutation_locks_guard = threading.Lock()
+
+
+def _template_mutation_lock_for(template_id: int) -> threading.Lock:
+    with _template_mutation_locks_guard:
+        lock = _template_mutation_locks.get(template_id)
+        if lock is None:
+            lock = threading.Lock()
+            _template_mutation_locks[template_id] = lock
+        return lock
+
+
 def _is_admin(user: Optional[User]) -> bool:
     return bool(user) and user.email.strip().lower() == ADMIN_EMAIL
 
@@ -561,7 +584,15 @@ def list_notifications(user: User = Depends(get_current_user), session: Session 
     rows = session.exec(
         select(Notification).where(Notification.user_id == user.id).order_by(Notification.created_at.desc()).limit(50)
     ).all()
-    unread_count = len([n for n in rows if n.read_at is None])
+    # Bug tracker #47: unread_count used to be derived only from the 50 rows
+    # fetched for display, so once an account passed 50 total notifications,
+    # any unread one older than the 50 most recent silently dropped out of
+    # the count -- the bell badge understated how many were actually unread.
+    # Counted independently here, unbounded by the display limit.
+    unread_rows = session.exec(
+        select(Notification).where(Notification.user_id == user.id, Notification.read_at.is_(None))
+    ).all()
+    unread_count = len(unread_rows)
     return {"notifications": [_notification_payload(n) for n in rows], "unread_count": unread_count}
 
 
@@ -853,6 +884,11 @@ def mark_placeholder(
     if not body.segments:
         raise HTTPException(400, "No text was selected.")
 
+    with _template_mutation_lock_for(tpl.id):
+        return _mark_placeholder_locked(tpl, body, session)
+
+
+def _mark_placeholder_locked(tpl: Template, body: "MarkBody", session: Session):
     reuse_key = body.existing_field_key.strip()
     existing_placeholder = None
     if reuse_key:
@@ -1945,6 +1981,45 @@ def set_archived(
 @app.delete("/api/generated/{generated_id}")
 def delete_generated_forever(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     gc = _get_owned_generated(session, user, generated_id)
+
+    # Bug tracker #46: this was a true hard delete of the GeneratedContract
+    # row and its file, but never touched any ShareLink still pointing at
+    # it (or that link's RedlineSubmission/RedlineEdit/RedlineComment
+    # history). The link stayed "open" against a generated_contract_id that
+    # no longer existed -- a client with a still-valid share session could
+    # keep posting comments into that void: the write silently succeeded,
+    # the owner notification silently no-op'd (its owner lookup came back
+    # None), and there was no way for the owner to ever see it, even though
+    # "permanently delete... cannot be undone" implied the whole thing was
+    # gone. Scoped to links whose CURRENT pointer is this exact document --
+    # not the whole lineage family the way archive/create_share_link/
+    # close_share_link match -- so deleting one old revision doesn't tear
+    # down an unrelated, still-open negotiation that's live on a surviving
+    # sibling revision in the same family.
+    dangling_links = session.exec(
+        select(ShareLink).where(ShareLink.generated_contract_id == gc.id)
+    ).all()
+    if dangling_links:
+        link_ids = [link.id for link in dangling_links]
+        submissions = session.exec(
+            select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(link_ids))
+        ).all()
+        submission_ids = [s.id for s in submissions]
+        if submission_ids:
+            edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id.in_(submission_ids))).all()
+            edit_ids = [e.id for e in edits]
+            if edit_ids:
+                for comment in session.exec(select(RedlineComment).where(RedlineComment.edit_id.in_(edit_ids))).all():
+                    session.delete(comment)
+            for edit in edits:
+                session.delete(edit)
+            for sub in submissions:
+                session.delete(sub)
+        for view in session.exec(select(ShareLinkView).where(ShareLinkView.share_link_id.in_(link_ids))).all():
+            session.delete(view)
+        for link in dangling_links:
+            session.delete(link)
+
     if gc.file_path and os.path.exists(gc.file_path):
         try:
             os.remove(gc.file_path)
