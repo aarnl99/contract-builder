@@ -341,15 +341,15 @@ def extract_text_at(doc: Document, container_path: Optional[List[List[int]]], pa
     return "".join(parts)
 
 
-def _apply_paragraph_group(paragraph: Paragraph, group: List[dict]) -> None:
-    """Rebuild one paragraph's runs, applying every edit in `group` (each
-    {"segments": [...], "new_text": str}) in a single pass over the
-    paragraph's ORIGINAL run list. All edits' segments were captured by the
-    browser against that same original layout, so this must not re-query
-    paragraph.runs between edits -- doing so one at a time would shift run
-    indices out from under any edit sharing this paragraph."""
-    original_runs = list(paragraph.runs)
-
+def _tag_and_check_overlaps(original_runs: List, group: List[dict]) -> List[tuple]:
+    """Shared by _apply_paragraph_group and validate_no_overlaps (bug
+    tracker #44): normalizes every edit's segments in `group` against
+    `original_runs` (a paragraph's original, pre-edit run list) into
+    (run_index, start, end, group_index) tuples, validates each segment's
+    run index and offsets are in bounds, and raises MarkError if any two
+    edits in the group land on overlapping offsets within the same run.
+    Returns the tagged, sorted list so callers that go on to actually
+    splice text (_apply_paragraph_group) don't have to redo this pass."""
     tagged = []  # (run_index, start, end, group_index)
     for g_idx, e in enumerate(group):
         for seg in e["segments"]:
@@ -369,6 +369,19 @@ def _apply_paragraph_group(paragraph: Paragraph, group: List[dict]) -> None:
         r, s, _, _ = tagged[i]
         if r == pr and s < pe:
             raise MarkError("Overlapping redline selections can't be applied together")
+
+    return tagged
+
+
+def _apply_paragraph_group(paragraph: Paragraph, group: List[dict]) -> None:
+    """Rebuild one paragraph's runs, applying every edit in `group` (each
+    {"segments": [...], "new_text": str}) in a single pass over the
+    paragraph's ORIGINAL run list. All edits' segments were captured by the
+    browser against that same original layout, so this must not re-query
+    paragraph.runs between edits -- doing so one at a time would shift run
+    indices out from under any edit sharing this paragraph."""
+    original_runs = list(paragraph.runs)
+    tagged = _tag_and_check_overlaps(original_runs, group)
 
     segs_by_run: Dict[int, List[tuple]] = {}
     for r_idx, s, e, g_idx in tagged:
@@ -408,6 +421,23 @@ def _apply_paragraph_group(paragraph: Paragraph, group: List[dict]) -> None:
             parent_el.remove(r_element)
 
 
+def _group_edits_by_paragraph(edits: List[dict]) -> Dict[tuple, List[dict]]:
+    """Groups a batch of edits (each with "container_path"/"paragraph_index"
+    /"segments") by which paragraph they land in, so every edit sharing a
+    paragraph can be validated/applied together in one pass instead of
+    invalidating each other's recorded run indices. Shared by
+    apply_text_edits and validate_no_overlaps (bug tracker #44) so both
+    apply the exact same overlap rule to the exact same grouping."""
+    groups: Dict[tuple, List[dict]] = {}
+    path_by_key: Dict[tuple, List[List[int]]] = {}
+    for e in edits:
+        cp = e.get("container_path") or []
+        key = (_path_str(cp), e["paragraph_index"])
+        path_by_key[key] = cp
+        groups.setdefault(key, []).append(e)
+    return groups, path_by_key
+
+
 def apply_text_edits(doc: Document, edits: List[dict]) -> None:
     """Apply a batch of redline text replacements directly onto an
     already-generated document -- unlike mark_placeholder, which inserts a
@@ -417,13 +447,7 @@ def apply_text_edits(doc: Document, edits: List[dict]) -> None:
     by paragraph so multiple edits landing in the same paragraph are applied
     together in one pass (see _apply_paragraph_group) instead of
     invalidating each other's recorded run indices."""
-    groups: Dict[tuple, List[dict]] = {}
-    path_by_key: Dict[tuple, List[List[int]]] = {}
-    for e in edits:
-        cp = e.get("container_path") or []
-        key = (_path_str(cp), e["paragraph_index"])
-        path_by_key[key] = cp
-        groups.setdefault(key, []).append(e)
+    groups, path_by_key = _group_edits_by_paragraph(edits)
 
     for key, group in groups.items():
         container_path = path_by_key[key]
@@ -433,6 +457,38 @@ def apply_text_edits(doc: Document, edits: List[dict]) -> None:
         if p_idx < 0 or p_idx >= len(paragraphs):
             raise MarkError("Invalid paragraph index")
         _apply_paragraph_group(paragraphs[p_idx], group)
+
+
+def validate_no_overlaps(doc: Document, edits: List[dict]) -> None:
+    """Bug tracker #44: check a batch of proposed edits (same shape as
+    apply_text_edits -- "container_path"/"paragraph_index"/"segments") for
+    same-run overlaps WITHOUT writing anything, so a caller can reject a
+    bad batch up front, before creating any database rows for it.
+
+    Before this existed, only the instant-apply path (which calls
+    apply_text_edits, and so gets this check "for free" via
+    _apply_paragraph_group) was protected. The shared/queued batch path
+    (edit_generated_document's open_link branch) staged each edit
+    independently with no overlap check at all -- two overlapping edits in
+    the same owner batch would both queue successfully, and the overlap
+    would only surface much later, at Apply time, by which point the
+    client had already accepted both and there was no in-app way to undo
+    that. Calling this up front, on the same `doc`/`resolved` data already
+    used to validate each edit individually, closes that gap for good --
+    the batch is refused before a single RedlineSubmission/RedlineEdit row
+    ever gets created for it, exactly matching the instant-apply path's
+    existing fail-closed behavior."""
+    groups, path_by_key = _group_edits_by_paragraph(edits)
+
+    for key, group in groups.items():
+        container_path = path_by_key[key]
+        container = _resolve_container(doc, container_path)
+        paragraphs = container.paragraphs
+        p_idx = key[1]
+        if p_idx < 0 or p_idx >= len(paragraphs):
+            raise MarkError("Invalid paragraph index")
+        original_runs = list(paragraphs[p_idx].runs)
+        _tag_and_check_overlaps(original_runs, group)
 
 
 def mark_placeholder(

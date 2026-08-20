@@ -1825,6 +1825,24 @@ def edit_generated_document(
             "original_text": original_text,
         })
 
+    # Bug tracker #44: reject a batch containing two edits that overlap the
+    # same run BEFORE creating anything for it, on either path. The
+    # instant-apply branch below already gets this for free (it calls
+    # de.apply_text_edits, which raises via _apply_paragraph_group before
+    # anything is saved), but the queued/shared branch used to stage each
+    # item independently with no such check -- both overlapping edits would
+    # queue successfully, and the client could go on to accept both, at
+    # which point the overlap would only surface at Apply time, long after
+    # they'd already been explicitly accepted and could no longer be
+    # withdrawn (withdraw_owner_edit only works on a still-"countered"
+    # edit) -- permanently stranding that round with no in-app way out.
+    # Checking here, up front, against the same doc_for_read/resolved data
+    # already used above, closes that gap for both branches uniformly.
+    try:
+        de.validate_no_overlaps(doc_for_read, resolved)
+    except de.MarkError as err:
+        raise HTTPException(400, f"Those edits overlap and can't be batched together: {err}")
+
     if open_link:
         submission = RedlineSubmission(
             share_link_id=open_link.id, status="pending", origin="owner_edit",
