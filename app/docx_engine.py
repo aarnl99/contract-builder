@@ -267,6 +267,55 @@ def _remove_range_from_run(run, start: int, end: int) -> None:
         parent_el.remove(r_element)
 
 
+def _utf16_offset_to_codepoint(text: str, utf16_offset: int) -> int:
+    """Convert a UTF-16 code-unit offset (as produced by browser
+    Range.startOffset/endOffset and Node.textContent.length -- see app.js's
+    and share.js's computeCursorPosition/computeSelectionSegments) into the
+    equivalent Python string index into `text`.
+
+    Python strings index by codepoint; JavaScript strings index by UTF-16
+    code unit. Every character is 1:1 EXCEPT characters outside the Basic
+    Multilingual Plane (ord(ch) > 0xFFFF -- some emoji, some rare CJK
+    Extension B+ ideographs, mathematical alphanumeric symbols, etc.), which
+    take 2 UTF-16 code units but remain a single Python codepoint. A run
+    containing even one such character before the split point makes a raw
+    JS offset diverge from the correct Python index by one unit per such
+    character -- silently slicing at the wrong boundary (or splitting a
+    surrogate pair) instead of erroring. Bug tracker #49.
+    """
+    if utf16_offset <= 0:
+        return 0
+    units = 0
+    for i, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units >= utf16_offset:
+            return i + 1
+    # utf16_offset exceeds the text's total UTF-16 length -- a genuinely
+    # out-of-range offset (bad/stale client data), not a legitimate "select
+    # to the end of the run" case (that's already handled above: the loop's
+    # final iteration returns len(text) once cumulative units reach
+    # utf16_offset exactly). Returning it UNCHANGED here, rather than
+    # clamping to len(text), matters: a codepoint contributes at most as
+    # many UTF-16 units as itself, so the text's total UTF-16 length is
+    # always >= len(text) -- meaning utf16_offset here is guaranteed >
+    # len(text) too, so the caller's existing bounds check
+    # (0 <= start <= end <= len(text)) still correctly rejects it as
+    # invalid instead of silently clamping a bad offset into a valid one.
+    return utf16_offset
+
+
+def _normalize_segment_offsets(seg: dict, text: str) -> dict:
+    """Return a copy of `seg` with start/end converted from UTF-16 code-unit
+    offsets (as sent by the browser) to Python codepoint offsets against the
+    given run's CURRENT text -- see _utf16_offset_to_codepoint. Every
+    consumer below indexes `run.text` by codepoint, so this must run before
+    any bounds-check or slicing sees the raw offsets. Bug tracker #49."""
+    norm = dict(seg)
+    norm["start"] = _utf16_offset_to_codepoint(text, seg["start"])
+    norm["end"] = _utf16_offset_to_codepoint(text, seg["end"])
+    return norm
+
+
 def extract_text_at(doc: Document, container_path: Optional[List[List[int]]], paragraph_index: int, segments: List[dict]) -> str:
     """Read back the exact text currently at a given (container, paragraph,
     run-segments) location. Used server-side to derive a redline edit's
@@ -285,6 +334,7 @@ def extract_text_at(doc: Document, container_path: Optional[List[List[int]]], pa
         if r_idx < 0 or r_idx >= len(runs):
             raise MarkError(f"Invalid run index {r_idx}")
         text = runs[r_idx].text or ""
+        seg = _normalize_segment_offsets(seg, text)
         if not (0 <= seg["start"] <= seg["end"] <= len(text)):
             raise MarkError(f"Invalid offsets for run {r_idx}")
         parts.append(text[seg["start"]:seg["end"]])
@@ -306,7 +356,9 @@ def _apply_paragraph_group(paragraph: Paragraph, group: List[dict]) -> None:
             r_idx = seg["r"]
             if r_idx < 0 or r_idx >= len(original_runs):
                 raise MarkError(f"Invalid run index {r_idx}")
-            run_len = len(original_runs[r_idx].text or "")
+            run_text = original_runs[r_idx].text or ""
+            seg = _normalize_segment_offsets(seg, run_text)
+            run_len = len(run_text)
             if not (0 <= seg["start"] <= seg["end"] <= run_len):
                 raise MarkError(f"Invalid offsets for run {r_idx}")
             tagged.append((r_idx, seg["start"], seg["end"], g_idx))
@@ -411,13 +463,17 @@ def mark_placeholder(
 
     segments = sorted(segments, key=lambda s: s["r"])
 
+    normalized_segments = []
     for seg in segments:
         r_idx = seg["r"]
         if r_idx < 0 or r_idx >= len(original_runs):
             raise MarkError(f"Invalid run index {r_idx}")
-        run_text_len = len(original_runs[r_idx].text or "")
-        if not (0 <= seg["start"] <= seg["end"] <= run_text_len):
+        run_text = original_runs[r_idx].text or ""
+        seg = _normalize_segment_offsets(seg, run_text)
+        if not (0 <= seg["start"] <= seg["end"] <= len(run_text)):
             raise MarkError(f"Invalid offsets for run {r_idx}")
+        normalized_segments.append(seg)
+    segments = normalized_segments
 
     token_text = token_for(field_key)
     first_seg = segments[0]

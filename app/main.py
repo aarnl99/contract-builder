@@ -925,7 +925,21 @@ def _mark_placeholder_locked(tpl: Template, body: "MarkBody", session: Session):
         current_text = de.extract_text_at(doc, container_path, body.paragraph_index, [s.dict() for s in body.segments])
     except de.MarkError as e:
         raise HTTPException(400, str(e))
-    if body.expected_text and current_text != body.expected_text:
+    # Bug tracker #50: this guard used to be opt-in -- `if body.expected_text
+    # and ...` -- so a request that simply omitted expected_text (a stale
+    # client build, or a crafted request) skipped the staleness comparison
+    # entirely, with nothing left to catch it but extract_text_at's own
+    # in-bounds check (which only confirms the offsets are numerically valid
+    # for whatever text is THERE NOW, not that it's the text the owner
+    # actually selected). app.js itself never sends this field empty (see
+    # MarkBody.expected_text's docstring), so requiring it here just closes
+    # the loophole without affecting any real caller.
+    if not body.expected_text:
+        raise HTTPException(
+            400,
+            "That selection is no longer valid -- please reselect the text and try again.",
+        )
+    if current_text != body.expected_text:
         raise HTTPException(
             400,
             "That selection is no longer valid -- the document changed since you selected this text. Please reselect and try again.",
@@ -2722,6 +2736,37 @@ def apply_redline_submission(
         ).all()
         superseded_edit_ids = {e.source_edit_id for e in all_sibling_edits if e.source_edit_id}
 
+    # Bug tracker #50: an edit's `evaluation` (auto_approved | needs_review)
+    # is computed once, at submit time (_resolve_edits), against the
+    # field's threshold rule AS IT EXISTED THEN. It's never recomputed
+    # after that. If the owner tightens, changes, or removes a field's
+    # threshold_type/threshold_config (PATCH .../threshold) any time
+    # between a client's submission and the owner clicking Apply, an edit
+    # that was auto_approved under the OLD rule would otherwise still get
+    # silently spliced into the document here as if today's rule agreed
+    # with that call -- the same "decision made against stale state" shape
+    # apply_redline_submission already guards against for document TEXT
+    # (see the staleness check below), just for the threshold RULE instead.
+    # Re-deriving the evaluation fresh, against each field's CURRENT
+    # threshold config, closes that gap. An explicit owner accept
+    # (decision == "accepted") is a real human decision and is never
+    # second-guessed here -- only the auto-approval path is re-checked.
+    placeholders_by_key = {p.field_key: p for p in tpl.placeholders if p.field_key}
+
+    def _still_applyable(e: "RedlineEdit") -> bool:
+        if e.decision == "accepted":
+            return True
+        if e.decision != "pending" or e.evaluation != "auto_approved":
+            return False
+        ph = placeholders_by_key.get(e.field_key) if e.field_key else None
+        if ph is None:
+            # Free-text edit (no field_key, no threshold rule) or the
+            # field was deleted since submission -- either way there's no
+            # live rule to re-confirm auto-approval against, so this can't
+            # be trusted as still auto-approved.
+            return False
+        return rl.evaluate_edit(ph.threshold_type, ph.threshold_config, e.proposed_value) == rl.AUTO_APPROVED
+
     # Fold in every other submission on this link that's been responded to
     # (the owner has decided on it) but never applied -- see the docstring
     # above. edit_to_folded_sub tracks which sibling submission each folded
@@ -2742,8 +2787,7 @@ def apply_redline_submission(
             s_edits = session.exec(select(RedlineEdit).where(RedlineEdit.submission_id == s.id)).all()
             relevant = [
                 e for e in s_edits
-                if e.id not in superseded_edit_ids
-                and (e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved"))
+                if e.id not in superseded_edit_ids and _still_applyable(e)
             ]
             if relevant:
                 folded_in_subs.append(s)
@@ -2753,8 +2797,7 @@ def apply_redline_submission(
 
     to_apply = [
         e for e in edits
-        if e.id not in superseded_edit_ids
-        and (e.decision == "accepted" or (e.decision == "pending" and e.evaluation == "auto_approved"))
+        if e.id not in superseded_edit_ids and _still_applyable(e)
     ]
     if not to_apply:
         raise HTTPException(400, "No accepted edits to apply yet.")
