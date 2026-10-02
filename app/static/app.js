@@ -1310,6 +1310,78 @@ async function openShareModal(generatedId) {
 }
 
 // ---------------------------------------------------------------------------
+// Upload a document straight to e-signature, skipping Draft entirely --
+// for a contract someone else already wrote, or a one-off the owner
+// doesn't want turned into a reusable master document. Posts to
+// /api/documents/upload-for-signature, then immediately opens the normal
+// openSignatureModal intake form for the document it creates -- from that
+// point on it's indistinguishable from any other document.
+// ---------------------------------------------------------------------------
+
+function openUploadForSignatureModal(onDone) {
+  document.querySelectorAll(".panel-overlay, .modal-overlay").forEach((o) => o.remove());
+  const overlay = el("div", { class: "modal-overlay" });
+
+  const nameInput = el("input", { type: "text", placeholder: "Defaults to the file name" });
+  const typeSelect = el("select", {}, state.documentTypes.map((t) => el("option", { value: t }, t)));
+  const customTypeInput = el("input", { type: "text", placeholder: "Type a custom document type", style: "display:none;margin-top:8px;" });
+  typeSelect.appendChild(el("option", { value: "__custom__" }, "Custom..."));
+  typeSelect.addEventListener("change", () => {
+    customTypeInput.style.display = typeSelect.value === "__custom__" ? "block" : "none";
+  });
+  const fileInput = el("input", { type: "file", accept: ".docx" });
+  const errBox = el("div", {});
+  const uploadBtn = el("button", { class: "btn" }, "Upload and continue");
+
+  uploadBtn.addEventListener("click", async () => {
+    errBox.innerHTML = "";
+    if (!fileInput.files[0]) {
+      errBox.appendChild(el("div", { class: "error-box" }, "Choose a .docx file first."));
+      return;
+    }
+    const docType = typeSelect.value === "__custom__" ? customTypeInput.value.trim() || "Other" : typeSelect.value;
+    const fd = new FormData();
+    fd.append("name", nameInput.value.trim());
+    fd.append("document_type", docType);
+    fd.append("file", fileInput.files[0]);
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = "Uploading...";
+    try {
+      const res = await fetch("/api/documents/upload-for-signature", { method: "POST", body: fd, credentials: "same-origin" });
+      if (!res.ok) {
+        let msg = res.statusText || `Something went wrong (error ${res.status}). Please try again.`;
+        try {
+          const data = await res.json();
+          msg = (data && (typeof data.detail === "object" ? data.detail.message : data.detail)) || msg;
+        } catch (e) {}
+        throw new Error(msg);
+      }
+      const doc = await res.json();
+      overlay.remove();
+      if (typeof onDone === "function") onDone();
+      openSignatureModal(doc.generated_id);
+    } catch (e) {
+      errBox.appendChild(el("div", { class: "error-box" }, e.message));
+    } finally {
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = "Upload and continue";
+    }
+  });
+
+  const modal = el("div", { class: "modal" }, [
+    el("h2", {}, "Upload document to sign"),
+    el("p", { class: "subtitle" }, "Send a document straight out for signature -- no need to draft it here first."),
+    el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Word document (.docx)"), fileInput]),
+    el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Document name"), nameInput]),
+    el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Document type"), typeSelect, customTypeInput]),
+    errBox,
+    el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), uploadBtn]),
+  ]);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+}
+
+// ---------------------------------------------------------------------------
 // E-signature: send a finished document out through DocuSeal for signing.
 // Mirrors openShareModal's shape (intake form -> created-state view) but for
 // /api/generated/{id}/signature-request instead of /share. See the
@@ -2308,6 +2380,13 @@ function DocumentsView() {
     });
   });
   toolbar.appendChild(tabsRow);
+  // A document someone else drafted (or a one-off the owner doesn't want
+  // to turn into a reusable master document) can be sent straight out for
+  // signature without ever going through Draft -- see
+  // openUploadForSignatureModal / POST /api/documents/upload-for-signature.
+  toolbar.appendChild(
+    el("button", { class: "btn secondary", style: "margin-left:auto;", onclick: () => openUploadForSignatureModal(load) }, "Upload document to sign")
+  );
   wrap.appendChild(toolbar);
 
   const listWrap = el("div", {});
