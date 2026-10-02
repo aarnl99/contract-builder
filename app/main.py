@@ -499,6 +499,33 @@ def _template_mutation_lock_for(template_id: int) -> threading.Lock:
         return lock
 
 
+# Bug tracker #51: create_signature_request's "is one already pending for
+# this document?" check and its eventual SigningRequest insert had no lock
+# between them -- same shape as #39/#42/#48. Two genuinely concurrent
+# sends (two tabs, or a client/owner double-submit racing the frontend's
+# own disable-while-sending guard) could both pass the check and both
+# create a live SigningRequest + DocuSeal submission for the same
+# document. Worse than those other three: get_signature_request and
+# cancel_signature_request only ever look at the single newest/first
+# matching row, so the earlier one becomes a permanently invisible, still-
+# pending, uncancelable-in-app signing request that already emailed the
+# client a separate signing link. Reproduced live with two genuinely
+# concurrent HTTP requests against a real running server: both committed
+# separate SigningRequest rows. Same fix shape: a per-document lock around
+# the whole check-through-create critical section.
+_signature_request_locks: dict[int, threading.Lock] = {}
+_signature_request_locks_guard = threading.Lock()
+
+
+def _signature_request_lock_for(generated_id: int) -> threading.Lock:
+    with _signature_request_locks_guard:
+        lock = _signature_request_locks.get(generated_id)
+        if lock is None:
+            lock = threading.Lock()
+            _signature_request_locks[generated_id] = lock
+        return lock
+
+
 def _is_admin(user: Optional[User]) -> bool:
     return bool(user) and user.email.strip().lower() == ADMIN_EMAIL
 
@@ -2667,100 +2694,109 @@ def create_signature_request(
     unlike ShareLink, a new revision never silently repoints an in-flight
     signature request; sending a later revision for signature is its own
     new request. Refuses if one is already pending for this exact
-    document, since DocuSeal already has a live submission for it."""
-    gc = _get_owned_generated(session, user, generated_id)
+    document, since DocuSeal already has a live submission for it.
 
-    existing = session.exec(
-        select(SigningRequest)
-        .where(SigningRequest.generated_contract_id == gc.id, SigningRequest.status == "pending")
-    ).first()
-    if existing:
-        raise HTTPException(400, "A signature request is already pending for this document. Cancel it first to send a new one.")
+    Bug tracker #51: the whole check-through-create sequence below runs
+    under a per-document lock (_signature_request_lock_for) -- without it,
+    two genuinely concurrent sends for the same document could both pass
+    the "already pending?" check and both create a live SigningRequest +
+    DocuSeal submission, and only the newest one is ever visible/
+    cancelable afterward (see get_signature_request/cancel_signature_
+    request, which both only look at one row). Reproduced live pre-fix."""
+    with _signature_request_lock_for(generated_id):
+        gc = _get_owned_generated(session, user, generated_id)
 
-    client_name = body.client_name.strip()[:200]
-    client_email = body.client_email.strip()[:200]
-    if not client_name or not client_email:
-        raise HTTPException(400, "Enter the client's name and email.")
-    if not _EMAIL_ADDR_RE.fullmatch(client_email):
-        raise HTTPException(400, "That doesn't look like a valid client email address.")
+        existing = session.exec(
+            select(SigningRequest)
+            .where(SigningRequest.generated_contract_id == gc.id, SigningRequest.status == "pending")
+        ).first()
+        if existing:
+            raise HTTPException(400, "A signature request is already pending for this document. Cancel it first to send a new one.")
 
-    signer_specs = [{"role": "Client", "name": client_name, "email": client_email}]
-    if body.include_sender:
-        sender_name = body.sender_name.strip()[:200] or user.name.strip() or user.email
-        sender_email = body.sender_email.strip()[:200] or user.email
-        if not _EMAIL_ADDR_RE.fullmatch(sender_email):
-            raise HTTPException(400, "That doesn't look like a valid sender email address.")
-        signer_specs.append({"role": "Sender", "name": sender_name, "email": sender_email})
+        client_name = body.client_name.strip()[:200]
+        client_email = body.client_email.strip()[:200]
+        if not client_name or not client_email:
+            raise HTTPException(400, "Enter the client's name and email.")
+        if not _EMAIL_ADDR_RE.fullmatch(client_email):
+            raise HTTPException(400, "That doesn't look like a valid client email address.")
 
-    if not gc.file_path or not os.path.exists(gc.file_path):
-        raise HTTPException(404, "This document's file is missing on disk and can't be sent for signature.")
+        signer_specs = [{"role": "Client", "name": client_name, "email": client_email}]
+        if body.include_sender:
+            sender_name = body.sender_name.strip()[:200] or user.name.strip() or user.email
+            sender_email = body.sender_email.strip()[:200] or user.email
+            if not _EMAIL_ADDR_RE.fullmatch(sender_email):
+                raise HTTPException(400, "That doesn't look like a valid sender email address.")
+            signer_specs.append({"role": "Sender", "name": sender_name, "email": sender_email})
 
-    sig_dir = os.path.join(UPLOADS_DIR, str(user.id), "signatures")
-    os.makedirs(sig_dir, exist_ok=True)
-    prepped_path = os.path.join(sig_dir, f"{gc.id}_{secrets.token_hex(6)}_for_signature.docx")
-    try:
-        de.append_signature_block(
-            gc.file_path, prepped_path,
-            [{"role": s["role"], "label": f'{s["name"]} ({s["role"]})'} for s in signer_specs],
-            anchor_paragraph_index=body.signature_anchor_paragraph_index,
-        )
-        with open(prepped_path, "rb") as f:
-            prepped_bytes = f.read()
+        if not gc.file_path or not os.path.exists(gc.file_path):
+            raise HTTPException(404, "This document's file is missing on disk and can't be sent for signature.")
 
-        submitters_resp = ds.create_submission_from_docx(
-            name=gc.name,
-            file_bytes=prepped_bytes,
-            file_name=f"{gc.name}.docx",
-            submitters=[{"role": s["role"], "email": s["email"], "name": s["name"]} for s in signer_specs],
-        )
-    except RuntimeError as e:
-        raise HTTPException(400, str(e))  # DOCUSEAL_API_KEY not configured
-    except httpx.HTTPStatusError as e:
-        detail = "DocuSeal rejected this request."
-        if e.response.status_code in (401, 403):
-            detail = "DocuSeal rejected the API key. Check DOCUSEAL_API_KEY."
-        elif e.response.status_code == 422:
-            detail = "DocuSeal couldn't process this document for signing. Sending from DOCX requires a Pro/Cloud Sandbox DocuSeal plan."
-        raise HTTPException(502, detail)
-    except httpx.RequestError:
-        raise HTTPException(502, "Couldn't reach DocuSeal. Try again in a moment.")
-    finally:
+        sig_dir = os.path.join(UPLOADS_DIR, str(user.id), "signatures")
+        os.makedirs(sig_dir, exist_ok=True)
+        prepped_path = os.path.join(sig_dir, f"{gc.id}_{secrets.token_hex(6)}_for_signature.docx")
         try:
-            os.remove(prepped_path)
-        except OSError:
-            pass
+            de.append_signature_block(
+                gc.file_path, prepped_path,
+                [{"role": s["role"], "label": f'{s["name"]} ({s["role"]})'} for s in signer_specs],
+                anchor_paragraph_index=body.signature_anchor_paragraph_index,
+            )
+            with open(prepped_path, "rb") as f:
+                prepped_bytes = f.read()
 
-    if not submitters_resp or not submitters_resp.get("submitters"):
-        raise HTTPException(502, "DocuSeal returned an empty response.")
-    submission_id = submitters_resp["id"]
-    sr = SigningRequest(generated_contract_id=gc.id, docuseal_submission_id=submission_id)
-    session.add(sr)
-    session.commit()
-    session.refresh(sr)
+            submitters_resp = ds.create_submission_from_docx(
+                name=gc.name,
+                file_bytes=prepped_bytes,
+                file_name=f"{gc.name}.docx",
+                submitters=[{"role": s["role"], "email": s["email"], "name": s["name"]} for s in signer_specs],
+            )
+        except RuntimeError as e:
+            raise HTTPException(400, str(e))  # DOCUSEAL_API_KEY not configured
+        except httpx.HTTPStatusError as e:
+            detail = "DocuSeal rejected this request."
+            if e.response.status_code in (401, 403):
+                detail = "DocuSeal rejected the API key. Check DOCUSEAL_API_KEY."
+            elif e.response.status_code == 422:
+                detail = "DocuSeal couldn't process this document for signing. Sending from DOCX requires a Pro/Cloud Sandbox DocuSeal plan."
+            raise HTTPException(502, detail)
+        except httpx.RequestError:
+            raise HTTPException(502, "Couldn't reach DocuSeal. Try again in a moment.")
+        finally:
+            try:
+                os.remove(prepped_path)
+            except OSError:
+                pass
 
-    by_email = {item["email"]: item for item in submitters_resp["submitters"]}
-    signers = []
-    for spec in signer_specs:
-        item = by_email.get(spec["email"])
-        if not item:
-            continue  # shouldn't happen -- DocuSeal echoes back every submitter we sent
-        signer = SigningRequestSigner(
-            signing_request_id=sr.id,
-            docuseal_submitter_id=item["id"],
-            role=spec["role"],
-            name=spec["name"],
-            email=spec["email"],
-            token=secrets.token_urlsafe(24),
-            embed_src=item.get("embed_src", ""),
-        )
-        session.add(signer)
-        signers.append(signer)
-    session.commit()
-    for signer in signers:
-        session.refresh(signer)
-        _send_signature_request_email(request, user, gc, signer)
+        if not submitters_resp or not submitters_resp.get("submitters"):
+            raise HTTPException(502, "DocuSeal returned an empty response.")
+        submission_id = submitters_resp["id"]
+        sr = SigningRequest(generated_contract_id=gc.id, docuseal_submission_id=submission_id)
+        session.add(sr)
+        session.commit()
+        session.refresh(sr)
 
-    return _signing_request_payload(sr, signers)
+        by_email = {item["email"]: item for item in submitters_resp["submitters"]}
+        signers = []
+        for spec in signer_specs:
+            item = by_email.get(spec["email"])
+            if not item:
+                continue  # shouldn't happen -- DocuSeal echoes back every submitter we sent
+            signer = SigningRequestSigner(
+                signing_request_id=sr.id,
+                docuseal_submitter_id=item["id"],
+                role=spec["role"],
+                name=spec["name"],
+                email=spec["email"],
+                token=secrets.token_urlsafe(24),
+                embed_src=item.get("embed_src", ""),
+            )
+            session.add(signer)
+            signers.append(signer)
+        session.commit()
+        for signer in signers:
+            session.refresh(signer)
+            _send_signature_request_email(request, user, gc, signer)
+
+        return _signing_request_payload(sr, signers)
 
 
 @app.get("/api/generated/{generated_id}/signature-request")
