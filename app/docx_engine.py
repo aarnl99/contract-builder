@@ -40,6 +40,7 @@ import re
 from typing import Dict, List, Optional
 
 from docx import Document
+from docx.shared import Pt
 from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run as DocxRun
@@ -606,3 +607,43 @@ def list_tokens(doc: Document) -> List[str]:
             if m:
                 found.append(m.group(1))
     return found
+
+
+def append_signature_block(path: str, out_path: str, signers: List[Dict]) -> None:
+    """Appends a signature block to the end of the document at `path` and
+    saves the result to `out_path`, leaving the original untouched. Used
+    only when preparing a copy of a generated contract to send through
+    DocuSeal for e-signature (see docuseal_engine.create_submission_from_docx)
+    -- never touches the live GeneratedContract.file_path, so the document a
+    client already reviewed/downloaded is never mutated just because it was
+    later sent out for signature.
+
+    `signers`: list of {"role": str, "label": str} in signing order, e.g.
+    [{"role": "Client", "label": "Jane Doe (Acme Inc.)"}]. For each one,
+    appends a labeled paragraph plus DocuSeal's own "{{...;type=signature}}"
+    / "{{...;type=datenow}}" text-tag syntax, which DocuSeal parses into
+    real fillable fields at submission time -- see
+    https://www.docuseal.com/docs/api#create-a-submission-from-docx. The
+    `role` here must exactly match the `role` passed for the corresponding
+    submitter in the DocuSeal API call, or the tag won't bind to the right
+    signer.
+
+    Deliberately just a brand-new paragraph appended at the very end of the
+    document body -- doesn't touch any existing paragraph, run, or table,
+    so it doesn't go anywhere near the offset-tracking machinery the rest of
+    this file is built around (this module's own known-tricky surface --
+    see the F5/F6/#49 bug-tracker entries) and can't reintroduce any of
+    those classes of bug."""
+    doc = load(path)
+    doc.add_page_break()
+    heading = doc.add_paragraph()
+    heading_run = heading.add_run("Signatures")
+    heading_run.bold = True
+    heading_run.font.size = Pt(13)
+    for signer in signers:
+        role = signer["role"]
+        label = signer.get("label") or role
+        doc.add_paragraph(label)
+        doc.add_paragraph("{{%s Signature;type=signature;role=%s;required=true}}" % (role, role))
+        doc.add_paragraph("Date: {{%s Date;type=datenow;role=%s}}" % (role, role))
+    doc.save(out_path)

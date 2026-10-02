@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import shutil
 import secrets
 import string
@@ -22,11 +23,13 @@ from .db import init_db, get_session, UPLOADS_DIR, DATA_DIR
 from .models import (
     User, Template, Placeholder, GeneratedContract, GenerationEvent, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
     ShareLink, ShareLinkView, RedlineSubmission, RedlineEdit, RedlineComment, EmailAlias, EmailDraftRequest, Notification,
+    SigningRequest, SigningRequestSigner,
 )
 from .auth import hash_password, verify_password, validate_password_strength, get_current_user, get_optional_user
 from . import docx_engine as de
 from . import redline_engine as rl
 from . import email_engine as ee
+from . import docuseal_engine as ds
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SECRET_KEY_PATH = os.path.join(BASE_DIR, "secret.key")
@@ -2052,6 +2055,36 @@ def delete_generated_forever(generated_id: int, user: User = Depends(get_current
         for link in dangling_links:
             session.delete(link)
 
+    # Same class of gap #46 fixed for ShareLink: a SigningRequest pointing at
+    # this exact document must not survive a hard delete of it. Scoped to
+    # this exact generated_id, matching how SigningRequest itself is scoped
+    # (see its model docstring) -- a hard delete of one revision shouldn't
+    # touch an in-flight signature request on a different revision.
+    signing_requests = session.exec(
+        select(SigningRequest).where(SigningRequest.generated_contract_id == gc.id)
+    ).all()
+    for sr in signing_requests:
+        if sr.status == "pending":
+            try:
+                ds.archive_submission(sr.docuseal_submission_id)
+            except (RuntimeError, httpx.HTTPStatusError, httpx.RequestError):
+                pass  # best-effort -- the local rows are deleted either way, below
+        for signer in session.exec(
+            select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
+        ).all():
+            if signer.photo_path and os.path.exists(signer.photo_path):
+                try:
+                    os.remove(signer.photo_path)
+                except OSError:
+                    pass
+            session.delete(signer)
+        if sr.signed_file_path and os.path.exists(sr.signed_file_path):
+            try:
+                os.remove(sr.signed_file_path)
+            except OSError:
+                pass
+        session.delete(sr)
+
     if gc.file_path and os.path.exists(gc.file_path):
         try:
             os.remove(gc.file_path)
@@ -2412,6 +2445,434 @@ def close_share_link(
         session.add(link)
     session.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# E-signature: send a finished document out through DocuSeal for signing.
+#
+# Scope for v1 (see the project's e-signature design notes for the fuller
+# reasoning): exactly two possible roles, "Client" (always) and "Sender"
+# (the account owner's own business, optional, off by default) -- not an
+# arbitrary signer list. Before a signer ever sees DocuSeal's own signing
+# form, they land on Rotely's own /sign/{token} page, where they explicitly
+# consent and a photo is captured -- see SigningRequestSigner's model
+# docstring for why that's a deterrent/record, not identity verification.
+# Real completion state is driven entirely by DocuSeal's webhook (verified
+# via HMAC, see docuseal_engine.verify_webhook_signature), never by the
+# browser's own `completed` event, per DocuSeal's own security guidance.
+# ---------------------------------------------------------------------------
+
+_SIGNATURE_ROLES = ("Client", "Sender")
+
+
+def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
+    return {
+        "id": sr.id,
+        "status": sr.status,
+        "created_at": sr.created_at.isoformat(),
+        "completed_at": sr.completed_at.isoformat() if sr.completed_at else None,
+        "signed_document_available": bool(sr.signed_file_path and os.path.exists(sr.signed_file_path)),
+        "signers": [
+            {
+                "role": s.role,
+                "name": s.name,
+                "email": s.email,
+                "status": s.status,
+                "sign_url": f"/sign/{s.token}",
+                "consent_given_at": s.consent_given_at.isoformat() if s.consent_given_at else None,
+                "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                "has_photo": bool(s.photo_path),
+            }
+            for s in signers
+        ],
+    }
+
+
+def _send_signature_request_email(request: Request, user: User, gc: GeneratedContract, signer: SigningRequestSigner) -> None:
+    sender_name = user.name.strip() or user.email
+    sign_url = f"{_base_url(request)}/sign/{signer.token}"
+    first_name = signer.name.split(" ")[0] if signer.name else "there"
+    body = (
+        f"Hi {first_name},\n\n"
+        f'{sender_name} sent you "{gc.name}" to sign.\n\n'
+        f"Open it here:\n{sign_url}\n\n"
+        "You'll be asked to agree to a quick photo step before signing -- this is "
+        "part of the signing record, not a separate account or download.\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(signer.email, f'{sender_name} sent you "{gc.name}" to sign', body)
+    except RuntimeError:
+        pass  # SENDGRID_API_KEY not configured yet -- the request still exists, just wasn't emailed
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        pass  # matches bug tracker #33's handling elsewhere -- a bad address shouldn't break the request itself
+
+
+def _send_signature_completed_email(user: User, gc: GeneratedContract) -> None:
+    """Deliberately a direct email, not a call to _notify -- see that
+    function's docstring: the in-app bell is intentionally scoped to just
+    two redline-specific triggers, and this isn't one of them."""
+    body = f'Hi,\n\nEveryone has signed "{gc.name}". The signed document is in your Rotely documents library.\n\n- Rotely'
+    try:
+        ee.send_email(user.email, f'Fully signed: "{gc.name}"', body)
+    except RuntimeError:
+        pass
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        pass
+
+
+class CreateSignatureRequestBody(BaseModel):
+    client_name: str
+    client_email: str
+    include_sender: bool = False
+    sender_name: str = ""
+    sender_email: str = ""
+
+
+@app.post("/api/generated/{generated_id}/signature-request")
+def create_signature_request(
+    generated_id: int,
+    body: CreateSignatureRequestBody,
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Sends gc's exact current file out through DocuSeal for signing.
+    Scoped to this exact GeneratedContract id, not its lineage family --
+    unlike ShareLink, a new revision never silently repoints an in-flight
+    signature request; sending a later revision for signature is its own
+    new request. Refuses if one is already pending for this exact
+    document, since DocuSeal already has a live submission for it."""
+    gc = _get_owned_generated(session, user, generated_id)
+
+    existing = session.exec(
+        select(SigningRequest)
+        .where(SigningRequest.generated_contract_id == gc.id, SigningRequest.status == "pending")
+    ).first()
+    if existing:
+        raise HTTPException(400, "A signature request is already pending for this document. Cancel it first to send a new one.")
+
+    client_name = body.client_name.strip()[:200]
+    client_email = body.client_email.strip()[:200]
+    if not client_name or not client_email:
+        raise HTTPException(400, "Enter the client's name and email.")
+    if not _EMAIL_ADDR_RE.fullmatch(client_email):
+        raise HTTPException(400, "That doesn't look like a valid client email address.")
+
+    signer_specs = [{"role": "Client", "name": client_name, "email": client_email}]
+    if body.include_sender:
+        sender_name = body.sender_name.strip()[:200] or user.name.strip() or user.email
+        sender_email = body.sender_email.strip()[:200] or user.email
+        if not _EMAIL_ADDR_RE.fullmatch(sender_email):
+            raise HTTPException(400, "That doesn't look like a valid sender email address.")
+        signer_specs.append({"role": "Sender", "name": sender_name, "email": sender_email})
+
+    if not gc.file_path or not os.path.exists(gc.file_path):
+        raise HTTPException(404, "This document's file is missing on disk and can't be sent for signature.")
+
+    sig_dir = os.path.join(UPLOADS_DIR, str(user.id), "signatures")
+    os.makedirs(sig_dir, exist_ok=True)
+    prepped_path = os.path.join(sig_dir, f"{gc.id}_{secrets.token_hex(6)}_for_signature.docx")
+    try:
+        de.append_signature_block(
+            gc.file_path, prepped_path,
+            [{"role": s["role"], "label": f'{s["name"]} ({s["role"]})'} for s in signer_specs],
+        )
+        with open(prepped_path, "rb") as f:
+            prepped_bytes = f.read()
+
+        submitters_resp = ds.create_submission_from_docx(
+            name=gc.name,
+            file_bytes=prepped_bytes,
+            file_name=f"{gc.name}.docx",
+            submitters=[{"role": s["role"], "email": s["email"], "name": s["name"]} for s in signer_specs],
+        )
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))  # DOCUSEAL_API_KEY not configured
+    except httpx.HTTPStatusError as e:
+        detail = "DocuSeal rejected this request."
+        if e.response.status_code in (401, 403):
+            detail = "DocuSeal rejected the API key. Check DOCUSEAL_API_KEY."
+        elif e.response.status_code == 422:
+            detail = "DocuSeal couldn't process this document for signing. Sending from DOCX requires a Pro/Cloud Sandbox DocuSeal plan."
+        raise HTTPException(502, detail)
+    except httpx.RequestError:
+        raise HTTPException(502, "Couldn't reach DocuSeal. Try again in a moment.")
+    finally:
+        try:
+            os.remove(prepped_path)
+        except OSError:
+            pass
+
+    if not submitters_resp:
+        raise HTTPException(502, "DocuSeal returned an empty response.")
+    submission_id = submitters_resp[0]["submission_id"]
+    sr = SigningRequest(generated_contract_id=gc.id, docuseal_submission_id=submission_id)
+    session.add(sr)
+    session.commit()
+    session.refresh(sr)
+
+    by_email = {item["email"]: item for item in submitters_resp}
+    signers = []
+    for spec in signer_specs:
+        item = by_email.get(spec["email"])
+        if not item:
+            continue  # shouldn't happen -- DocuSeal echoes back every submitter we sent
+        signer = SigningRequestSigner(
+            signing_request_id=sr.id,
+            docuseal_submitter_id=item["id"],
+            role=spec["role"],
+            name=spec["name"],
+            email=spec["email"],
+            token=secrets.token_urlsafe(24),
+            embed_src=item.get("embed_src", ""),
+        )
+        session.add(signer)
+        signers.append(signer)
+    session.commit()
+    for signer in signers:
+        session.refresh(signer)
+        _send_signature_request_email(request, user, gc, signer)
+
+    return _signing_request_payload(sr, signers)
+
+
+@app.get("/api/generated/{generated_id}/signature-request")
+def get_signature_request(
+    generated_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    gc = _get_owned_generated(session, user, generated_id)
+    sr = session.exec(
+        select(SigningRequest)
+        .where(SigningRequest.generated_contract_id == gc.id)
+        .order_by(SigningRequest.created_at.desc())
+    ).first()
+    if not sr:
+        return {"exists": False}
+    signers = session.exec(
+        select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
+    ).all()
+    return {"exists": True, **_signing_request_payload(sr, signers)}
+
+
+@app.post("/api/generated/{generated_id}/signature-request/cancel")
+def cancel_signature_request(
+    generated_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    gc = _get_owned_generated(session, user, generated_id)
+    sr = session.exec(
+        select(SigningRequest)
+        .where(SigningRequest.generated_contract_id == gc.id, SigningRequest.status == "pending")
+    ).first()
+    if not sr:
+        raise HTTPException(404, "No pending signature request for this document.")
+    try:
+        ds.archive_submission(sr.docuseal_submission_id)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except httpx.HTTPStatusError:
+        raise HTTPException(502, "DocuSeal couldn't cancel this request. Try again.")
+    except httpx.RequestError:
+        raise HTTPException(502, "Couldn't reach DocuSeal. Try again in a moment.")
+    sr.status = "cancelled"
+    session.add(sr)
+    session.commit()
+    return {"ok": True}
+
+
+@app.get("/api/generated/{generated_id}/signature-request/download")
+def download_signed_document(
+    generated_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    gc = _get_owned_generated(session, user, generated_id)
+    sr = session.exec(
+        select(SigningRequest)
+        .where(SigningRequest.generated_contract_id == gc.id, SigningRequest.status == "completed")
+        .order_by(SigningRequest.created_at.desc())
+    ).first()
+    if not sr or not sr.signed_file_path or not os.path.exists(sr.signed_file_path):
+        raise HTTPException(404, "No signed document available for this document yet.")
+    safe_name = re.sub(r"[^A-Za-z0-9 _-]", "", gc.name).strip() or "document"
+    return FileResponse(sr.signed_file_path, filename=f"{safe_name} (signed).pdf", media_type="application/pdf")
+
+
+def _get_signer_or_404(session: Session, token: str) -> SigningRequestSigner:
+    signer = session.exec(select(SigningRequestSigner).where(SigningRequestSigner.token == token)).first()
+    if not signer:
+        raise HTTPException(404, "Signing link not found.")
+    return signer
+
+
+@app.get("/api/sign/{token}")
+def get_sign_status(token: str, session: Session = Depends(get_session)):
+    """Public (no account) -- mirrors GET /api/share/{token}'s no-login
+    model. The DocuSeal embed URL is only ever included once consent has
+    actually been recorded (status != awaiting_consent); until then, the
+    client literally cannot reach DocuSeal's signing form through this
+    page, which is the whole point of gating it here first."""
+    signer = _get_signer_or_404(session, token)
+    sr = session.get(SigningRequest, signer.signing_request_id)
+    gc = session.get(GeneratedContract, sr.generated_contract_id) if sr else None
+    owner = session.get(User, gc.owner_id) if gc else None
+    return {
+        "document_name": gc.name if gc else "",
+        "sender_name": (owner.name.strip() or owner.email) if owner else "",
+        "signer_name": signer.name,
+        "role": signer.role,
+        "status": signer.status,
+        "request_status": sr.status if sr else "",
+        "embed_src": signer.embed_src if signer.status != "awaiting_consent" else None,
+    }
+
+
+class SignConsentBody(BaseModel):
+    consent: bool = False
+    photo: str = ""  # data URL, e.g. "data:image/jpeg;base64,...."
+
+
+_MAX_CONSENT_PHOTO_BYTES = 8 * 1024 * 1024  # 8MB -- generous for a browser-captured selfie, matches the spirit of #15's upload cap
+
+
+@app.post("/api/sign/{token}/consent")
+def submit_sign_consent(token: str, body: SignConsentBody, session: Session = Depends(get_session)):
+    """Records consent + a photo, then (and only then) unlocks the actual
+    DocuSeal signing form for this signer -- see get_sign_status. Does
+    nothing to the signature itself; the photo is a record stored
+    alongside the request, not sent to or checked by DocuSeal."""
+    signer = _get_signer_or_404(session, token)
+    if signer.status != "awaiting_consent":
+        raise HTTPException(400, "You've already completed this step.")
+    if not body.consent:
+        raise HTTPException(400, "You must agree to continue.")
+    if not body.photo or "," not in body.photo:
+        raise HTTPException(400, "A photo is required before continuing.")
+
+    header, _, b64data = body.photo.partition(",")
+    try:
+        photo_bytes = base64.b64decode(b64data, validate=True)
+    except ValueError:
+        raise HTTPException(400, "That photo couldn't be read. Try again.")
+    if not photo_bytes:
+        raise HTTPException(400, "That photo couldn't be read. Try again.")
+    if len(photo_bytes) > _MAX_CONSENT_PHOTO_BYTES:
+        raise HTTPException(400, "That photo is too large.")
+
+    sr = session.get(SigningRequest, signer.signing_request_id)
+    gc = session.get(GeneratedContract, sr.generated_contract_id) if sr else None
+    owner_id = gc.owner_id if gc else 0
+    photo_dir = os.path.join(UPLOADS_DIR, str(owner_id), "signatures", str(signer.signing_request_id))
+    os.makedirs(photo_dir, exist_ok=True)
+    ext = "png" if "image/png" in header else "jpg"
+    photo_path = os.path.join(photo_dir, f"signer_{signer.id}_consent.{ext}")
+    with open(photo_path, "wb") as f:
+        f.write(photo_bytes)
+
+    signer.consent_given_at = datetime.utcnow()
+    signer.photo_path = photo_path
+    signer.photo_captured_at = datetime.utcnow()
+    signer.status = "ready_to_sign"
+    session.add(signer)
+    session.commit()
+    return {"ok": True, "embed_src": signer.embed_src}
+
+
+@app.post("/api/webhooks/docuseal")
+async def docuseal_webhook(request: Request, session: Session = Depends(get_session)):
+    """Verified via HMAC (see docuseal_engine.verify_webhook_signature) --
+    an unverified or unconfigured secret rejects with 401 and changes
+    nothing, by construction of that function. This is the ONLY thing
+    allowed to mark a SigningRequest/SigningRequestSigner completed; the
+    browser's own `completed` event from <docuseal-form> (see sign.js) is
+    treated purely as a UI hint, per DocuSeal's own security guidance."""
+    raw_body = await request.body()
+    signature = request.headers.get("X-Docuseal-Signature", "")
+    if not ds.verify_webhook_signature(raw_body, signature, ds.DOCUSEAL_WEBHOOK_SECRET):
+        raise HTTPException(401, "Invalid webhook signature.")
+
+    try:
+        payload = json.loads(raw_body)
+    except ValueError:
+        raise HTTPException(400, "Invalid JSON.")
+    event_type = payload.get("event_type", "")
+    data = payload.get("data", {}) or {}
+
+    if event_type == "form.completed":
+        submitter_id = data.get("id")
+        signer = session.exec(
+            select(SigningRequestSigner).where(SigningRequestSigner.docuseal_submitter_id == submitter_id)
+        ).first()
+        if signer and signer.status != "completed":
+            signer.status = "completed"
+            signer.completed_at = datetime.utcnow()
+            session.add(signer)
+            session.commit()
+
+    elif event_type == "form.declined":
+        submitter_id = data.get("id")
+        signer = session.exec(
+            select(SigningRequestSigner).where(SigningRequestSigner.docuseal_submitter_id == submitter_id)
+        ).first()
+        if signer:
+            signer.status = "declined"
+            session.add(signer)
+            sr = session.get(SigningRequest, signer.signing_request_id)
+            if sr and sr.status == "pending":
+                sr.status = "declined"
+                session.add(sr)
+            session.commit()
+
+    elif event_type == "submission.completed":
+        submission_id = data.get("id")
+        sr = session.exec(
+            select(SigningRequest).where(SigningRequest.docuseal_submission_id == submission_id)
+        ).first()
+        if sr and sr.status != "completed":
+            sr.status = "completed"
+            sr.completed_at = datetime.utcnow()
+            gc = session.get(GeneratedContract, sr.generated_contract_id)
+            try:
+                docs_resp = ds.get_submission_documents(submission_id)
+                doc_url = (docs_resp.get("documents") or [{}])[0].get("url")
+                if doc_url and gc:
+                    signed_bytes = ds.download_document(doc_url)
+                    sig_dir = os.path.join(UPLOADS_DIR, str(gc.owner_id), "signatures", str(sr.id))
+                    os.makedirs(sig_dir, exist_ok=True)
+                    signed_path = os.path.join(sig_dir, "signed.pdf")
+                    with open(signed_path, "wb") as f:
+                        f.write(signed_bytes)
+                    sr.signed_file_path = signed_path
+            except (RuntimeError, httpx.HTTPStatusError, httpx.RequestError, IndexError, KeyError):
+                # The submission IS fully signed regardless -- a failure here
+                # just means we download the PDF later. Owner-side download
+                # already checks os.path.exists(signed_file_path), and the
+                # file can always be fetched from DocuSeal's dashboard
+                # directly as a fallback in the meantime.
+                pass
+            session.add(sr)
+            session.commit()
+            if gc:
+                owner = session.get(User, gc.owner_id)
+                if owner:
+                    _send_signature_completed_email(owner, gc)
+
+    elif event_type == "submission.expired":
+        submission_id = data.get("id")
+        sr = session.exec(
+            select(SigningRequest).where(SigningRequest.docuseal_submission_id == submission_id)
+        ).first()
+        if sr and sr.status == "pending":
+            sr.status = "expired"
+            session.add(sr)
+            session.commit()
+
+    return {"ok": True}
+
 
 
 @app.get("/api/generated/{generated_id}/redlines")
@@ -4480,6 +4941,30 @@ def admin_delete_user(
         for link in session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(generated_ids))).all():
             session.delete(link)
 
+    if generated_ids:
+        # Same reasoning as delete_generated_forever above -- SigningRequest/
+        # SigningRequestSigner carry a direct FK to a GeneratedContract, not
+        # to the user, so they'd otherwise be left dangling by this sweep
+        # the same way ShareLink was before bug tracker #38 added the
+        # equivalent for RedlineComment. Files on disk (consent photos,
+        # signed PDFs) live under this user's uploads folder either way and
+        # are cleaned up by the shutil.rmtree below -- no separate
+        # os.remove needed here, unlike the single-document delete above.
+        signing_request_ids = [
+            sr.id for sr in session.exec(
+                select(SigningRequest).where(SigningRequest.generated_contract_id.in_(generated_ids))
+            ).all()
+        ]
+        if signing_request_ids:
+            for signer in session.exec(
+                select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id.in_(signing_request_ids))
+            ).all():
+                session.delete(signer)
+            for sr in session.exec(
+                select(SigningRequest).where(SigningRequest.id.in_(signing_request_ids))
+            ).all():
+                session.delete(sr)
+
     for gc in session.exec(select(GeneratedContract).where(GeneratedContract.owner_id == user_id)).all():
         session.delete(gc)
     for tpl in session.exec(select(Template).where(Template.owner_id == user_id)).all():
@@ -4520,6 +5005,17 @@ def share_page(token: str):
     on the server, not a hash route, since this link goes to someone with
     no Rotely account of their own."""
     return FileResponse(os.path.join(static_dir, "share.html"))
+
+
+@app.get("/sign/{token}")
+def sign_page(token: str):
+    """Serves the standalone (no-login) consent + photo + signing page --
+    same no-account model as /share/{token} above, but deliberately its
+    own page rather than reusing share.html/share.js: the two flows
+    (redlining vs. signing) don't share any UI once you're past the
+    topbar, and keeping them separate avoids one growing a pile of
+    conditionals for the other's steps."""
+    return FileResponse(os.path.join(static_dir, "sign.html"))
 
 
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")

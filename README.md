@@ -50,21 +50,27 @@ a card.
 ```
 app/
   main.py            FastAPI app: auth, master documents, marking, drafting, library, plans,
-                      redlining/sharing, email drafting
-  docx_engine.py      Core .docx manipulation (render, split runs, fill tokens)
+                      redlining/sharing, email drafting, e-signature
+  docx_engine.py      Core .docx manipulation (render, split runs, fill tokens, signature block)
   redline_engine.py   Auto-approval evaluation for client-proposed field edits
   email_engine.py     Drafting-alias parsing, outbound mail (SendGrid), AI field extraction (Anthropic)
+  docuseal_engine.py   DocuSeal API client (create/archive a submission, download signed documents,
+                      webhook HMAC verification)
   models.py           Database tables (User, Template, Placeholder, GeneratedContract,
-                      ShareLink, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest)
+                      ShareLink, RedlineSubmission, RedlineEdit, EmailAlias, EmailDraftRequest,
+                      SigningRequest, SigningRequestSigner)
   auth.py             Password hashing and session-based auth
   db.py               SQLite engine/session setup
   static/
     app.js, styles.css, index.html   Main app (accounts, editor, draft, library, redline review)
     share.html, share.js             Standalone client redlining page (no account, /share/{token})
+    sign.html, sign.js               Standalone signer page: consent, photo, DocuSeal signing form
+                                      (no account, /sign/{token})
 tests/
   test_docx_engine.py     Unit tests for the docx engine
   test_redline_engine.py  Unit tests for redline auto-approval evaluation
   test_email_engine.py    Unit tests for alias parsing/generation and template matching
+  test_docuseal_engine.py Unit tests for DocuSeal webhook HMAC verification
 render.yaml       Render Blueprint (see Deploying below)
 requirements.txt
 ```
@@ -175,6 +181,50 @@ Once those are set, every account's drafting address (shown in the account
 menu) works end to end: send a request, get asked for anything missing,
 reply, and the finished draft lands in the portal and in your inbox.
 
+## Setting up e-signature (DocuSeal)
+
+"Send for signature" works out of the box, nothing to configure, but
+nothing actually goes out for signing until DocuSeal is wired up. Sending
+the `.docx` straight through (no separate PDF conversion step) requires a
+**Pro or Cloud Sandbox** DocuSeal plan -- `POST /submissions/docx` 404s on
+the free tier.
+
+1. **Get a DocuSeal account and API key** at
+   [console.docuseal.com/api](https://console.docuseal.com/api).
+2. **Add a webhook** in DocuSeal's console
+   ([console.docuseal.com/webhooks](https://console.docuseal.com/webhooks))
+   pointing at `https://<your-render-url>/api/webhooks/docuseal`, subscribed
+   to at least `form.completed`, `form.declined`, `submission.completed`,
+   and `submission.expired`. Open the webhook's **Security** panel, **HMAC**
+   tab, and copy the `whsec_...` signing secret -- every request to this
+   endpoint is rejected with 401 unless it's HMAC-verified against this
+   exact value (see `docuseal_engine.verify_webhook_signature`), so nothing
+   here works until this step is done.
+3. **Set these environment variables** on Render (or wherever it's
+   deployed):
+   - `DOCUSEAL_API_KEY`
+   - `DOCUSEAL_WEBHOOK_SECRET` (the `whsec_...` value from step 2)
+   - `DOCUSEAL_BASE_URL` (optional -- defaults to `https://api.docuseal.com`;
+     set to `https://api.docuseal.eu` for EU Cloud, or your own
+     `https://docuseal.yourdomain.com/api` if self-hosting)
+
+Once those are set, "Send for signature" on any generated document sends a
+copy of it (with a signature block appended -- the original file on disk is
+never touched) through DocuSeal, and each signer gets Rotely's own
+`/sign/{token}` link rather than a DocuSeal link directly -- see the next
+section for why.
+
+**A note on the photo step.** Before reaching DocuSeal's actual signing
+form, each signer is asked to consent and a photo is taken via their
+browser's camera, stored alongside the signed document. This is
+deliberately **not** identity verification -- there's nothing to match the
+photo against, so it can't prove the signer is who they claim to be. It's a
+deterrent and a record: people behave more carefully when they know a photo
+is attached to the signing event, and the owner has something on file if a
+signature is ever disputed. If real identity verification is wanted later
+(matching the photo against an uploaded ID), that's a meaningfully bigger
+feature on its own -- see "Ideas for v2" below.
+
 ## What is built and what is not
 
 **Built and working:** accounts, master documents with a name and document
@@ -184,9 +234,12 @@ draft flow (pick a template, fill in a popup, get a live preview and a
 permanent delete, real usage limits tied to a plan, per-field redline
 auto-approval rules, share-for-review links with a passcode gate, the
 client-facing redline page, the owner-side review/accept/reject/apply
-flow, and the full email-drafting pipeline (alias, inbound webhook,
+flow, the full email-drafting pipeline (alias, inbound webhook,
 AI field extraction, missing-info reply loop, ready notification with the
-file attached).
+file attached), and e-signature via DocuSeal (send for signature, a
+consent + photo-capture step before the signer reaches the actual signing
+form, webhook-verified completion tracking, and downloading the final
+signed document).
 
 **Not built yet, on purpose:**
 - **Real billing.** Plans can be switched from the account menu for testing
@@ -237,6 +290,16 @@ file attached).
   random code (huge guess space), but there's currently no lockout after
   repeated wrong attempts. Worth adding before this handles anything truly
   sensitive at scale.
+- **Signature requests support exactly two roles.** "Client" (always) and
+  "Sender" (the account owner's own business, optional) -- not an arbitrary
+  signer list. Covers the common two-party contract case; a deal with three
+  or more distinct signing parties isn't supported yet.
+- **The `/sign/{token}` link has no separate access-code gate**, unlike
+  `/share/{token}`. The token itself is a 32-character random bearer value
+  (the same security model DocuSeal's own `/s/{slug}` signing links use),
+  which is adequate for a signing link but a deliberate difference from the
+  share-link pattern elsewhere in this app -- worth revisiting if that
+  inconsistency matters for compliance reasons.
 
 ## Ideas for v2
 
@@ -249,3 +312,8 @@ file attached).
 - A dashboard/list view for in-flight email drafting requests.
 - Rate-limiting on the share-link access code.
 - Real billing.
+- Real identity verification on the signing flow (match the consent photo
+  against an uploaded ID) instead of today's deterrent-only photo capture.
+- Arbitrary signer lists for e-signature, instead of today's fixed
+  Client/Sender roles.
+- An access-code gate on `/sign/{token}`, matching `/share/{token}`'s model.

@@ -301,3 +301,30 @@ def test_apply_text_edits_inside_table_cell(tmp_path):
     assert right_cell.paragraphs[1].text == "Name: Janet Roe-Smith"
     left_cell = doc.tables[0].cell(0, 0)
     assert left_cell.paragraphs[1].text == "Name: John Doe"
+
+
+def test_append_signature_block_adds_tagged_paragraphs(tmp_path):
+    src = str(tmp_path / "sample.docx")
+    out = str(tmp_path / "sample_for_signature.docx")
+    make_sample_doc(src)
+
+    de.append_signature_block(src, out, [
+        {"role": "Client", "label": "Jane Doe (Acme Inc.)"},
+        {"role": "Sender", "label": "Rotely AI"},
+    ])
+
+    original = de.load(src)
+    signed_copy = de.load(out)
+    # The source file on disk is never touched -- only a new file is written.
+    assert [p.text for p in original.paragraphs] == [p.text for p in de.load(src).paragraphs]
+
+    texts = [p.text for p in signed_copy.paragraphs]
+    assert "Jane Doe (Acme Inc.)" in texts
+    assert "{{Client Signature;type=signature;role=Client;required=true}}" in texts
+    assert "Date: {{Client Date;type=datenow;role=Client}}" in texts
+    assert "Rotely AI" in texts
+    assert "{{Sender Signature;type=signature;role=Sender;required=true}}" in texts
+    assert "Date: {{Sender Date;type=datenow;role=Sender}}" in texts
+    # The original document's own content is still present ahead of the
+    # appended signature block, untouched.
+    assert texts[0] == original.paragraphs[0].text

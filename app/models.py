@@ -453,6 +453,68 @@ class EmailDraftRequest(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+# ---------------------------------------------------------------------------
+# E-signature: send a finished, redline-settled document out through
+# DocuSeal for signing. See app/docuseal_engine.py for the API integration
+# itself; these two tables are just Rotely's own record of each request.
+# ---------------------------------------------------------------------------
+
+class SigningRequest(SQLModel, table=True):
+    """One send-for-signature request for a single, specific
+    GeneratedContract revision -- not a whole lineage family the way
+    ShareLink intentionally is. The document being signed is the exact
+    decided-upon .docx; if the owner creates another revision later,
+    sending that for signature is its own new SigningRequest, never a
+    silent repoint onto a request already in flight.
+    `docuseal_submission_id` is a one-off DocuSeal "submission" (see
+    docuseal_engine.create_submission_from_docx) -- never a reusable
+    DocuSeal "template" object."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    generated_contract_id: int = Field(foreign_key="generatedcontract.id", index=True)
+    docuseal_submission_id: int
+    status: str = "pending"  # pending | completed | declined | cancelled | expired
+    # Populated once every signer has completed, by downloading from
+    # DocuSeal immediately (its document URLs expire ~40 minutes after
+    # being issued -- see docuseal_engine.get_submission_documents) rather
+    # than ever storing a DocuSeal URL. Relative-to-UPLOADS_DIR path, same
+    # convention as GeneratedContract.file_path / Template.working_path.
+    signed_file_path: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    completed_at: Optional[datetime] = None
+
+
+class SigningRequestSigner(SQLModel, table=True):
+    """One signer within a SigningRequest. `token` gates Rotely's own
+    consent + photo-capture page (see main.py's GET/POST /api/sign/{token})
+    -- a signer never sees DocuSeal's own signing form (reached via
+    `embed_src`) until they've explicitly consented and a photo has been
+    captured, both recorded here. This is deliberately a record kept
+    alongside the signature, not an identity-verification step: a bare
+    photo with nothing to match it against proves someone's face was in
+    front of a camera, not that it's the face it claims to be."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    signing_request_id: int = Field(foreign_key="signingrequest.id", index=True)
+    docuseal_submitter_id: int
+    role: str  # must exactly match the role= used in the document's {{...}} field tags
+    name: str
+    email: str
+    token: str = Field(index=True, unique=True)
+    # DocuSeal's own per-signer signing-form URL, taken verbatim from its API
+    # response ("embed_src", e.g. "https://docuseal.com/s/pAMimKcyrLjqVt").
+    # Unlike the submission's *document* URLs (see
+    # docuseal_engine.get_submission_documents), this one is stable until the
+    # submission completes, so it's fine to store rather than re-fetch.
+    embed_src: str = ""
+    status: str = "awaiting_consent"  # awaiting_consent | ready_to_sign | completed | declined
+    consent_given_at: Optional[datetime] = None
+    photo_path: str = ""  # relative-to-UPLOADS_DIR path to the captured consent photo
+    photo_captured_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class Notification(SQLModel, table=True):
     """One in-app bell notification for an account owner. Deliberately
     narrow-scoped: only two things ever create a row here -- a client

@@ -1272,6 +1272,148 @@ async function openShareModal(generatedId) {
 }
 
 // ---------------------------------------------------------------------------
+// E-signature: send a finished document out through DocuSeal for signing.
+// Mirrors openShareModal's shape (intake form -> created-state view) but for
+// /api/generated/{id}/signature-request instead of /share. See the
+// e-signature design notes for why this is scoped to exactly two roles
+// ("Client", always, and "Sender", the account owner's own business,
+// optional) rather than an arbitrary signer list.
+// ---------------------------------------------------------------------------
+
+async function openSignatureModal(generatedId) {
+  document.querySelectorAll(".panel-overlay").forEach((o) => o.remove());
+  const overlay = el("div", { class: "modal-overlay" });
+  const body = el("div", {}, el("p", { class: "subtitle" }, "Loading..."));
+  const modal = el("div", { class: "modal" }, [el("h2", {}, "Send for signature"), body]);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  function statusLabel(s) {
+    return { awaiting_consent: "Awaiting consent", ready_to_sign: "Ready to sign", completed: "Signed", declined: "Declined" }[s] || s;
+  }
+
+  function renderStatusView(sr) {
+    body.innerHTML = "";
+    body.appendChild(el("p", { class: "subtitle" }, "Sent through DocuSeal. Each signer first agrees to a quick photo step on Rotely's own page before reaching the actual signing form."));
+    const list = el("div", { class: "share-info-box" });
+    sr.signers.forEach((s) => {
+      const linkUrl = `${location.origin}${s.sign_url}`;
+      list.appendChild(
+        el("div", { class: "row" }, [
+          el("div", { style: "min-width:0;" }, [
+            el("div", { class: "k" }, `${s.name} (${s.role})`),
+            el("div", { class: "v" }, `${statusLabel(s.status)}${s.status === "awaiting_consent" || s.status === "ready_to_sign" ? " -- " + linkUrl : ""}`),
+          ]),
+          s.status !== "completed" ? el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(linkUrl, e.currentTarget) }, "Copy link") : null,
+        ])
+      );
+    });
+    body.appendChild(list);
+
+    const actions = [];
+    if (sr.status === "pending") {
+      actions.push(
+        el(
+          "button",
+          {
+            class: "btn danger",
+            onclick: async (e) => {
+              if (!confirm("Cancel this signature request? Signers will no longer be able to sign it.")) return;
+              const btn = e.currentTarget;
+              btn.disabled = true;
+              try {
+                await api(`/api/generated/${generatedId}/signature-request/cancel`, { method: "POST" });
+                overlay.remove();
+              } catch (err) {
+                btn.disabled = false;
+                alert(err.message);
+              }
+            },
+          },
+          "Cancel request"
+        )
+      );
+    }
+    if (sr.signed_document_available) {
+      actions.push(
+        el("a", { class: "btn", href: `/api/generated/${generatedId}/signature-request/download` }, "Download signed document")
+      );
+    }
+    actions.push(el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Close"));
+    body.appendChild(el("div", { class: "modal-actions" }, actions));
+  }
+
+  function renderIntakeForm() {
+    body.innerHTML = "";
+    const errBox = el("div", {});
+    const nameInput = el("input", { type: "text", placeholder: "Jamie Rivera" });
+    const emailInput = el("input", { type: "email", placeholder: "client@company.com" });
+    const includeSender = el("input", { type: "checkbox" });
+    const senderNameInput = el("input", { type: "text", placeholder: "Your name or business", style: "display:none;margin-top:8px;" });
+    const senderEmailInput = el("input", { type: "email", placeholder: "you@company.com", style: "display:none;margin-top:8px;" });
+    includeSender.addEventListener("change", () => {
+      senderNameInput.style.display = includeSender.checked ? "block" : "none";
+      senderEmailInput.style.display = includeSender.checked ? "block" : "none";
+    });
+
+    body.appendChild(
+      el("div", { class: "form-row" }, [
+        el("label", { class: "field-label" }, "Client's name and email"),
+        nameInput,
+        emailInput,
+      ])
+    );
+    body.appendChild(
+      el("div", { class: "form-row", style: "margin-top:14px;" }, [
+        el("label", { style: "display:flex;gap:8px;align-items:center;cursor:pointer;" }, [includeSender, "Also require a signature from your side"]),
+        senderNameInput,
+        senderEmailInput,
+      ])
+    );
+    body.appendChild(errBox);
+    const sendBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Send for signature");
+    sendBtn.addEventListener("click", async () => {
+      errBox.innerHTML = "";
+      const name = nameInput.value.trim(), email = emailInput.value.trim();
+      if (!name || !email) {
+        errBox.appendChild(el("div", { class: "error-box" }, "Enter the client's name and email."));
+        return;
+      }
+      const reqBody = { client_name: name, client_email: email, include_sender: includeSender.checked };
+      if (includeSender.checked) {
+        reqBody.sender_name = senderNameInput.value.trim();
+        reqBody.sender_email = senderEmailInput.value.trim();
+      }
+      sendBtn.disabled = true;
+      sendBtn.textContent = "Sending...";
+      try {
+        const sr = await api(`/api/generated/${generatedId}/signature-request`, { method: "POST", body: reqBody });
+        renderStatusView(sr);
+      } catch (err) {
+        errBox.appendChild(el("div", { class: "error-box" }, err.message));
+        sendBtn.disabled = false;
+        sendBtn.textContent = "Send for signature";
+      }
+    });
+    body.appendChild(
+      el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), sendBtn])
+    );
+  }
+
+  try {
+    const existing = await api(`/api/generated/${generatedId}/signature-request`);
+    if (existing.exists) {
+      renderStatusView(existing);
+    } else {
+      renderIntakeForm();
+    }
+  } catch (e) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "error-box" }, e.message));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Shared: open comment thread on a redline (owner side). Lightweight,
 // Google-Docs-suggest-edit-style back-and-forth on ANY redline regardless of
 // its accept/reject/counter decision -- see RedlineComment and the
@@ -1950,13 +2092,14 @@ function DraftView(preselectId) {
     });
     const libBtn = el("button", { class: "btn secondary", onclick: () => { overlay.remove(); location.hash = "#/documents"; } }, "View in Documents");
     const shareBtn = el("button", { class: "btn secondary", onclick: () => openShareModal(result.generated_id) }, "Share for review");
+    const signBtn = el("button", { class: "btn secondary", onclick: () => openSignatureModal(result.generated_id) }, "Send for signature");
     const redlinesBtn = el("button", { class: "btn secondary", onclick: () => openRedlinesModal(result.generated_id) }, "Redlines");
     var overlay = showPreviewOverlay({
       title: result.name,
       subtitle: `Generated from ${tpl.name} · saved to your Documents library`,
       html: result.html,
       generatedId: result.generated_id,
-      extraButtons: [editBtn, libBtn, shareBtn, redlinesBtn],
+      extraButtons: [editBtn, libBtn, shareBtn, signBtn, redlinesBtn],
       editable: true,
       onEdited: (editRes) => {
         // Edge case: this dialog only shows right after a fresh generation,
@@ -2473,6 +2616,7 @@ function DocumentsView() {
           // button, with no visible sign why. This is what "Preview
           // document" below already does correctly.
           el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openShareModal(d.id); } }, "Share for review"),
+          el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openSignatureModal(d.id); } }, "Send for signature"),
           el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openRedlinesModal(d.id); } }, "Redlines"),
           el("button", {
             class: "btn secondary",
