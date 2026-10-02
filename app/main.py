@@ -1606,6 +1606,19 @@ def _document_statuses(session: Session, doc_ids: list, owner_id: Optional[int] 
             continue  # an in-progress "Save progress" draft isn't visible to the owner yet
         subs_by_link.setdefault(s.share_link_id, []).append(s)
 
+    # #57: a submission can now legitimately carry zero RedlineEdit rows (the
+    # client reviewed and had nothing to flag), so "responded_at is set" no
+    # longer always means the OWNER sent something back -- it can equally
+    # mean there was never anything to respond to in the first place. Batch
+    # up edit counts per submission so the loop below can tell those two
+    # cases apart instead of mislabeling a plain "nothing to change"
+    # confirmation as "Response sent, awaiting client".
+    sub_ids = [s.id for s in subs]
+    edit_counts: dict = {}
+    if sub_ids:
+        for sid in session.exec(select(RedlineEdit.submission_id).where(RedlineEdit.submission_id.in_(sub_ids))).all():
+            edit_counts[sid] = edit_counts.get(sid, 0) + 1
+
     out = {}
     for link in links:
         # A generated doc can pick up more than one share link over time
@@ -1618,6 +1631,11 @@ def _document_statuses(session: Session, doc_ids: list, owner_id: Optional[int] 
             status = {"key": "shared", "label": "Shared, awaiting review", "tone": "pending"}
         elif latest_sub.status == "reviewed":
             status = {"key": "applied", "label": "Redlines applied", "tone": "final"}
+        elif latest_sub.responded_at and not edit_counts.get(latest_sub.id, 0):
+            # Nothing was ever proposed in this round -- responded_at was set
+            # the instant it arrived (see submit_redlines) because there was
+            # never anything pending, not because the owner sent a response.
+            status = {"key": "reviewed_no_changes", "label": "Reviewed, no changes requested", "tone": "final"}
         elif latest_sub.responded_at and not latest_sub.client_ack_at:
             status = {"key": "response_sent", "label": "Response sent, awaiting client", "tone": "pending"}
         elif latest_sub.responded_at and latest_sub.client_ack_at:
@@ -4280,9 +4298,12 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     gc = session.get(GeneratedContract, link.generated_contract_id)
     if not gc:
         raise HTTPException(410, "This document is no longer available.")
-    if not body.edits and not body.note.strip():
-        raise HTTPException(400, "No changes or comments were provided.")
-
+    # Bug tracker #57: this used to also reject edits=[] + note="" outright
+    # ("No changes or comments were provided"), even though the note field
+    # is labeled "(optional)" on the client page -- there was no way to
+    # finalize a review that's genuinely just "I looked, nothing to flag,"
+    # which is a legitimate outcome, not an accident. Submitting with
+    # nothing in either is now allowed and means exactly that.
     resolved = _resolve_edits(session, gc, body.edits, link_id=link.id)
 
     # Hard block -- bug tracker #21 / phase 4. Inaction on a counter used to
@@ -4337,7 +4358,17 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     # includes a comment-only edit (#35, also left "pending"), still needs
     # a real response for that part, so this only fires when NOTHING in the
     # round is still "pending".
-    if resolved and all(kw["decision"] != "pending" for kw in resolved):
+    # #57 (continued): dropped the `resolved and` guard that used to make
+    # this condition vacuously false whenever resolved == [] -- all(...) is
+    # already vacuously True over an empty list, which is exactly what's
+    # wanted: zero edits means zero still pending, so there's nothing for
+    # the owner to decide and this round is responded the instant it
+    # arrives. Before this, a no-edits (or comment-only) submission left
+    # responded_at unset forever, which the dashboard rendered as a
+    # permanent, un-clearable "Redlines submitted, awaiting your review" --
+    # the Redlines modal never even shows a "Send response" button when
+    # there's nothing undecided, so there was no way to make it go away.
+    if all(kw["decision"] != "pending" for kw in resolved):
         submission.responded_at = datetime.utcnow()
     session.add(submission)
     session.commit()
@@ -4351,9 +4382,14 @@ def submit_redlines(token: str, body: ShareSubmitBody, request: Request, session
     if owner and owner.notify_redline_submitted:
         _send_redlines_submitted_notification(owner, gc, link, len(resolved), body.note.strip())
         who = link.client_email.strip() or "A reviewer"
+        # #57: a zero-edit submission is now a real, allowed outcome ("looked
+        # it over, nothing to flag") rather than something that could never
+        # reach here -- word the bell notification for it instead of saying
+        # "sent redlines" when none were sent.
+        title = f'{who} sent redlines on "{gc.name}"' if resolved else f'{who} reviewed "{gc.name}" with no changes'
         _notify(
             session, owner.id, "redline_submitted",
-            title=f'{who} sent redlines on "{gc.name}"',
+            title=title,
             body=f"{len(resolved)} change{'s' if len(resolved) != 1 else ''} proposed." if resolved else "",
             generated_contract_id=gc.id,
         )
@@ -4835,12 +4871,16 @@ def _send_redlines_submitted_notification(owner: User, gc: GeneratedContract, li
     client's email (if the sender collected one) so replying goes straight
     back to whoever submitted them."""
     who = link.client_email.strip() or "The reviewer"
-    lines = [f'{who} sent back redlines on "{gc.name}".']
+    # #57: zero edits is a real, allowed outcome now ("looked it over, no
+    # changes"), not something that could never reach here -- say that
+    # plainly instead of claiming redlines came back when none did.
     if edit_count:
-        lines.append(f"{edit_count} change{'s' if edit_count != 1 else ''} proposed.")
+        lines = [f'{who} sent back redlines on "{gc.name}".', f"{edit_count} change{'s' if edit_count != 1 else ''} proposed."]
+    else:
+        lines = [f'{who} reviewed "{gc.name}" and didn\'t propose any changes.']
     if note:
         lines.append(f'\nTheir note: "{note}"')
-    lines.append("\nLog in to your Rotely documents library to review and respond.")
+    lines.append("\nLog in to your Rotely documents library to review and respond." if edit_count else "\nLog in to your Rotely documents library to see the full review.")
     body = "\n".join(lines) + "\n\n- Rotely"
     try:
         ee.send_email(
