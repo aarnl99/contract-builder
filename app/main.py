@@ -2642,6 +2642,16 @@ class CreateSignatureRequestBody(BaseModel):
     include_sender: bool = False
     sender_name: str = ""
     sender_email: str = ""
+    # Where to splice the signature fields in -- a paragraph index into the
+    # document's top-level body, counted the same way render_paragraphs_html's
+    # data-p attribute counts (see docx_engine.detect_signature_anchor_paragraph
+    # and append_signature_block). Comes from the frontend's signature-anchor
+    # preview: either the auto-detected "sign here" line the person confirmed
+    # by not changing it, or a different spot they clicked instead. None (the
+    # default, and also what an out-of-range/stale index falls back to) means
+    # "append a new signature block at the very end", which is the original,
+    # always-safe behavior from before this existed.
+    signature_anchor_paragraph_index: Optional[int] = None
 
 
 @app.post("/api/generated/{generated_id}/signature-request")
@@ -2692,6 +2702,7 @@ def create_signature_request(
         de.append_signature_block(
             gc.file_path, prepped_path,
             [{"role": s["role"], "label": f'{s["name"]} ({s["role"]})'} for s in signer_specs],
+            anchor_paragraph_index=body.signature_anchor_paragraph_index,
         )
         with open(prepped_path, "rb") as f:
             prepped_bytes = f.read()
@@ -2770,6 +2781,31 @@ def get_signature_request(
         select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
     ).all()
     return {"exists": True, **_signing_request_payload(sr, signers)}
+
+
+@app.get("/api/generated/{generated_id}/signature-anchor-preview")
+def get_signature_anchor_preview(
+    generated_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Backs the "where should the signature go?" picker shown before
+    sending a document for signature (both the normal draft-flow send and
+    the upload-to-sign flow funnel through the same openSignatureModal, so
+    one endpoint covers both). Returns the document rendered the same way
+    the share/redline views already do, plus whatever
+    detect_signature_anchor_paragraph found -- the frontend highlights that
+    paragraph as the default spot, but a person can click anywhere else in
+    the preview to override it (see computeCursorPosition), and nothing is
+    ever placed without that round trip through a human first."""
+    gc = _get_owned_generated(session, user, generated_id)
+    if not gc.file_path or not os.path.exists(gc.file_path):
+        raise HTTPException(404, "This document's file is missing on disk.")
+    doc = de.load(gc.file_path)
+    field_positions = json.loads(gc.field_positions_json or "[]")
+    html_content = de.render_paragraphs_html(doc, field_positions)
+    detected = de.detect_signature_anchor_paragraph(doc)
+    return {"html": html_content, "detected_paragraph_index": detected}
 
 
 @app.post("/api/generated/{generated_id}/signature-request/cancel")
