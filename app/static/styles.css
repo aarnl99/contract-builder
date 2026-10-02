@@ -385,6 +385,18 @@ label.field-label .req { color: var(--danger); }
   font-size: 12.5px; font-weight: 700; color: #92400e;
 }
 .contract-view.compact { padding: 22px 26px; font-size: 13.5px; }
+/* Signature-anchor picker (openSignatureModal's "where should the
+   signature go?" preview) -- a scrollable, click-to-place variant of the
+   same document view used for field marking and redlining. See
+   GET /api/generated/{id}/signature-anchor-preview and
+   docx_engine.detect_signature_anchor_paragraph. */
+.sig-anchor-preview { max-height: 260px; overflow-y: auto; cursor: pointer; }
+.sig-anchor-preview .para:hover { background: var(--accent-soft); border-radius: 3px; }
+.sig-anchor-preview .para.sig-anchor-selected {
+  background: var(--accent-soft); border-radius: 3px;
+  box-shadow: inset 3px 0 0 var(--accent);
+  padding-left: 8px; margin-left: -8px;
+}
 .contract-view .doc-table {
   width: 100%; border-collapse: collapse; margin: 0 0 14px; font-size: inherit;
 }
