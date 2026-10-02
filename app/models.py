@@ -187,6 +187,21 @@ class GeneratedContract(SQLModel, table=True):
     # edits still slot into the same revision-history chain as redlines.
     source_generated_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
 
+    # Cache of the DocuSeal "template" created for this exact document
+    # version once the owner starts designing signature fields in the
+    # embedded DocuSeal Form Builder (see main.py's
+    # get_signature_builder_token) -- the Google-eSign-style "highlight a
+    # box, assign it to a signer" flow. None until that step has ever run.
+    # docuseal_template_doc_hash is a sha256 of file_path's bytes at the
+    # moment the template was created, so a later edit to the underlying
+    # document (new redline round, direct edit, etc.) is detectable: a
+    # mismatch means the placed fields were positioned against now-stale
+    # content, so create_signature_request falls back to the old
+    # blind-append path rather than sending out fields that no longer line
+    # up with what's actually in the document.
+    docuseal_template_id: Optional[int] = None
+    docuseal_template_doc_hash: Optional[str] = None
+
     owner: Optional[User] = Relationship(back_populates="generated_contracts")
 
 
