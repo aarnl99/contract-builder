@@ -76,6 +76,13 @@ class User(SQLModel, table=True):
     # declined one, as of Phase 2 of the redline-negotiation overhaul).
     # Gates the in-app bell only -- thread replies never send email.
     notify_redline_comment: bool = True
+    # A signer finished signing (bell only -- see _apply_signer_completed)
+    # or an entire signature request is fully signed by everyone (gates both
+    # the bell and the "Fully signed" email -- see _apply_submission_completed
+    # and _send_signature_completed_email). Previously this was hardcoded
+    # to email-only with no bell and no way to opt out at all; see bug
+    # tracker entry on missing signature notifications.
+    notify_signature_events: bool = True
 
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
