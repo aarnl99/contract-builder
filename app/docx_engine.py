@@ -40,6 +40,7 @@ import re
 from typing import Dict, List, Optional
 
 from docx import Document
+from docx.oxml import OxmlElement
 from docx.shared import Pt
 from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
@@ -609,32 +610,117 @@ def list_tokens(doc: Document) -> List[str]:
     return found
 
 
-def append_signature_block(path: str, out_path: str, signers: List[Dict]) -> None:
-    """Appends a signature block to the end of the document at `path` and
-    saves the result to `out_path`, leaving the original untouched. Used
-    only when preparing a copy of a generated contract to send through
-    DocuSeal for e-signature (see docuseal_engine.create_submission_from_docx)
-    -- never touches the live GeneratedContract.file_path, so the document a
-    client already reviewed/downloaded is never mutated just because it was
-    later sent out for signature.
+_SIGNATURE_LINE_RE = re.compile(
+    r"\b(?:sign(?:ature)?s?|signed|by)\s*:?\s*_{3,}|(?<![A-Za-z])x\s*_{3,}|^_{4,}\s*$",
+    re.IGNORECASE,
+)
+
+
+def detect_signature_anchor_paragraph(doc: Document) -> Optional[int]:
+    """Scans top-level body paragraphs (not table cells -- see this
+    module's "known limitation" note, which this inherits) for a line that
+    already looks like a "sign here" spot: "Signature: ____", "By: ___",
+    "X_____", or a lone underscore rule.
+
+    The common case is a document someone else wrote and sent straight
+    through the upload-to-sign flow (see main.py's
+    upload_document_for_signature) -- these almost always already have
+    their own signature line, and tacking a second, redundant one onto the
+    end looks broken. Just as possible on a drafted document if the
+    template's own text happens to include one.
+
+    Returns the first match's paragraph index, counted the same way
+    render_paragraphs_html's `data-p` attribute counts top-level body
+    paragraphs (so a frontend preview can highlight the exact same
+    paragraph this points at), or None if nothing looks like a signature
+    line -- callers should fall back to appending a new block at the very
+    end, exactly like before this existed. Purely a heuristic: it can miss
+    an unusually worded line, or (rarely) match something that isn't
+    actually a signature line -- either way the frontend shows the
+    document and lets a human confirm or pick a different spot before
+    anything is sent."""
+    p_idx = 0
+    for block in doc.iter_inner_content():
+        if isinstance(block, Paragraph):
+            text = "".join(r.text or "" for r in block.runs)
+            if text.strip() and _SIGNATURE_LINE_RE.search(text):
+                return p_idx
+            p_idx += 1
+    return None
+
+
+def _insert_paragraph_after(paragraph: Paragraph) -> Paragraph:
+    """Splices a brand-new, empty paragraph into the XML tree immediately
+    after `paragraph` (same parent container) and returns it as a
+    python-docx Paragraph ready for .add_run(). Standard python-docx idiom
+    for inserting mid-document -- .add_paragraph() alone can only append at
+    the very end of its container, which is exactly why
+    append_signature_block needed this to support anchor_paragraph_index."""
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    return Paragraph(new_p, paragraph._parent)
+
+
+def append_signature_block(
+    path: str, out_path: str, signers: List[Dict], anchor_paragraph_index: Optional[int] = None
+) -> None:
+    """Adds a signature block to the document at `path` and saves the
+    result to `out_path`, leaving the original untouched. Used only when
+    preparing a copy of a generated contract to send through DocuSeal for
+    e-signature (see docuseal_engine.create_submission_from_docx) -- never
+    touches the live GeneratedContract.file_path, so the document a client
+    already reviewed/downloaded is never mutated just because it was later
+    sent out for signature.
 
     `signers`: list of {"role": str, "label": str} in signing order, e.g.
     [{"role": "Client", "label": "Jane Doe (Acme Inc.)"}]. For each one,
-    appends a labeled paragraph plus DocuSeal's own "{{...;type=signature}}"
-    / "{{...;type=datenow}}" text-tag syntax, which DocuSeal parses into
-    real fillable fields at submission time -- see
+    adds a labeled paragraph plus DocuSeal's own "{{...;type=signature}}" /
+    "{{...;type=datenow}}" text-tag syntax, which DocuSeal parses into real
+    fillable fields at submission time -- see
     https://www.docuseal.com/docs/api#create-a-submission-from-docx. The
     `role` here must exactly match the `role` passed for the corresponding
     submitter in the DocuSeal API call, or the tag won't bind to the right
     signer.
 
-    Deliberately just a brand-new paragraph appended at the very end of the
-    document body -- doesn't touch any existing paragraph, run, or table,
-    so it doesn't go anywhere near the offset-tracking machinery the rest of
-    this file is built around (this module's own known-tricky surface --
-    see the F5/F6/#49 bug-tracker entries) and can't reintroduce any of
-    those classes of bug."""
+    `anchor_paragraph_index`, if given, splices the block in immediately
+    after that top-level body paragraph instead of at the very end -- see
+    detect_signature_anchor_paragraph, and main.py's
+    CreateSignatureRequestBody.signature_anchor_paragraph_index for where a
+    human-confirmed choice comes from. An index that's out of range (stale
+    against a document edited since it was computed, or never valid to
+    begin with) is silently ignored and falls back to the append-at-end
+    path below -- landing in the wrong spot would be worse than the old
+    always-at-the-end default. The append-at-end path itself is unchanged
+    from before anchoring existed: still just brand-new paragraphs added at
+    the very end, never touching any existing paragraph, run, or table, so
+    it stays nowhere near the offset-tracking machinery the rest of this
+    file is built around (this module's own known-tricky surface -- see the
+    F5/F6/#49 bug-tracker entries)."""
     doc = load(path)
+
+    if anchor_paragraph_index is not None:
+        body_paragraphs = [b for b in doc.iter_inner_content() if isinstance(b, Paragraph)]
+        if 0 <= anchor_paragraph_index < len(body_paragraphs):
+            insert_after = body_paragraphs[anchor_paragraph_index]
+            heading = _insert_paragraph_after(insert_after)
+            heading_run = heading.add_run("Signatures")
+            heading_run.bold = True
+            heading_run.font.size = Pt(13)
+            insert_after = heading
+            for signer in signers:
+                role = signer["role"]
+                label = signer.get("label") or role
+                for line in (
+                    label,
+                    "{{%s Signature;type=signature;role=%s;required=true}}" % (role, role),
+                    "Date: {{%s Date;type=datenow;role=%s}}" % (role, role),
+                ):
+                    p = _insert_paragraph_after(insert_after)
+                    p.add_run(line)
+                    insert_after = p
+            doc.save(out_path)
+            return
+
     doc.add_page_break()
     heading = doc.add_paragraph()
     heading_run = heading.add_run("Signatures")
