@@ -57,8 +57,10 @@ def create_submission_from_docx(
     """submitters: list of {"role", "email", "name", "external_id"}.
     `order` is left at DocuSeal's default ("preserved"), so a second signer
     only gets access once the first has completed -- the normal shape for a
-    two-party contract. Returns the parsed JSON submission response (a list
-    of per-submitter records, each with its own "slug"/"embed_src")."""
+    two-party contract. Returns the parsed JSON submission response: a
+    single object with top-level "id" (the submission id) plus a nested
+    "submitters" list, each entry its own record with "id"/"email"/
+    "slug"/"embed_src" etc. -- NOT a bare list of submitter records."""
     payload = {
         "name": name,
         "send_email": False,
