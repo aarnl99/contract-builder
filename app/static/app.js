@@ -1394,7 +1394,7 @@ async function openSignatureModal(generatedId) {
   document.querySelectorAll(".panel-overlay").forEach((o) => o.remove());
   const overlay = el("div", { class: "modal-overlay" });
   const body = el("div", {}, el("p", { class: "subtitle" }, "Loading..."));
-  const modal = el("div", { class: "modal" }, [el("h2", {}, "Send for signature"), body]);
+  const modal = el("div", { class: "modal", style: "width:700px;" }, [el("h2", {}, "Send for signature"), body]);
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
@@ -1453,7 +1453,58 @@ async function openSignatureModal(generatedId) {
     body.appendChild(el("div", { class: "modal-actions" }, actions));
   }
 
-  function renderIntakeForm() {
+  // Where in the document the signature fields will actually land --
+  // null means "append a new signature block at the end" (the original,
+  // always-safe default). Set from the anchor-preview fetch below (if it
+  // auto-detects an existing "sign here" line) and can be overridden by
+  // clicking anywhere else in that preview. See
+  // GET /api/generated/{id}/signature-anchor-preview and
+  // docx_engine.detect_signature_anchor_paragraph.
+  let anchorIndex = null;
+
+  function highlightAnchor(previewEl, idx) {
+    previewEl.querySelectorAll(".para.sig-anchor-selected").forEach((p) => p.classList.remove("sig-anchor-selected"));
+    if (idx === null) return;
+    const match = previewEl.querySelector(`.para[data-p="${idx}"]`);
+    if (match) match.classList.add("sig-anchor-selected");
+  }
+
+  async function buildAnchorPicker() {
+    const wrap = el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Where should the signature go?")]);
+    const hint = el("p", { class: "subtitle", style: "margin:2px 0 8px;" }, "Loading the document...");
+    wrap.appendChild(hint);
+    let preview = null;
+    try {
+      const data = await api(`/api/generated/${generatedId}/signature-anchor-preview`);
+      preview = el("div", { class: "contract-view compact sig-anchor-preview" });
+      preview.innerHTML = data.html;
+      anchorIndex = data.detected_paragraph_index;
+      hint.textContent =
+        anchorIndex !== null
+          ? "We found what looks like a signature line (highlighted below) and will place the fields there. Click anywhere else in the document to use a different spot instead."
+          : "We didn't spot an existing signature line, so the fields will be added at the end of the document. Click anywhere below to place them somewhere specific instead.";
+      highlightAnchor(preview, anchorIndex);
+      preview.addEventListener("mouseup", () => {
+        setTimeout(() => {
+          const info = computeCursorPosition(preview);
+          if (!info || info.error || info.table_path) return; // table-cell clicks aren't supported yet -- see detect_signature_anchor_paragraph's scope note
+          window.getSelection().removeAllRanges();
+          anchorIndex = info.paragraph_index;
+          highlightAnchor(preview, anchorIndex);
+          hint.textContent = "The signature fields will be placed at the highlighted spot below. Click anywhere else to move it.";
+        }, 0);
+      });
+      wrap.appendChild(preview);
+    } catch (e) {
+      // Anchor preview is a nice-to-have, not a blocker -- if it fails to
+      // load for any reason, fall through with anchorIndex left at null,
+      // which is exactly today's always-append-at-the-end behavior.
+      hint.textContent = "Couldn't load a preview of this document -- the signature will be added at the end instead.";
+    }
+    return wrap;
+  }
+
+  async function renderIntakeForm() {
     body.innerHTML = "";
     const errBox = el("div", {});
     const nameInput = el("input", { type: "text", placeholder: "Jamie Rivera" });
@@ -1480,6 +1531,7 @@ async function openSignatureModal(generatedId) {
         senderEmailInput,
       ])
     );
+    body.appendChild(el("div", { style: "margin-top:14px;" }, [await buildAnchorPicker()]));
     body.appendChild(errBox);
     const sendBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Send for signature");
     sendBtn.addEventListener("click", async () => {
@@ -1489,7 +1541,12 @@ async function openSignatureModal(generatedId) {
         errBox.appendChild(el("div", { class: "error-box" }, "Enter the client's name and email."));
         return;
       }
-      const reqBody = { client_name: name, client_email: email, include_sender: includeSender.checked };
+      const reqBody = {
+        client_name: name,
+        client_email: email,
+        include_sender: includeSender.checked,
+        signature_anchor_paragraph_index: anchorIndex,
+      };
       if (includeSender.checked) {
         reqBody.sender_name = senderNameInput.value.trim();
         reqBody.sender_email = senderEmailInput.value.trim();
@@ -1515,7 +1572,7 @@ async function openSignatureModal(generatedId) {
     if (existing.exists) {
       renderStatusView(existing);
     } else {
-      renderIntakeForm();
+      await renderIntakeForm();
     }
   } catch (e) {
     body.innerHTML = "";
