@@ -1484,15 +1484,36 @@ async function openSignatureModal(generatedId) {
           ? "We found what looks like a signature line (highlighted below) and will place the fields there. Click anywhere else in the document to use a different spot instead."
           : "We didn't spot an existing signature line, so the fields will be added at the end of the document. Click anywhere below to place them somewhere specific instead.";
       highlightAnchor(preview, anchorIndex);
+      const selectAnchor = (idx) => {
+        window.getSelection().removeAllRanges();
+        anchorIndex = idx;
+        highlightAnchor(preview, anchorIndex);
+        hint.textContent = "The signature fields will be placed at the highlighted spot below. Click anywhere else to move it.";
+      };
       preview.addEventListener("mouseup", () => {
         setTimeout(() => {
           const info = computeCursorPosition(preview);
           if (!info || info.error || info.table_path) return; // table-cell clicks aren't supported yet -- see detect_signature_anchor_paragraph's scope note
-          window.getSelection().removeAllRanges();
-          anchorIndex = info.paragraph_index;
-          highlightAnchor(preview, anchorIndex);
-          hint.textContent = "The signature fields will be placed at the highlighted spot below. Click anywhere else to move it.";
+          selectAnchor(info.paragraph_index);
         }, 0);
+      });
+      // A blank line (render_paragraphs_html emits "<p class=\"para\">&nbsp;</p>"
+      // with no run spans at all for an empty paragraph) has nothing for
+      // computeCursorPosition's run-ancestor lookup to find, so the mouseup
+      // handler above silently no-ops there -- with no feedback telling
+      // someone why clicking a blank line between sections didn't move the
+      // highlight. Handle that one case directly off the click target
+      // instead: only when the clicked <p class="para"> has no .run child
+      // (i.e. mouseup's own path didn't/can't handle it) and isn't a
+      // table-cell paragraph (data-path set -- same "not supported yet"
+      // scope as above).
+      preview.addEventListener("click", (e) => {
+        const paraEl = e.target.closest(".para");
+        if (!paraEl || !preview.contains(paraEl)) return;
+        if (paraEl.querySelector(".run")) return;
+        if (paraEl.dataset.path) return;
+        if (paraEl.dataset.p === undefined) return;
+        selectAnchor(parseInt(paraEl.dataset.p, 10));
       });
       wrap.appendChild(preview);
     } catch (e) {
