@@ -6,10 +6,23 @@ Responsibilities:
      DocuSeal submission (POST /submissions/docx) -- no persistent DocuSeal
      "template" object is created or reused; every signature request is its
      own standalone submission, matching how GeneratedContract rows already
-     work (each one is its own row, never overwritten).
-  2. Verify DocuSeal's webhook HMAC signature, so main.py's webhook route
+     work (each one is its own row, never overwritten). This is now the
+     FALLBACK path only, used for a document that was sent without ever
+     going through the visual field-placement step below (see main.py's
+     create_signature_request) -- kept so that path still works exactly as
+     before rather than being ripped out.
+  2. Create a real, reusable DocuSeal "template" from a .docx with no
+     fields yet (POST /templates/docx, no {{...}} tags), mint the signed
+     JWT the embeddable <docuseal-builder> web component needs to edit
+     that template, and create a submission FROM that template once the
+     owner has visually placed fields in it (POST /submissions with
+     template_id) -- the Google-eSign-style "highlight a box, assign it to
+     a signer" flow, replacing blind text-tag/anchor-paragraph embedding as
+     the primary way fields get placed. See get_signature_builder_token and
+     create_signature_request in main.py.
+  3. Verify DocuSeal's webhook HMAC signature, so main.py's webhook route
      can trust a payload actually came from DocuSeal before acting on it.
-  3. Fetch submission status and download the final signed document(s) once
+  4. Fetch submission status and download the final signed document(s) once
      complete.
 
 None of this touches the database -- main.py owns that -- so it can be unit
@@ -36,10 +49,19 @@ import time
 from typing import Dict, List, Optional
 
 import httpx
+import jwt as _pyjwt
 
 DOCUSEAL_API_KEY = os.environ.get("DOCUSEAL_API_KEY", "")
 DOCUSEAL_BASE_URL = os.environ.get("DOCUSEAL_BASE_URL", "https://api.docuseal.com").rstrip("/")
 DOCUSEAL_WEBHOOK_SECRET = os.environ.get("DOCUSEAL_WEBHOOK_SECRET", "")
+# The DocuSeal ACCOUNT email that owns DOCUSEAL_API_KEY -- required as
+# "user_email" in the Form Builder's JWT (see mint_builder_token). This is
+# never a Rotely customer's own email; DocuSeal has no concept of Rotely's
+# customers, only the one account the API key belongs to. Defaults to the
+# same fallback main.py's ADMIN_EMAIL uses, since in practice they're the
+# same person/account today -- override with its own env var if that ever
+# stops being true.
+DOCUSEAL_ACCOUNT_EMAIL = os.environ.get("DOCUSEAL_ACCOUNT_EMAIL", "aaronkluan@gmail.com")
 
 _TIMEOUT = 30
 
@@ -79,6 +101,74 @@ def create_submission_from_docx(
     if variables:
         payload["variables"] = variables
     resp = httpx.post(f"{DOCUSEAL_BASE_URL}/submissions/docx", json=payload, headers=_headers(), timeout=_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_template_from_docx(*, name: str, file_bytes: bytes, file_name: str) -> dict:
+    """Uploads file_bytes as a brand-new DocuSeal template with NO fields
+    and no {{...}} text tags (POST /templates/docx) -- just the document
+    itself. This is the template the embedded <docuseal-builder> (see
+    mint_builder_token) opens for a human to visually drag signature/text/
+    date/etc. fields onto and assign to a role, instead of this module
+    guessing field placement from text-tag embedding. Returns the parsed
+    JSON template object (has a top-level "id" -- see main.py's
+    get_signature_builder_token, which caches that id on the
+    GeneratedContract row)."""
+    payload = {
+        "name": name,
+        "documents": [{"name": file_name, "file": base64.b64encode(file_bytes).decode("ascii")}],
+    }
+    resp = httpx.post(f"{DOCUSEAL_BASE_URL}/templates/docx", json=payload, headers=_headers(), timeout=_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def mint_builder_token(*, template_id: int, name: str) -> str:
+    """Signs the JWT (HS256) the <docuseal-builder> web component needs in
+    its data-token attribute -- per DocuSeal's Form Builder JS docs, this
+    token's payload is itself signed with DOCUSEAL_API_KEY (that's the
+    whole auth mechanism for the embed; there's no separate embed-specific
+    secret). Must only ever be minted server-side, never in the browser,
+    since the API key is the signing secret -- see
+    GET-equivalent get_signature_builder_token in main.py, the only caller.
+    "user_email" here is DocuSeal's own account owner, not any Rotely
+    customer -- see DOCUSEAL_ACCOUNT_EMAIL above."""
+    if not DOCUSEAL_API_KEY:
+        raise RuntimeError("DOCUSEAL_API_KEY is not configured.")
+    payload = {"user_email": DOCUSEAL_ACCOUNT_EMAIL, "template_id": template_id, "name": name}
+    return _pyjwt.encode(payload, DOCUSEAL_API_KEY, algorithm="HS256")
+
+
+def create_submission_from_template(*, template_id: int, submitters: List[Dict]) -> list:
+    """POST /submissions against a template whose fields were already
+    placed through the builder (see create_template_from_docx) -- NOT
+    /submissions/docx. submitters: list of {"role", "email", "name",
+    "external_id"}, same shape as create_submission_from_docx takes.
+
+    Unlike create_submission_from_docx, DocuSeal's response here is a bare
+    LIST of submitter records directly (no wrapping {"id": ...,
+    "submitters": [...]} object) -- each item already carries its own
+    "submission_id" (shared across every item in the list, since one call
+    creates every submitter for one new submission) and "id" (that one
+    submitter's own id). See main.py's create_signature_request, which
+    branches on whether a GeneratedContract has a cached template id to
+    decide which of these two creation paths to use."""
+    payload = {
+        "template_id": template_id,
+        "send_email": False,
+        "submitters": [
+            {
+                "role": s["role"],
+                "email": s["email"],
+                "name": s.get("name", ""),
+                "send_email": False,
+                "external_id": s.get("external_id", ""),
+            }
+            for s in submitters
+        ],
+    }
+    resp = httpx.post(f"{DOCUSEAL_BASE_URL}/submissions", json=payload, headers=_headers(), timeout=_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
