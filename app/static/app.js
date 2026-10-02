@@ -671,7 +671,7 @@ function AuthView(mode) {
     const passInput = el("input", { type: "password", placeholder: tab === "register" ? "At least 8 characters" : "Password" });
     const nameInput = el("input", { type: "text", placeholder: "Full name" });
     const confirmInput = el("input", { type: "password", placeholder: "Re-enter your password" });
-    const codeInput = el("input", { type: "text", placeholder: "e.g. userotelynow", autocapitalize: "none", autocorrect: "off" });
+    const codeInput = el("input", { type: "text", placeholder: "Enter your access code", autocapitalize: "none", autocorrect: "off" });
 
     const fields = [];
     if (tab === "register") {
