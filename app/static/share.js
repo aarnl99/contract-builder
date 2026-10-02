@@ -1118,11 +1118,14 @@ function DocumentView(data) {
     // check, so this is always true at Finalize; sent anyway so the
     // server's own hard-block (submit_redlines) doesn't have to trust
     // anything this endpoint wasn't explicitly told.
+    // Bug tracker #57: this used to also block here when there were zero
+    // suggested edits AND an empty note, even though the comment field
+    // right above is labeled "(optional)" -- there was no way to finalize
+    // a review that's genuinely just "I looked it over, nothing to flag,"
+    // which is a real outcome, not an accidental empty click. The server
+    // (submit_redlines) no longer rejects this either, so nothing further
+    // is needed here beyond just letting it through.
     const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null, counter_decided: !e.counterPending }));
-    if (!editList.length && !noteInput.value.trim()) {
-      errBox.appendChild(el("div", { class: "error-box" }, "Suggest a change or add a comment before submitting."));
-      return;
-    }
     submitBtn.disabled = true;
     submitBtn.textContent = "Submitting...";
     try {
