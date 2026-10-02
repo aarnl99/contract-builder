@@ -297,6 +297,7 @@ function toggleAvatarMenu() {
   const NOTIF_TOGGLES = [
     { key: "redline_submitted", label: "Someone sends redlines" },
     { key: "redline_comment", label: "Client comments on a redline" },
+    { key: "signature_events", label: "Someone signs (or finishes signing) a document" },
   ];
   const notifList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:2px;" }, [
     el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."),
@@ -366,15 +367,26 @@ function toggleAvatarMenu() {
 }
 
 // ---------------------------------------------------------------------------
-// Notification bell -- fires on exactly two events (see main.py's _notify
-// call sites): a client submits redlines for review, and a client comments
-// on a redline the owner declined. Nothing else lights up the bell.
+// Notification bell -- fires on the events listed in main.py's _notify
+// docstring: a client submits redlines, a client comments on a redline, a
+// signer finishes signing while others are still pending, and a signature
+// request is fully signed by everyone. Nothing else lights up the bell.
 // "response_acknowledged" is kept in the label map only so any older,
 // already-delivered notifications of that (now-retired) type still render
 // with a readable title instead of raw text.
 // ---------------------------------------------------------------------------
 
-const NOTIF_TYPE_LABELS = { redline_submitted: "Redlines submitted", response_acknowledged: "Response seen", redline_comment: "Redline comment" };
+const NOTIF_TYPE_LABELS = {
+  redline_submitted: "Redlines submitted",
+  response_acknowledged: "Response seen",
+  redline_comment: "Redline comment",
+  signature_signed: "Signature received",
+  signature_completed: "Fully signed",
+};
+// Notification types that are about the e-signature flow, not redlines --
+// clicking one of these should open the signature status modal instead of
+// the redlines modal (see toggleNotifDropdown's click handler below).
+const SIGNATURE_NOTIF_TYPES = new Set(["signature_signed", "signature_completed"]);
 
 function refreshNotifBadge() {
   if (!state.user) return;
@@ -469,7 +481,10 @@ function toggleNotifDropdown() {
         // router() clears any open .modal-overlay as routine nav cleanup.
         history.replaceState(null, "", "#/documents");
         render(shell(DocumentsView()));
-        if (n.generated_contract_id) openRedlinesModal(n.generated_contract_id);
+        if (n.generated_contract_id) {
+          if (SIGNATURE_NOTIF_TYPES.has(n.type)) openSignatureModal(n.generated_contract_id);
+          else openRedlinesModal(n.generated_contract_id);
+        }
       });
       list.appendChild(item);
     });
@@ -1572,11 +1587,36 @@ async function openSignatureModal(generatedId) {
   async function renderIntakeForm() {
     body.innerHTML = "";
     const errBox = el("div", {});
+
+    // Friction fix: if this document already has an open share link, the
+    // client's name and email were already collected at that step -- just
+    // in a different shape (first/last split there vs. one combined name
+    // field here). Prefill from it instead of asking again from scratch.
+    // Best-effort: any failure here just leaves the fields blank, exactly
+    // like before this existed.
+    let shareInfo = { exists: false };
+    try {
+      shareInfo = await api(`/api/generated/${generatedId}/share-link`);
+    } catch (e) {
+      // not worth blocking the modal over
+    }
+    const prefillName = shareInfo.exists
+      ? [shareInfo.client_first_name, shareInfo.client_last_name].filter(Boolean).join(" ")
+      : "";
+
     const nameInput = el("input", { type: "text", placeholder: "Jamie Rivera" });
+    nameInput.value = prefillName;
     const emailInput = el("input", { type: "email", placeholder: "client@company.com" });
+    emailInput.value = (shareInfo.exists && shareInfo.client_email) || "";
     const includeSender = el("input", { type: "checkbox" });
     const senderNameInput = el("input", { type: "text", placeholder: "Your name or business", style: "display:none;margin-top:8px;" });
+    // Defaults to the account's own identity (or this document's share-link
+    // sender override, if one was set) instead of a blank field every time
+    // -- the owner's own name/email is never actually new information, so
+    // there's nothing to type unless they want to show something different.
+    senderNameInput.value = (shareInfo.exists && shareInfo.sender_email ? "" : state.user.name) || "";
     const senderEmailInput = el("input", { type: "email", placeholder: "you@company.com", style: "display:none;margin-top:8px;" });
+    senderEmailInput.value = (shareInfo.exists && shareInfo.sender_email) || state.user.email || "";
     includeSender.addEventListener("change", () => {
       senderNameInput.style.display = includeSender.checked ? "block" : "none";
       senderEmailInput.style.display = includeSender.checked ? "block" : "none";
@@ -1585,6 +1625,9 @@ async function openSignatureModal(generatedId) {
     body.appendChild(
       el("div", { class: "form-row" }, [
         el("label", { class: "field-label" }, "Client's name and email"),
+        shareInfo.exists
+          ? el("p", { class: "subtitle", style: "margin:2px 0 6px;" }, "Filled in from this document's share link -- change it if a different person is signing.")
+          : null,
         nameInput,
         emailInput,
       ])
@@ -1592,6 +1635,7 @@ async function openSignatureModal(generatedId) {
     body.appendChild(
       el("div", { class: "form-row", style: "margin-top:14px;" }, [
         el("label", { style: "display:flex;gap:8px;align-items:center;cursor:pointer;" }, [includeSender, "Also require a signature from your side"]),
+        el("p", { class: "subtitle", style: "margin:2px 0 6px;" }, "Defaults to your own account's name and email -- edit below only if you want to show something else."),
         senderNameInput,
         senderEmailInput,
       ])
