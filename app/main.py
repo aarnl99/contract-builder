@@ -592,6 +592,7 @@ def _notification_settings_payload(user: User) -> dict:
     return {
         "redline_submitted": user.notify_redline_submitted,
         "redline_comment": user.notify_redline_comment,
+        "signature_events": user.notify_signature_events,
     }
 
 
@@ -603,6 +604,7 @@ def get_notification_settings(user: User = Depends(get_current_user)):
 class NotificationSettingsBody(BaseModel):
     redline_submitted: Optional[bool] = None
     redline_comment: Optional[bool] = None
+    signature_events: Optional[bool] = None
 
 
 @app.patch("/api/account/notification-settings")
@@ -613,27 +615,36 @@ def set_notification_settings(
 ):
     """Per-type opt-out. redline_submitted gates both the bell and a
     matching email; redline_comment gates the in-app bell only (comment-
-    thread replies never send email -- see post_share_edit_comment). Each
-    field is optional so the client can flip just one toggle at a time
-    without having to resend the other current value."""
+    thread replies never send email -- see post_share_edit_comment).
+    signature_events gates a signer finishing (bell only) and the whole
+    request being fully signed (bell + the "Fully signed" email -- see
+    _apply_signer_completed/_apply_submission_completed). Each field is
+    optional so the client can flip just one toggle at a time without
+    having to resend the other current values."""
     if body.redline_submitted is not None:
         user.notify_redline_submitted = body.redline_submitted
     if body.redline_comment is not None:
         user.notify_redline_comment = body.redline_comment
+    if body.signature_events is not None:
+        user.notify_signature_events = body.signature_events
     session.add(user)
     session.commit()
     return _notification_settings_payload(user)
 
 
 # ---------------------------------------------------------------------------
-# Notifications -- the bell in the topbar. Deliberately narrow: the only
-# two things that ever create a row are a client submitting redlines and a
-# client commenting on a declined redline (see _notify's call sites) --
-# each individually mutable via /api/account/notification-settings above.
-# (A third type, "response_acknowledged" -- a client viewing the owner's
-# accept/reject/counter response -- used to fire here too; it was removed
-# because it produced too much low-value email volume. Older rows of that
-# type may still exist and will still display fine.)
+# Notifications -- the bell in the topbar. The things that create a row: a
+# client submitting redlines, a client commenting on a redline, a signer
+# finishing their signature, and a signature request being fully signed by
+# everyone (see _notify's call sites) -- each individually mutable via
+# /api/account/notification-settings above. (A past type,
+# "response_acknowledged" -- a client viewing the owner's accept/reject/
+# counter response -- used to fire here too; it was removed because it
+# produced too much low-value email volume. Older rows of that type may
+# still exist and will still display fine. Signature events were, for a
+# while, deliberately excluded from the bell entirely and sent only as an
+# email with no opt-out -- see bug tracker: that silently failed to tell an
+# owner anything at all when the bell was the only thing being watched.)
 # ---------------------------------------------------------------------------
 
 def _notification_payload(n: Notification) -> dict:
@@ -2402,6 +2413,45 @@ def _send_response_email(
         pass  # bug tracker #33 -- see _send_reconsideration_email's identical comment
 
 
+def _find_open_share_link(session: Session, gc: GeneratedContract) -> Optional["ShareLink"]:
+    """The account's existing open share link for gc's whole lineage
+    family, if any -- factored out of create_share_link so a read-only
+    caller (see get_share_link_info below) can look this up without that
+    endpoint's side effect of creating a brand-new link when none exists."""
+    return session.exec(
+        select(ShareLink)
+        .where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)), ShareLink.status == "open")
+        .order_by(ShareLink.created_at.desc())
+    ).first()
+
+
+@app.get("/api/generated/{generated_id}/share-link")
+def get_share_link_info(
+    generated_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Read-only: does this document already have an open share link, and
+    if so, what client/sender identity is on file for it? Added so other
+    flows that need the same person's name/email -- right now just the
+    signature-request modal -- can prefill from it instead of asking from
+    scratch. Friction audit: the signature modal previously had no way to
+    know a client's name and email were already collected (in a different
+    shape -- first/last split here, one combined field there) at share-link
+    time for this exact document, and always asked again from zero."""
+    gc = _get_owned_generated(session, user, generated_id)
+    link = _find_open_share_link(session, gc)
+    if not link:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "client_first_name": link.client_first_name,
+        "client_last_name": link.client_last_name,
+        "client_email": link.client_email,
+        "sender_email": link.sender_email,
+    }
+
+
 class CreateShareBody(BaseModel):
     client_email: str = ""
     client_first_name: str = ""
@@ -2443,11 +2493,7 @@ def create_share_link(
     # history) would miss the family's real open link and create a second,
     # simultaneously-open one that close_share_link's own exact-id lookup
     # could never fully close either.
-    existing = session.exec(
-        select(ShareLink)
-        .where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)), ShareLink.status == "open")
-        .order_by(ShareLink.created_at.desc())
-    ).first()
+    existing = _find_open_share_link(session, gc)
     if existing:
         changed = False
         if existing.generated_contract_id != gc.id:
@@ -2599,9 +2645,10 @@ def _send_signature_request_email(request: Request, user: User, gc: GeneratedCon
 
 
 def _send_signature_completed_email(user: User, gc: GeneratedContract) -> None:
-    """Deliberately a direct email, not a call to _notify -- see that
-    function's docstring: the in-app bell is intentionally scoped to just
-    two redline-specific triggers, and this isn't one of them."""
+    """Always paired with a _notify bell call at this function's one call
+    site (_apply_submission_completed) -- see that function. Kept as its
+    own helper rather than inlined since it's also referenced from the
+    bug-tracker note on _notify's docstring."""
     body = f'Hi,\n\nEveryone has signed "{gc.name}". The signed document is in your Rotely documents library.\n\n- Rotely'
     try:
         ee.send_email(user.email, f'Fully signed: "{gc.name}"', body)
@@ -3056,6 +3103,18 @@ def submit_sign_consent(token: str, body: SignConsentBody, session: Session = De
 # ---------------------------------------------------------------------------
 
 def _apply_signer_completed(session: Session, submitter_id) -> None:
+    """Marks one signer done. If anyone else on this same request still
+    hasn't signed, this is the owner's only signal that something happened
+    until the rest finish too -- bug tracker: this used to notify no one at
+    all (no bell, no email) for every signer completion except possibly the
+    very last one, which went out as email only via
+    _apply_submission_completed. Bell only here, deliberately -- a mid-
+    flight status update isn't worth an email (same reasoning as a redline
+    comment). If this WAS the last pending signer, skip notifying here and
+    let _apply_submission_completed's "fully signed" notification cover it
+    instead, so a single-signer request (the common case) doesn't fire two
+    separate notifications for what is, from the owner's point of view, one
+    event."""
     signer = session.exec(
         select(SigningRequestSigner).where(SigningRequestSigner.docuseal_submitter_id == submitter_id)
     ).first()
@@ -3064,6 +3123,26 @@ def _apply_signer_completed(session: Session, submitter_id) -> None:
         signer.completed_at = datetime.utcnow()
         session.add(signer)
         session.commit()
+
+        sr = session.get(SigningRequest, signer.signing_request_id)
+        gc = session.get(GeneratedContract, sr.generated_contract_id) if sr else None
+        if sr and gc:
+            still_pending = session.exec(
+                select(SigningRequestSigner).where(
+                    SigningRequestSigner.signing_request_id == sr.id,
+                    SigningRequestSigner.status != "completed",
+                )
+            ).all()
+            if still_pending:
+                owner = session.get(User, gc.owner_id)
+                if owner and owner.notify_signature_events:
+                    waiting_on = ", ".join(p.name for p in still_pending)
+                    _notify(
+                        session, owner.id, "signature_signed",
+                        title=f'{signer.name} signed "{gc.name}"',
+                        body=f"Waiting on {waiting_on} to sign.",
+                        generated_contract_id=gc.id,
+                    )
 
 
 def _apply_signer_declined(session: Session, submitter_id) -> None:
@@ -3110,8 +3189,22 @@ def _apply_submission_completed(session: Session, submission_id) -> None:
         session.commit()
         if gc:
             owner = session.get(User, gc.owner_id)
-            if owner:
+            # Bug tracker: this used to email unconditionally, with no bell
+            # and no opt-out, so an owner who only watches the bell (the
+            # normal pattern for every other notification in this app) got
+            # no signal at all when a document finished signing. Now gated
+            # on notify_signature_events, same toggle as the mid-flight
+            # per-signer notification above -- and fires both the bell and
+            # the email together, since "fully signed" is the one signature
+            # event worth an email, not just a bell ping.
+            if owner and owner.notify_signature_events:
                 _send_signature_completed_email(owner, gc)
+                _notify(
+                    session, owner.id, "signature_completed",
+                    title=f'Fully signed: "{gc.name}"',
+                    body="Everyone has signed. The signed document is in your documents library.",
+                    generated_contract_id=gc.id,
+                )
 
 
 def _apply_submission_expired(session: Session, submission_id) -> None:
@@ -4892,16 +4985,20 @@ def _send_redlines_submitted_notification(owner: User, gc: GeneratedContract, li
 
 
 def _notify(session: Session, user_id: int, type_: str, title: str, body: str = "", generated_contract_id: Optional[int] = None):
-    """Writes one row to the owner's in-app notification bell. Two call
-    sites, on purpose (see the Notification model docstring): submit_redlines
-    (a client submitted redlines) and post_share_edit_comment (a client
-    commented in a redline's thread -- ANY redline as of Phase 2 of the
-    redline-negotiation overhaul, not just a declined one; bell only, no
-    email -- see that function's docstring). Nothing else should call
-    this -- keeping the bell to exactly those triggers is a deliberate
-    product decision, not an oversight. (acknowledge_response used to be a
-    third trigger; it was removed for firing too often with too little
-    value -- see that endpoint's docstring.)"""
+    """Writes one row to the owner's in-app notification bell. Call sites,
+    on purpose (see the Notification model docstring): submit_redlines (a
+    client submitted redlines), post_share_edit_comment (a client commented
+    in a redline's thread -- ANY redline as of Phase 2 of the redline-
+    negotiation overhaul, not just a declined one; bell only, no email --
+    see that function's docstring), _apply_signer_completed (one signer
+    finished signing but others are still pending; bell only, same reasoning
+    as a redline comment -- a mid-flight status update, not big enough for
+    email), and _apply_submission_completed (everyone has signed; bell +
+    email, gated together by notify_signature_events). Keeping the bell to
+    exactly these triggers is a deliberate product decision, not an
+    oversight -- a new call site should be a deliberate choice too.
+    (acknowledge_response used to be a trigger; it was removed for firing
+    too often with too little value -- see that endpoint's docstring.)"""
     session.add(Notification(user_id=user_id, type=type_, title=title, body=body, generated_contract_id=generated_contract_id))
     session.commit()
 
