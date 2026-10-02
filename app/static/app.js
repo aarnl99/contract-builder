@@ -1405,6 +1405,23 @@ async function openSignatureModal(generatedId) {
   function renderStatusView(sr) {
     body.innerHTML = "";
     body.appendChild(el("p", { class: "subtitle" }, "Sent through DocuSeal. Each signer first agrees to a quick photo step on Rotely's own page before reaching the actual signing form."));
+    // Bug tracker #55: nothing told the owner that a signature request only
+    // ever updates itself automatically if DocuSeal's webhook is actually
+    // configured -- without it, this modal could sit on "Pending" forever
+    // even after the document is fully signed, with no clue why. Surface
+    // the exact URL to add in DocuSeal's dashboard whenever that env var
+    // isn't set (the backend reports this honestly via webhook_configured,
+    // not guessed client-side), and only while there's still something to
+    // wait on.
+    if (!sr.webhook_configured && sr.status === "pending") {
+      body.appendChild(
+        el("div", { class: "warn-box" }, [
+          el("strong", {}, "Status won't update automatically yet. "),
+          "Add this URL as a webhook endpoint in your DocuSeal account (Settings → Webhooks) to get live updates, or use “Check for updates” below in the meantime: ",
+          el("code", {}, `${location.origin}/api/webhooks/docuseal`),
+        ])
+      );
+    }
     const list = el("div", { class: "share-info-box" });
     sr.signers.forEach((s) => {
       const linkUrl = `${location.origin}${s.sign_url}`;
@@ -1422,6 +1439,33 @@ async function openSignatureModal(generatedId) {
 
     const actions = [];
     if (sr.status === "pending") {
+      // Bug tracker #55: the only way "pending" ever moved before was
+      // DocuSeal's webhook firing -- never configured, or a delivery lost,
+      // and a fully-signed document just sat here forever with nothing in
+      // the UI to do about it. This hits the same reconciliation endpoint
+      // the backend would otherwise only run from a webhook, on demand.
+      actions.push(
+        el(
+          "button",
+          {
+            class: "btn secondary",
+            onclick: async (e) => {
+              const btn = e.currentTarget;
+              btn.disabled = true;
+              btn.textContent = "Checking...";
+              try {
+                const refreshed = await api(`/api/generated/${generatedId}/signature-request/refresh`, { method: "POST" });
+                renderStatusView(refreshed);
+              } catch (err) {
+                btn.disabled = false;
+                btn.textContent = "Check for updates";
+                alert(err.message);
+              }
+            },
+          },
+          "Check for updates"
+        )
+      );
       actions.push(
         el(
           "button",
