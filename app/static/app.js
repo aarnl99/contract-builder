@@ -67,7 +67,13 @@ async function api(path, opts = {}) {
     credentials: "same-origin",
   });
   if (!res.ok) {
-    let msg = res.statusText;
+    // res.statusText is unreliable as a fallback: HTTP/2 (which Render's
+    // edge serves) has no status-reason phrase at all, so browsers report
+    // it as "" -- an unhandled backend crash (a plain 500 with no JSON
+    // "detail", e.g. not raised via HTTPException) would otherwise surface
+    // as a blank .error-box with no text, leaving the user with no idea
+    // what happened.
+    let msg = res.statusText || `Something went wrong (error ${res.status}). Please try again.`;
     let code = null;
     try {
       const data = await res.json();
@@ -82,6 +88,7 @@ async function api(path, opts = {}) {
         msg = data.detail || msg;
       }
     } catch (e) {}
+    if (!msg) msg = `Something went wrong (error ${res.status}). Please try again.`;
     const err = new Error(msg);
     if (code) err.code = code;
     throw err;
@@ -551,6 +558,7 @@ function AuthView(mode) {
   const justVerified = hashQuery.get("verified") === "1";
   const verifyError = hashQuery.get("verify_error") === "1";
   const googleError = hashQuery.get("google_error") === "1";
+  const googleErrorReason = hashQuery.get("reason") || "";
   const resetError = hashQuery.get("reset_error") === "1";
   if (justVerified || verifyError || googleError || resetError) {
     history.replaceState(null, "", location.pathname + "#/login");
@@ -646,6 +654,8 @@ function AuthView(mode) {
       errorBox.appendChild(el("div", { class: "notice-box" }, "Email verified — you can log in now."));
     } else if (tab === "login" && verifyError) {
       errorBox.appendChild(el("div", { class: "error-box" }, "That verification link is invalid or expired. Request a new one below."));
+    } else if (tab === "register" && googleError && googleErrorReason === "access_code") {
+      errorBox.appendChild(el("div", { class: "error-box" }, "Enter your access code below, then continue with Google."));
     } else if (tab === "login" && googleError) {
       errorBox.appendChild(el("div", { class: "error-box" }, "Couldn't sign in with Google. Try again, or log in with your email and password."));
     } else if (tab === "login" && resetError) {
@@ -661,8 +671,19 @@ function AuthView(mode) {
     const passInput = el("input", { type: "password", placeholder: tab === "register" ? "At least 8 characters" : "Password" });
     const nameInput = el("input", { type: "text", placeholder: "Full name" });
     const confirmInput = el("input", { type: "password", placeholder: "Re-enter your password" });
+    const codeInput = el("input", { type: "text", placeholder: "e.g. userotelynow", autocapitalize: "none", autocorrect: "off" });
 
-    const fields = [el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Email"), emailInput])];
+    const fields = [];
+    if (tab === "register") {
+      fields.push(
+        el("div", { class: "form-row" }, [
+          el("label", { class: "field-label" }, "Access code"),
+          codeInput,
+          el("div", { style: "font-size:12px;color:var(--muted);margin-top:4px;" }, "Rotely is invite-only right now. Don't have a code? Join the waitlist at rotely.ai."),
+        ])
+      );
+    }
+    fields.push(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Email"), emailInput]));
     if (tab === "register") {
       fields.push(
         el("div", { class: "form-row" }, [el("label", { class: "field-label" }, ["Full name", el("span", { class: "req" }, " *")]), nameInput])
@@ -686,6 +707,10 @@ function AuthView(mode) {
     submitBtn.addEventListener("click", async () => {
       errorBox.innerHTML = "";
       if (tab === "register") {
+        if (!codeInput.value.trim()) {
+          errorBox.appendChild(el("div", { class: "error-box" }, "Please enter your access code."));
+          return;
+        }
         if (!nameInput.value.trim()) {
           errorBox.appendChild(el("div", { class: "error-box" }, "Please enter your full name."));
           return;
@@ -697,7 +722,7 @@ function AuthView(mode) {
       }
       try {
         if (tab === "register") {
-          const res = await api("/api/register", { method: "POST", body: { email: emailInput.value, password: passInput.value, name: nameInput.value } });
+          const res = await api("/api/register", { method: "POST", body: { email: emailInput.value, password: passInput.value, name: nameInput.value, access_code: codeInput.value } });
           registeredEmail = res.email;
           draw();
           return;
@@ -736,13 +761,26 @@ function AuthView(mode) {
     fields.forEach((f) => card.appendChild(f));
     card.appendChild(submitBtn);
 
+    const googleBtn = el("a", { href: "/api/auth/google/start", class: "btn secondary block google-btn" }, [
+      el("span", { html: '<svg width="16" height="16" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.9 32.6 29.4 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.1 5.1 29.3 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.2-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.5 19 12 24 12c3.1 0 5.8 1.1 8 3l6-6C34.1 5.1 29.3 3 24 3 16.3 3 9.6 7.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 45c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 36.4 26.7 37 24 37c-5.3 0-9.8-3.4-11.4-8.1l-6.5 5C9.5 40.6 16.2 45 24 45z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1.1 3-3.4 5.4-6.3 6.7l6.2 5.2C38.9 37.4 42 31.2 42 24c0-1.2-.1-2.4-.4-3.5z"/></svg>' }),
+      el("span", {}, "Continue with Google"),
+    ]);
+    if (tab === "register") {
+      // New accounts need the access code too -- it's only known client-side
+      // (the input above), so it rides along as a query param and comes back
+      // to us in the session on the server for google_auth_callback to check.
+      googleBtn.addEventListener("click", (e) => {
+        if (!codeInput.value.trim()) {
+          e.preventDefault();
+          errorBox.innerHTML = "";
+          errorBox.appendChild(el("div", { class: "error-box" }, "Please enter your access code first."));
+          return;
+        }
+        googleBtn.href = `/api/auth/google/start?access_code=${encodeURIComponent(codeInput.value.trim())}`;
+      });
+    }
     card.appendChild(el("div", { class: "auth-divider" }, [el("span", {}, "or")]));
-    card.appendChild(
-      el("a", { href: "/api/auth/google/start", class: "btn secondary block google-btn" }, [
-        el("span", { html: '<svg width="16" height="16" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.9 32.6 29.4 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.1 5.1 29.3 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.2-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.5 19 12 24 12c3.1 0 5.8 1.1 8 3l6-6C34.1 5.1 29.3 3 24 3 16.3 3 9.6 7.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 45c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 36.4 26.7 37 24 37c-5.3 0-9.8-3.4-11.4-8.1l-6.5 5C9.5 40.6 16.2 45 24 45z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1.1 3-3.4 5.4-6.3 6.7l6.2 5.2C38.9 37.4 42 31.2 42 24c0-1.2-.1-2.4-.4-3.5z"/></svg>' }),
-        el("span", {}, "Continue with Google"),
-      ])
-    );
+    card.appendChild(googleBtn);
   }
   draw();
   return wrap;
