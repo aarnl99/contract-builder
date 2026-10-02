@@ -66,6 +66,12 @@ ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "aaronkluan@gmail.com").strip().lowe
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
+# Rotely is invite-only during the friends-and-family beta: creating a new
+# account (either path -- email/password or Google) requires this code.
+# Logging into an account that already exists never requires it. Settable
+# via env so it can be rotated/removed without a code change.
+SIGNUP_ACCESS_CODE = os.environ.get("SIGNUP_ACCESS_CODE", "userotelynow")
+
 app = FastAPI(title="Rotely")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
 
@@ -116,6 +122,7 @@ class RegisterBody(BaseModel):
     email: str
     password: str
     name: str = ""
+    access_code: str = ""
 
 
 class LoginBody(BaseModel):
@@ -154,6 +161,8 @@ def _send_verification_email(request: Request, user: User) -> None:
 
 @app.post("/api/register")
 def register(body: RegisterBody, request: Request, session: Session = Depends(get_session)):
+    if body.access_code.strip().lower() != SIGNUP_ACCESS_CODE.lower():
+        raise HTTPException(400, "That access code isn't valid. Double-check it and try again.")
     email = body.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(400, "Please provide a valid email address")
@@ -311,11 +320,15 @@ def reset_password(body: ResetPasswordBody, request: Request, session: Session =
 
 
 @app.get("/api/auth/google/start")
-def google_auth_start(request: Request):
+def google_auth_start(request: Request, access_code: str = ""):
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(503, "Google sign-in isn't configured on this deploy.")
     state = secrets.token_urlsafe(24)
     request.session["google_oauth_state"] = state
+    # Stashed for the callback, which is the only place we know whether this
+    # sign-in is creating a brand-new account (see google_auth_callback) --
+    # an existing account signing back in never needs this.
+    request.session["google_oauth_access_code"] = access_code.strip()
     params = {
         "client_id": GOOGLE_CLIENT_ID,
         "redirect_uri": f"{_base_url(request)}/api/auth/google/callback",
@@ -374,7 +387,10 @@ def google_auth_callback(request: Request, code: str = "", state: str = "", erro
     name = profile.get("name", "") or email.split("@")[0]
 
     user = session.exec(select(User).where(User.email == email)).first()
+    pending_access_code = request.session.pop("google_oauth_access_code", "")
     if not user:
+        if pending_access_code.strip().lower() != SIGNUP_ACCESS_CODE.lower():
+            return RedirectResponse(url="/#/register?google_error=1&reason=access_code")
         user = User(
             email=email, password_hash=hash_password(secrets.token_urlsafe(32)), name=name,
             email_verified=True, google_sub=google_sub,
@@ -2604,15 +2620,15 @@ def create_signature_request(
         except OSError:
             pass
 
-    if not submitters_resp:
+    if not submitters_resp or not submitters_resp.get("submitters"):
         raise HTTPException(502, "DocuSeal returned an empty response.")
-    submission_id = submitters_resp[0]["submission_id"]
+    submission_id = submitters_resp["id"]
     sr = SigningRequest(generated_contract_id=gc.id, docuseal_submission_id=submission_id)
     session.add(sr)
     session.commit()
     session.refresh(sr)
 
-    by_email = {item["email"]: item for item in submitters_resp}
+    by_email = {item["email"]: item for item in submitters_resp["submitters"]}
     signers = []
     for spec in signer_specs:
         item = by_email.get(spec["email"])
