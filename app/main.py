@@ -2537,6 +2537,105 @@ def _send_signature_completed_email(user: User, gc: GeneratedContract) -> None:
         pass
 
 
+@app.post("/api/documents/upload-for-signature")
+def upload_document_for_signature(
+    request: Request,
+    name: str = Form(""),
+    document_type: str = Form("Other"),
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Lets an owner send a document out for signature without first
+    building it through the draft/template flow -- e.g. a contract someone
+    else drafted, or a one-off they don't want to turn into a reusable
+    master document. Creates a GeneratedContract with template_id=None
+    pointing straight at the uploaded file; that shape is already handled
+    everywhere a GeneratedContract is touched (see edit_generated_document's
+    gen_dir fallback and every `if gc.template_id else None` guard), so the
+    existing send-for-signature flow, /sign/{token}, the DocuSeal webhook,
+    and revision history all work on it completely unchanged."""
+    if not file.filename.lower().endswith(".docx"):
+        raise HTTPException(400, "Please upload a .docx file (Word format).")
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_TEMPLATE_UPLOAD_BYTES:
+                raise HTTPException(400, f"That file is too large -- uploads are limited to {MAX_TEMPLATE_UPLOAD_BYTES // (1024 * 1024)}MB.")
+        except ValueError:
+            pass  # malformed header -- fall through to the streaming check below
+
+    display_name = (name.strip() or os.path.splitext(file.filename)[0]).strip()[:200] or "Uploaded document"
+    doc_type = document_type.strip() or "Other"
+
+    with _generation_lock_for(user.id):
+        # Same quota accounting as every other path that creates a fresh
+        # GeneratedContract (see _log_generation_event's docstring) --
+        # otherwise this would be a quota-free side door around the plan
+        # limit that generate_contract and the inbound-email draft path
+        # both enforce.
+        plan = _plan_info(session, user)
+        if plan["limit"] is not None and plan["used"] >= plan["limit"]:
+            raise HTTPException(
+                402,
+                f"You have used all {plan['limit']} contracts included in your {user.plan} plan this month. "
+                f"Upgrade your plan to draft more.",
+            )
+
+        up_dir = os.path.join(UPLOADS_DIR, str(user.id), "direct_uploads")
+        os.makedirs(up_dir, exist_ok=True)
+        out_path = os.path.join(up_dir, f"{secrets.token_hex(8)}.docx")
+        written = 0
+        try:
+            with open(out_path, "wb") as f:
+                while True:
+                    chunk = file.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_TEMPLATE_UPLOAD_BYTES:
+                        raise HTTPException(400, f"That file is too large -- uploads are limited to {MAX_TEMPLATE_UPLOAD_BYTES // (1024 * 1024)}MB.")
+                    f.write(chunk)
+            de.load(out_path)  # fail fast on a corrupt/non-docx upload, not later inside docx_engine or DocuSeal
+        except HTTPException:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            raise
+        except Exception:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            raise HTTPException(400, "Couldn't read that file as a Word document. Make sure it's a valid, uncorrupted .docx.")
+
+        gc = GeneratedContract(
+            owner_id=user.id,
+            template_id=None,
+            template_name="Uploaded document",
+            document_type=doc_type,
+            name=display_name,
+            file_path=out_path,
+            values_json="[]",
+            field_positions_json="[]",
+            parties_json="[]",
+        )
+        session.add(gc)
+        session.flush()
+        _log_generation_event(session, user.id, gc.id)
+        session.commit()
+        session.refresh(gc)
+
+    return {
+        "generated_id": gc.id,
+        "name": gc.name,
+        "document_type": gc.document_type,
+        "plan": _plan_info(session, user),
+    }
+
+
 class CreateSignatureRequestBody(BaseModel):
     client_name: str
     client_email: str
