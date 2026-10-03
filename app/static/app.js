@@ -1512,76 +1512,101 @@ async function openSignatureModal(generatedId) {
     body.appendChild(el("div", { class: "modal-actions" }, actions));
   }
 
-  // Where in the document the signature fields will actually land --
-  // null means "append a new signature block at the end" (the original,
-  // always-safe default). Set from the anchor-preview fetch below (if it
-  // auto-detects an existing "sign here" line) and can be overridden by
-  // clicking anywhere else in that preview. See
-  // GET /api/generated/{id}/signature-anchor-preview and
-  // docx_engine.detect_signature_anchor_paragraph.
-  let anchorIndex = null;
-
-  function highlightAnchor(previewEl, idx) {
-    previewEl.querySelectorAll(".para.sig-anchor-selected").forEach((p) => p.classList.remove("sig-anchor-selected"));
-    if (idx === null) return;
-    const match = previewEl.querySelector(`.para[data-p="${idx}"]`);
-    if (match) match.classList.add("sig-anchor-selected");
+  // The DocuSeal Form Builder embed (<docuseal-builder>) replaces the old
+  // click-a-paragraph anchor picker entirely -- instead of guessing where
+  // a signature line is and letting someone nudge that guess, the owner
+  // now drags real field boxes (signature, text, date, initials, etc.)
+  // straight onto the document and assigns each one to a role, the same
+  // way Google eSign/DocuSign's own builders work. See renderFieldDesigner
+  // below and main.py's get_signature_builder_token.
+  function ensureDocusealBuilderScript() {
+    if (window.customElements && window.customElements.get("docuseal-builder")) return Promise.resolve();
+    if (window.__docusealBuilderScriptPromise) return window.__docusealBuilderScriptPromise;
+    window.__docusealBuilderScriptPromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://cdn.docuseal.com/js/builder.js";
+      s.onload = () => resolve();
+      s.onerror = () => {
+        window.__docusealBuilderScriptPromise = null;
+        reject(new Error("Couldn't load the signature field designer. Check your connection and try again."));
+      };
+      document.head.appendChild(s);
+    });
+    return window.__docusealBuilderScriptPromise;
   }
 
-  async function buildAnchorPicker() {
-    const wrap = el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Where should the signature go?")]);
-    const hint = el("p", { class: "subtitle", style: "margin:2px 0 8px;" }, "Loading the document...");
-    wrap.appendChild(hint);
-    let preview = null;
+  // identities: { client_name, client_email, include_sender, sender_name, sender_email }
+  // collected by renderIntakeForm below, passed through unchanged once the
+  // owner clicks "Continue to send" here -- this step only ever places
+  // fields, it doesn't re-collect who's signing.
+  async function renderFieldDesigner(identities) {
+    body.innerHTML = "";
+    body.appendChild(el("p", { class: "subtitle" }, "Loading the field designer..."));
+    const errBox = el("div", {});
+
+    let builderData;
     try {
-      const data = await api(`/api/generated/${generatedId}/signature-anchor-preview`);
-      preview = el("div", { class: "contract-view compact sig-anchor-preview" });
-      preview.innerHTML = data.html;
-      anchorIndex = data.detected_paragraph_index;
-      hint.textContent =
-        anchorIndex !== null
-          ? "We found what looks like a signature line (highlighted below) and will place the fields there. Click anywhere else in the document to use a different spot instead."
-          : "We didn't spot an existing signature line, so the fields will be added at the end of the document. Click anywhere below to place them somewhere specific instead.";
-      highlightAnchor(preview, anchorIndex);
-      const selectAnchor = (idx) => {
-        window.getSelection().removeAllRanges();
-        anchorIndex = idx;
-        highlightAnchor(preview, anchorIndex);
-        hint.textContent = "The signature fields will be placed at the highlighted spot below. Click anywhere else to move it.";
-      };
-      preview.addEventListener("mouseup", () => {
-        setTimeout(() => {
-          const info = computeCursorPosition(preview);
-          if (!info || info.error || info.table_path) return; // table-cell clicks aren't supported yet -- see detect_signature_anchor_paragraph's scope note
-          selectAnchor(info.paragraph_index);
-        }, 0);
+      await ensureDocusealBuilderScript();
+      builderData = await api(`/api/generated/${generatedId}/signature-builder-token`, {
+        method: "POST",
+        body: { include_sender: identities.include_sender },
       });
-      // A blank line (render_paragraphs_html emits "<p class=\"para\">&nbsp;</p>"
-      // with no run spans at all for an empty paragraph) has nothing for
-      // computeCursorPosition's run-ancestor lookup to find, so the mouseup
-      // handler above silently no-ops there -- with no feedback telling
-      // someone why clicking a blank line between sections didn't move the
-      // highlight. Handle that one case directly off the click target
-      // instead: only when the clicked <p class="para"> has no .run child
-      // (i.e. mouseup's own path didn't/can't handle it) and isn't a
-      // table-cell paragraph (data-path set -- same "not supported yet"
-      // scope as above).
-      preview.addEventListener("click", (e) => {
-        const paraEl = e.target.closest(".para");
-        if (!paraEl || !preview.contains(paraEl)) return;
-        if (paraEl.querySelector(".run")) return;
-        if (paraEl.dataset.path) return;
-        if (paraEl.dataset.p === undefined) return;
-        selectAnchor(parseInt(paraEl.dataset.p, 10));
-      });
-      wrap.appendChild(preview);
     } catch (e) {
-      // Anchor preview is a nice-to-have, not a blocker -- if it fails to
-      // load for any reason, fall through with anchorIndex left at null,
-      // which is exactly today's always-append-at-the-end behavior.
-      hint.textContent = "Couldn't load a preview of this document -- the signature will be added at the end instead.";
+      body.innerHTML = "";
+      body.appendChild(el("div", { class: "error-box" }, e.message));
+      body.appendChild(
+        el("div", { class: "modal-actions" }, [
+          el("button", { class: "btn secondary", onclick: () => renderIntakeForm() }, "Back"),
+        ])
+      );
+      return;
     }
-    return wrap;
+
+    body.innerHTML = "";
+    body.appendChild(
+      el("p", { class: "subtitle" }, "Drag fields onto the document and assign each one to who should fill it in -- signature, initials, text, date, or anything else in the list on the right. Changes save automatically.")
+    );
+    const builderEl = el("docuseal-builder", {
+      "data-token": builderData.token,
+      "data-roles": builderData.roles.join(","),
+      "data-field-types": "signature,initials,text,date,number,checkbox,select,radio",
+      "data-with-send-button": "false",
+      "data-with-upload-button": "false",
+      "data-with-sign-yourself-button": "false",
+      style: "display:block;height:560px;margin-top:10px;",
+    });
+    body.appendChild(builderEl);
+    body.appendChild(errBox);
+
+    const continueBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Continue to send");
+    continueBtn.addEventListener("click", async () => {
+      errBox.innerHTML = "";
+      continueBtn.disabled = true;
+      continueBtn.textContent = "Sending...";
+      try {
+        const reqBody = {
+          client_name: identities.client_name,
+          client_email: identities.client_email,
+          include_sender: identities.include_sender,
+        };
+        if (identities.include_sender) {
+          reqBody.sender_name = identities.sender_name;
+          reqBody.sender_email = identities.sender_email;
+        }
+        const sr = await api(`/api/generated/${generatedId}/signature-request`, { method: "POST", body: reqBody });
+        renderStatusView(sr);
+      } catch (err) {
+        errBox.appendChild(el("div", { class: "error-box" }, err.message));
+        continueBtn.disabled = false;
+        continueBtn.textContent = "Continue to send";
+      }
+    });
+    body.appendChild(
+      el("div", { class: "modal-actions" }, [
+        el("button", { class: "btn secondary", onclick: () => renderIntakeForm() }, "Back"),
+        continueBtn,
+      ])
+    );
   }
 
   async function renderIntakeForm() {
@@ -1640,39 +1665,24 @@ async function openSignatureModal(generatedId) {
         senderEmailInput,
       ])
     );
-    body.appendChild(el("div", { style: "margin-top:14px;" }, [await buildAnchorPicker()]));
     body.appendChild(errBox);
-    const sendBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Send for signature");
-    sendBtn.addEventListener("click", async () => {
+    const nextBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Next: place signature fields");
+    nextBtn.addEventListener("click", () => {
       errBox.innerHTML = "";
       const name = nameInput.value.trim(), email = emailInput.value.trim();
       if (!name || !email) {
         errBox.appendChild(el("div", { class: "error-box" }, "Enter the client's name and email."));
         return;
       }
-      const reqBody = {
-        client_name: name,
-        client_email: email,
-        include_sender: includeSender.checked,
-        signature_anchor_paragraph_index: anchorIndex,
-      };
+      const identities = { client_name: name, client_email: email, include_sender: includeSender.checked };
       if (includeSender.checked) {
-        reqBody.sender_name = senderNameInput.value.trim();
-        reqBody.sender_email = senderEmailInput.value.trim();
+        identities.sender_name = senderNameInput.value.trim();
+        identities.sender_email = senderEmailInput.value.trim();
       }
-      sendBtn.disabled = true;
-      sendBtn.textContent = "Sending...";
-      try {
-        const sr = await api(`/api/generated/${generatedId}/signature-request`, { method: "POST", body: reqBody });
-        renderStatusView(sr);
-      } catch (err) {
-        errBox.appendChild(el("div", { class: "error-box" }, err.message));
-        sendBtn.disabled = false;
-        sendBtn.textContent = "Send for signature";
-      }
+      renderFieldDesigner(identities);
     });
     body.appendChild(
-      el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), sendBtn])
+      el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), nextBtn])
     );
   }
 
