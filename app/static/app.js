@@ -369,8 +369,9 @@ function toggleAvatarMenu() {
 // ---------------------------------------------------------------------------
 // Notification bell -- fires on the events listed in main.py's _notify
 // docstring: a client submits redlines, a client comments on a redline, a
-// signer finishes signing while others are still pending, and a signature
-// request is fully signed by everyone. Nothing else lights up the bell.
+// signer finishes signing while others are still pending, a signature
+// request is fully signed by everyone, and a signer declines to sign (which
+// halts the request right away). Nothing else lights up the bell.
 // "response_acknowledged" is kept in the label map only so any older,
 // already-delivered notifications of that (now-retired) type still render
 // with a readable title instead of raw text.
@@ -382,11 +383,12 @@ const NOTIF_TYPE_LABELS = {
   redline_comment: "Redline comment",
   signature_signed: "Signature received",
   signature_completed: "Fully signed",
+  signature_declined: "Signing declined",
 };
 // Notification types that are about the e-signature flow, not redlines --
 // clicking one of these should open the signature status modal instead of
 // the redlines modal (see toggleNotifDropdown's click handler below).
-const SIGNATURE_NOTIF_TYPES = new Set(["signature_signed", "signature_completed"]);
+const SIGNATURE_NOTIF_TYPES = new Set(["signature_signed", "signature_completed", "signature_declined"]);
 
 function refreshNotifBadge() {
   if (!state.user) return;
