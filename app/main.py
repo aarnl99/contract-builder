@@ -2659,6 +2659,21 @@ def _send_signature_completed_email(user: User, gc: GeneratedContract) -> None:
         pass
 
 
+def _send_signature_declined_email(user: User, gc: GeneratedContract, signer_name: str = "") -> None:
+    """Mirrors _send_signature_completed_email. Paired with a _notify bell
+    call at each of this function's two call sites (_apply_signer_declined,
+    _apply_submission_declined) -- see those functions' docstrings for why
+    only one of the two ever actually fires this for a given request."""
+    who = f"{signer_name} declined" if signer_name else "Someone declined"
+    body = f'Hi,\n\n{who} to sign "{gc.name}". The signature request has been stopped -- you may want to follow up or send a new request.\n\n- Rotely'
+    try:
+        ee.send_email(user.email, f'Signing declined: "{gc.name}"', body)
+    except RuntimeError:
+        pass
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        pass
+
+
 @app.post("/api/documents/upload-for-signature")
 def upload_document_for_signature(
     request: Request,
@@ -3252,6 +3267,18 @@ def _apply_signer_completed(session: Session, submitter_id) -> None:
 
 
 def _apply_signer_declined(session: Session, submitter_id) -> None:
+    """Bug tracker: this used to update signer/sr status only -- no bell,
+    no email -- so a decline was silent and the owner only found out by
+    opening the document and checking. Unlike a completion (which waits
+    for every signer before notifying), a decline halts the whole request
+    right away, so it's notified the moment sr actually transitions out of
+    "pending" here. _apply_submission_declined below has the identical
+    "was it pending" guard and the same notify call, because DocuSeal can
+    deliver either a form.declined (this function) or a submission.declined
+    (that one) for the same decline -- whichever arrives first does the
+    transition and the notifying; the second one finds sr already
+    "declined" and does nothing, so the owner never gets duplicate
+    notifications for one decline."""
     signer = session.exec(
         select(SigningRequestSigner).where(SigningRequestSigner.docuseal_submitter_id == submitter_id)
     ).first()
@@ -3259,10 +3286,23 @@ def _apply_signer_declined(session: Session, submitter_id) -> None:
         signer.status = "declined"
         session.add(signer)
         sr = session.get(SigningRequest, signer.signing_request_id)
-        if sr and sr.status == "pending":
+        was_pending = bool(sr and sr.status == "pending")
+        if was_pending:
             sr.status = "declined"
             session.add(sr)
         session.commit()
+        if was_pending:
+            gc = session.get(GeneratedContract, sr.generated_contract_id)
+            if gc:
+                owner = session.get(User, gc.owner_id)
+                if owner and owner.notify_signature_events:
+                    _send_signature_declined_email(owner, gc, signer.name)
+                    _notify(
+                        session, owner.id, "signature_declined",
+                        title=f'{signer.name} declined to sign "{gc.name}"',
+                        body="The signature request has been stopped. You may want to follow up or send a new request.",
+                        generated_contract_id=gc.id,
+                    )
 
 
 def _apply_submission_completed(session: Session, submission_id) -> None:
@@ -3324,6 +3364,12 @@ def _apply_submission_expired(session: Session, submission_id) -> None:
 
 
 def _apply_submission_declined(session: Session, submission_id) -> None:
+    """See _apply_signer_declined's docstring -- same notify-once-on-the-
+    "pending" transition guard, covering DocuSeal's submission.declined
+    event. This event doesn't identify which signer declined, so the
+    notification here is generic; it only fires when this is the event
+    that gets there first (form.declined usually wins, since it names the
+    signer)."""
     sr = session.exec(
         select(SigningRequest).where(SigningRequest.docuseal_submission_id == submission_id)
     ).first()
@@ -3331,6 +3377,17 @@ def _apply_submission_declined(session: Session, submission_id) -> None:
         sr.status = "declined"
         session.add(sr)
         session.commit()
+        gc = session.get(GeneratedContract, sr.generated_contract_id)
+        if gc:
+            owner = session.get(User, gc.owner_id)
+            if owner and owner.notify_signature_events:
+                _send_signature_declined_email(owner, gc)
+                _notify(
+                    session, owner.id, "signature_declined",
+                    title=f'Signing declined: "{gc.name}"',
+                    body="The signature request has been stopped. You may want to follow up or send a new request.",
+                    generated_contract_id=gc.id,
+                )
 
 
 def _reconcile_signature_request_from_docuseal(session: Session, sr: SigningRequest) -> None:
@@ -5099,12 +5156,16 @@ def _notify(session: Session, user_id: int, type_: str, title: str, body: str = 
     see that function's docstring), _apply_signer_completed (one signer
     finished signing but others are still pending; bell only, same reasoning
     as a redline comment -- a mid-flight status update, not big enough for
-    email), and _apply_submission_completed (everyone has signed; bell +
-    email, gated together by notify_signature_events). Keeping the bell to
-    exactly these triggers is a deliberate product decision, not an
-    oversight -- a new call site should be a deliberate choice too.
-    (acknowledge_response used to be a trigger; it was removed for firing
-    too often with too little value -- see that endpoint's docstring.)"""
+    email), _apply_submission_completed (everyone has signed; bell +
+    email, gated together by notify_signature_events), and
+    _apply_signer_declined / _apply_submission_declined (a signer declined,
+    which halts the whole request right away unlike a completion -- bell +
+    email, same gating; see those functions' docstrings for why only one of
+    that pair ever actually fires per decline). Keeping the bell to exactly
+    these triggers is a deliberate product decision, not an oversight -- a
+    new call site should be a deliberate choice too. (acknowledge_response
+    used to be a trigger; it was removed for firing too often with too
+    little value -- see that endpoint's docstring.)"""
     session.add(Notification(user_id=user_id, type=type_, title=title, body=body, generated_contract_id=generated_contract_id))
     session.commit()
 
