@@ -76,12 +76,14 @@ class User(SQLModel, table=True):
     # declined one, as of Phase 2 of the redline-negotiation overhaul).
     # Gates the in-app bell only -- thread replies never send email.
     notify_redline_comment: bool = True
-    # A signer finished signing (bell only -- see _apply_signer_completed)
-    # or an entire signature request is fully signed by everyone (gates both
-    # the bell and the "Fully signed" email -- see _apply_submission_completed
-    # and _send_signature_completed_email). Previously this was hardcoded
-    # to email-only with no bell and no way to opt out at all; see bug
-    # tracker entry on missing signature notifications.
+    # A signer finished signing (bell only -- see _apply_signer_completed),
+    # an entire signature request is fully signed by everyone, or a signer
+    # declined to sign (the latter two gate both the bell and an email --
+    # see _apply_submission_completed/_send_signature_completed_email and
+    # _apply_signer_declined, _apply_submission_declined/
+    # _send_signature_declined_email). Previously completion was hardcoded
+    # to email-only with no bell and no way to opt out, and a decline
+    # notified no one at all; see bug tracker entries on both.
     notify_signature_events: bool = True
 
     templates: List["Template"] = Relationship(back_populates="owner")
@@ -539,17 +541,17 @@ class SigningRequestSigner(SQLModel, table=True):
 
 class Notification(SQLModel, table=True):
     """One in-app bell notification for an account owner. Deliberately
-    narrow-scoped: only two things ever create a row here -- a client
-    submitting redlines for review, and a client commenting on a redline the
-    owner declined (see main.py's submit_redlines and reply_to_redline_edit).
-    Nothing else should write to this table. (A third trigger,
+    narrow-scoped -- see main.py's _notify docstring for the exact, current
+    list of call sites (redline submission/comments, and the e-signature
+    lifecycle: a signer signing, everyone finishing, or a signer declining).
+    Nothing else should write to this table. (A retired trigger,
     "response_acknowledged" -- a client acknowledging the owner's response --
-    used to write here too; it was retired for firing too often with too
+    used to write here too; it was removed for firing too often with too
     little value. Old rows of that type may still exist and still render.)"""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id", index=True)
-    type: str  # "redline_submitted" | "redline_comment" (legacy rows may also be "response_acknowledged")
+    type: str  # see main.py's _notify docstring for the current set; legacy rows may also be "response_acknowledged"
     title: str
     body: str = ""
     generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
