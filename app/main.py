@@ -2,6 +2,7 @@ import os
 import re
 import json
 import base64
+import hashlib
 import shutil
 import secrets
 import string
@@ -2757,6 +2758,77 @@ def upload_document_for_signature(
     }
 
 
+class SignatureBuilderTokenBody(BaseModel):
+    # Which roles should exist in the field-designer embed -- set from the
+    # intake step's own choice of whether a sender signature is included,
+    # so the builder never offers a role the actual submission won't have
+    # a signer for (DocuSeal requires a submitter for every role that has
+    # fields assigned to it). Always includes "Client"; "Sender" only if
+    # the frontend's "also require a signature from your side" is checked.
+    include_sender: bool = False
+
+
+@app.post("/api/generated/{generated_id}/signature-builder-token")
+def get_signature_builder_token(
+    generated_id: int,
+    body: SignatureBuilderTokenBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Mints what the frontend's <docuseal-builder> embed needs to let the
+    owner visually drag signature/text/date/etc. fields onto this exact
+    document and assign each to a role -- the Google-eSign-style
+    replacement for blindly embedding a signature block at a detected or
+    appended spot (docx_engine.append_signature_block/
+    detect_signature_anchor_paragraph are now only reached as a fallback;
+    see create_signature_request below).
+
+    Creates a DocuSeal template from gc's current file the first time this
+    is called for a given file content, and caches the template id +
+    content hash on the GeneratedContract row so reopening the designer
+    for the same, unchanged document keeps editing the same fields instead
+    of starting over blank. A document edited since the last call gets a
+    fresh template (and, implicitly, a clean slate of fields) rather than
+    silently reusing one positioned against stale content."""
+    gc = _get_owned_generated(session, user, generated_id)
+    if not gc.file_path or not os.path.exists(gc.file_path):
+        raise HTTPException(404, "This document's file is missing on disk.")
+
+    with open(gc.file_path, "rb") as f:
+        file_bytes = f.read()
+    doc_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    if gc.docuseal_template_id and gc.docuseal_template_doc_hash == doc_hash:
+        template_id = gc.docuseal_template_id
+    else:
+        try:
+            template = ds.create_template_from_docx(name=gc.name, file_bytes=file_bytes, file_name=f"{gc.name}.docx")
+        except RuntimeError as e:
+            raise HTTPException(400, str(e))  # DOCUSEAL_API_KEY not configured
+        except httpx.HTTPStatusError as e:
+            detail = "DocuSeal rejected this request."
+            if e.response.status_code in (401, 403):
+                detail = "DocuSeal rejected the API key. Check DOCUSEAL_API_KEY."
+            elif e.response.status_code == 422:
+                detail = "DocuSeal couldn't process this document. Creating templates from DOCX requires a Pro/Cloud Sandbox DocuSeal plan."
+            raise HTTPException(502, detail)
+        except httpx.RequestError:
+            raise HTTPException(502, "Couldn't reach DocuSeal. Try again in a moment.")
+        template_id = template["id"]
+        gc.docuseal_template_id = template_id
+        gc.docuseal_template_doc_hash = doc_hash
+        session.add(gc)
+        session.commit()
+
+    roles = ["Client", "Sender"] if body.include_sender else ["Client"]
+    try:
+        token = ds.mint_builder_token(template_id=template_id, name=gc.name)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+    return {"template_id": template_id, "token": token, "roles": roles}
+
+
 class CreateSignatureRequestBody(BaseModel):
     client_name: str
     client_email: str
@@ -2766,12 +2838,13 @@ class CreateSignatureRequestBody(BaseModel):
     # Where to splice the signature fields in -- a paragraph index into the
     # document's top-level body, counted the same way render_paragraphs_html's
     # data-p attribute counts (see docx_engine.detect_signature_anchor_paragraph
-    # and append_signature_block). Comes from the frontend's signature-anchor
-    # preview: either the auto-detected "sign here" line the person confirmed
-    # by not changing it, or a different spot they clicked instead. None (the
-    # default, and also what an out-of-range/stale index falls back to) means
-    # "append a new signature block at the very end", which is the original,
-    # always-safe behavior from before this existed.
+    # and append_signature_block). The frontend no longer ever sends this --
+    # it's only reached by the legacy fallback path inside
+    # create_signature_request, for a document that was never run through
+    # the DocuSeal Form Builder (or whose template went stale). None (the
+    # default, and also what an out-of-range/stale index falls back to)
+    # means "append a new signature block at the very end", matching the
+    # original, always-safe behavior from before the builder existed.
     signature_anchor_paragraph_index: Optional[int] = None
 
 
@@ -2796,7 +2869,16 @@ def create_signature_request(
     the "already pending?" check and both create a live SigningRequest +
     DocuSeal submission, and only the newest one is ever visible/
     cancelable afterward (see get_signature_request/cancel_signature_
-    request, which both only look at one row). Reproduced live pre-fix."""
+    request, which both only look at one row). Reproduced live pre-fix.
+
+    Uses gc's DocuSeal template (visually field-placed via
+    get_signature_builder_token) when one exists and still matches the
+    document's current content -- this is the normal path now. Falls back
+    to the original blind text-tag/anchor-detection embedding
+    (docx_engine.append_signature_block) only when no such template
+    exists yet or the document changed since it was built, so a document
+    sent without ever opening the field designer still works exactly as
+    before rather than erroring out."""
     with _signature_request_lock_for(generated_id):
         gc = _get_owned_generated(session, user, generated_id)
 
@@ -2834,24 +2916,49 @@ def create_signature_request(
         if not gc.file_path or not os.path.exists(gc.file_path):
             raise HTTPException(404, "This document's file is missing on disk and can't be sent for signature.")
 
-        sig_dir = os.path.join(UPLOADS_DIR, str(user.id), "signatures")
-        os.makedirs(sig_dir, exist_ok=True)
-        prepped_path = os.path.join(sig_dir, f"{gc.id}_{secrets.token_hex(6)}_for_signature.docx")
-        try:
-            de.append_signature_block(
-                gc.file_path, prepped_path,
-                [{"role": s["role"], "label": f'{s["name"]} ({s["role"]})'} for s in signer_specs],
-                anchor_paragraph_index=body.signature_anchor_paragraph_index,
-            )
-            with open(prepped_path, "rb") as f:
-                prepped_bytes = f.read()
+        # Use the template the owner visually placed fields on in the
+        # DocuSeal Form Builder (see get_signature_builder_token above) as
+        # long as it was built from this EXACT file content -- a stale
+        # template (document edited since fields were placed) falls back
+        # to the old blind-append path below instead of sending out fields
+        # positioned against content that no longer matches.
+        with open(gc.file_path, "rb") as f:
+            current_hash = hashlib.sha256(f.read()).hexdigest()
+        use_template = bool(gc.docuseal_template_id) and gc.docuseal_template_doc_hash == current_hash
 
-            submitters_resp = ds.create_submission_from_docx(
-                name=gc.name,
-                file_bytes=prepped_bytes,
-                file_name=f"{gc.name}.docx",
-                submitters=[{"role": s["role"], "email": s["email"], "name": s["name"]} for s in signer_specs],
-            )
+        prepped_path = None
+        try:
+            if use_template:
+                raw_submitters = ds.create_submission_from_template(
+                    template_id=gc.docuseal_template_id,
+                    submitters=[{"role": s["role"], "email": s["email"], "name": s["name"]} for s in signer_specs],
+                )
+                if not raw_submitters:
+                    raise HTTPException(502, "DocuSeal returned an empty response.")
+                submission_id = raw_submitters[0]["submission_id"]
+                submitters_list = raw_submitters
+            else:
+                sig_dir = os.path.join(UPLOADS_DIR, str(user.id), "signatures")
+                os.makedirs(sig_dir, exist_ok=True)
+                prepped_path = os.path.join(sig_dir, f"{gc.id}_{secrets.token_hex(6)}_for_signature.docx")
+                de.append_signature_block(
+                    gc.file_path, prepped_path,
+                    [{"role": s["role"], "label": f'{s["name"]} ({s["role"]})'} for s in signer_specs],
+                    anchor_paragraph_index=body.signature_anchor_paragraph_index,
+                )
+                with open(prepped_path, "rb") as f:
+                    prepped_bytes = f.read()
+
+                submitters_resp = ds.create_submission_from_docx(
+                    name=gc.name,
+                    file_bytes=prepped_bytes,
+                    file_name=f"{gc.name}.docx",
+                    submitters=[{"role": s["role"], "email": s["email"], "name": s["name"]} for s in signer_specs],
+                )
+                if not submitters_resp or not submitters_resp.get("submitters"):
+                    raise HTTPException(502, "DocuSeal returned an empty response.")
+                submission_id = submitters_resp["id"]
+                submitters_list = submitters_resp["submitters"]
         except RuntimeError as e:
             raise HTTPException(400, str(e))  # DOCUSEAL_API_KEY not configured
         except httpx.HTTPStatusError as e:
@@ -2864,14 +2971,12 @@ def create_signature_request(
         except httpx.RequestError:
             raise HTTPException(502, "Couldn't reach DocuSeal. Try again in a moment.")
         finally:
-            try:
-                os.remove(prepped_path)
-            except OSError:
-                pass
+            if prepped_path:
+                try:
+                    os.remove(prepped_path)
+                except OSError:
+                    pass
 
-        if not submitters_resp or not submitters_resp.get("submitters"):
-            raise HTTPException(502, "DocuSeal returned an empty response.")
-        submission_id = submitters_resp["id"]
         sr = SigningRequest(generated_contract_id=gc.id, docuseal_submission_id=submission_id)
         session.add(sr)
         session.commit()
@@ -2885,7 +2990,7 @@ def create_signature_request(
         # instead of one per signer_spec. Email addresses aren't
         # case-sensitive in practice, so match on a normalized form instead
         # of the raw string DocuSeal happened to return.
-        by_email = {item["email"].strip().lower(): item for item in submitters_resp["submitters"]}
+        by_email = {item["email"].strip().lower(): item for item in submitters_list}
         signers = []
         for spec in signer_specs:
             item = by_email.get(spec["email"].strip().lower())
@@ -2936,15 +3041,16 @@ def get_signature_anchor_preview(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    """Backs the "where should the signature go?" picker shown before
-    sending a document for signature (both the normal draft-flow send and
-    the upload-to-sign flow funnel through the same openSignatureModal, so
-    one endpoint covers both). Returns the document rendered the same way
-    the share/redline views already do, plus whatever
-    detect_signature_anchor_paragraph found -- the frontend highlights that
-    paragraph as the default spot, but a person can click anywhere else in
-    the preview to override it (see computeCursorPosition), and nothing is
-    ever placed without that round trip through a human first."""
+    """Formerly backed the click-a-paragraph "where should the signature
+    go?" picker shown before sending a document for signature. Superseded
+    by the DocuSeal Form Builder embed (see get_signature_builder_token
+    and app.js's renderFieldDesigner) -- the frontend no longer calls this
+    route at all. Left in place (unused, not removed) since it's a plain
+    read-only preview with no side effects and no harm in keeping it
+    around; append_signature_block/detect_signature_anchor_paragraph still
+    use the same anchor concept for the legacy fallback path in
+    create_signature_request, so this isn't orphaned logic, just an
+    orphaned frontend caller."""
     gc = _get_owned_generated(session, user, generated_id)
     if not gc.file_path or not os.path.exists(gc.file_path):
         raise HTTPException(404, "This document's file is missing on disk.")
