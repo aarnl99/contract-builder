@@ -15,6 +15,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import jwt as pyjwt
+
 from app import docuseal_engine as ds
 
 SECRET = "whsec_test_secret_value"
@@ -65,3 +67,34 @@ def test_empty_secret_always_rejects():
     # silently accept an unverifiable payload.
     header = _sign(BODY, SECRET, int(time.time()))
     assert ds.verify_webhook_signature(BODY, header, "") is False
+
+
+# mint_builder_token is pure logic (just JWT signing, no network call), so
+# it's covered here like the webhook verification above -- creating an
+# actual template/submission from a template still needs a live DocuSeal
+# account and is exercised by hand against the real API, same as before.
+
+def test_mint_builder_token_payload():
+    original_key = ds.DOCUSEAL_API_KEY
+    ds.DOCUSEAL_API_KEY = "test_api_key_for_unit_test_only_do_not_use"
+    try:
+        token = ds.mint_builder_token(template_id=42, name="Test Doc")
+        decoded = pyjwt.decode(token, ds.DOCUSEAL_API_KEY, algorithms=["HS256"])
+        assert decoded["template_id"] == 42
+        assert decoded["name"] == "Test Doc"
+        assert decoded["user_email"] == ds.DOCUSEAL_ACCOUNT_EMAIL
+    finally:
+        ds.DOCUSEAL_API_KEY = original_key
+
+
+def test_mint_builder_token_requires_api_key():
+    original_key = ds.DOCUSEAL_API_KEY
+    ds.DOCUSEAL_API_KEY = ""
+    try:
+        try:
+            ds.mint_builder_token(template_id=1, name="x")
+            assert False, "expected RuntimeError when DOCUSEAL_API_KEY is unset"
+        except RuntimeError:
+            pass
+    finally:
+        ds.DOCUSEAL_API_KEY = original_key
