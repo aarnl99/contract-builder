@@ -23,10 +23,12 @@ def test_slugify_company_strips_non_alnum():
     assert ee.slugify_company("") == "account"
 
 
-def test_generate_alias_number_is_six_digits():
+def test_generate_alias_number_is_long_lowercase_alphanumeric():
+    # QA: was 6 digits (1M possibilities, enumerable). Legacy 6-digit numbers
+    # still PARSE (see test_parse_alias_plain_address) -- only new ones change.
     n = ee.generate_alias_number()
-    assert len(n) == 6
-    assert n.isdigit()
+    assert len(n) == 12
+    assert n.isalnum() and n == n.lower()
 
 
 def test_parse_alias_plain_address():
