@@ -31,6 +31,7 @@ from . import docx_engine as de
 from . import redline_engine as rl
 from . import email_engine as ee
 from . import docuseal_engine as ds
+from . import rate_limit as ratelimit
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SECRET_KEY_PATH = os.path.join(BASE_DIR, "secret.key")
@@ -145,11 +146,41 @@ class ResendVerificationBody(BaseModel):
 RESEND_VERIFICATION_COOLDOWN = 60  # seconds -- keeps "resend" from being spammed
 
 
+DEFAULT_PUBLIC_BASE_URL = "https://userotely.com"
+
+
+def _canonical_base_url() -> str:
+    return (os.environ.get("PUBLIC_BASE_URL") or DEFAULT_PUBLIC_BASE_URL).strip().rstrip("/")
+
+
+def _allowed_hosts() -> set:
+    """Hosts we're willing to build outbound links from: the canonical origin's
+    host, plus localhost-style dev hosts, plus anything in ALLOWED_HOSTS
+    (comma-separated, e.g. a staging domain)."""
+    hosts = {"localhost", "127.0.0.1", "testserver", "localhost:8000", "127.0.0.1:8000"}
+    canon = _canonical_base_url()
+    hosts.add(canon.split("://", 1)[-1].lower())
+    for h in (os.environ.get("ALLOWED_HOSTS") or "").split(","):
+        h = h.strip().lower()
+        if h:
+            hosts.add(h)
+    return hosts
+
+
 def _base_url(request: Request) -> str:
     """Absolute origin for building links that go out in email (e.g. the
     verify-email link), since those are opened outside this app's own
     hash-routed pages and need a real, fully-qualified URL."""
-    return f"{request.url.scheme}://{request.url.netloc}"
+    # Security (QA): this used to trust the request's Host header outright, so
+    # anyone could POST /api/forgot-password with `Host: evil.example` and the
+    # reset email -- sent to the VICTIM -- would carry a link to the attacker's
+    # domain (password-reset poisoning). Now the origin is only taken from the
+    # request when its host is on an allowlist; otherwise we fall back to the
+    # configured canonical origin.
+    host = (request.url.netloc or "").lower()
+    if host in _allowed_hosts():
+        return f"{request.url.scheme}://{request.url.netloc}"
+    return _canonical_base_url()
 
 
 def _send_verification_email(request: Request, user: User) -> None:
@@ -213,12 +244,51 @@ def register(body: RegisterBody, request: Request, session: Session = Depends(ge
     return {"registered": True, "email": user.email}
 
 
+LOGIN_WINDOW = 15 * 60       # seconds
+LOGIN_MAX_FAILS_PER_EMAIL = 8   # per account, from anywhere
+LOGIN_MAX_FAILS_PER_IP = 30     # per client IP, across accounts
+FORGOT_MAX_PER_IP = 10
+FORGOT_MAX_PER_EMAIL = 5
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP behind Render's proxy: the right-most
+    X-Forwarded-For entry is the one the platform's own proxy appended (the
+    left side is client-controlled and spoofable)."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        last = xff.split(",")[-1].strip()
+        if last:
+            return last
+    return request.client.host if request.client else "unknown"
+
+
+def _too_many(retry_after_s: int):
+    return HTTPException(
+        429, "Too many attempts. Please wait a few minutes and try again.",
+        headers={"Retry-After": str(retry_after_s)},
+    )
+
+
 @app.post("/api/login")
 def login(body: LoginBody, request: Request, session: Session = Depends(get_session)):
     email = body.email.strip().lower()
+    ip = _client_ip(request)
+    # Security (QA): there was no brake on password guessing at all. Failed
+    # attempts are counted per account AND per IP; a success clears the
+    # account counter so a real user who finally types it right isn't penalised.
+    wait = ratelimit.check([
+        (f"login:email:{email}", LOGIN_MAX_FAILS_PER_EMAIL, LOGIN_WINDOW),
+        (f"login:ip:{ip}", LOGIN_MAX_FAILS_PER_IP, LOGIN_WINDOW),
+    ])
+    if wait:
+        raise _too_many(wait)
     user = session.exec(select(User).where(User.email == email)).first()
     if not user or not verify_password(body.password, user.password_hash):
+        ratelimit.record(f"login:email:{email}", LOGIN_WINDOW)
+        ratelimit.record(f"login:ip:{ip}", LOGIN_WINDOW)
         raise HTTPException(401, "Invalid email or password")
+    ratelimit.clear(f"login:email:{email}")
     if not user.email_verified:
         raise HTTPException(403, {"code": "email_not_verified", "message": "Please verify your email before logging in."})
     if user.is_suspended:
@@ -298,6 +368,17 @@ def _send_reset_email(request: Request, user: User) -> None:
 @app.post("/api/forgot-password")
 def forgot_password(body: ForgotPasswordBody, request: Request, session: Session = Depends(get_session)):
     email = body.email.strip().lower()
+    ip = _client_ip(request)
+    # Security (QA): every request counts (not just failures) -- this endpoint
+    # sends email, so it's both a spam cannon and an enumeration surface.
+    wait = ratelimit.check([
+        (f"forgot:email:{email}", FORGOT_MAX_PER_EMAIL, LOGIN_WINDOW),
+        (f"forgot:ip:{ip}", FORGOT_MAX_PER_IP, LOGIN_WINDOW),
+    ])
+    if wait:
+        raise _too_many(wait)
+    ratelimit.record(f"forgot:email:{email}", LOGIN_WINDOW)
+    ratelimit.record(f"forgot:ip:{ip}", LOGIN_WINDOW)
     user = session.exec(select(User).where(User.email == email)).first()
     # Same generic response either way, whether or not the account exists --
     # this endpoint must not be usable to probe which emails have accounts.
@@ -810,7 +891,15 @@ def upload_template(
         raise
     shutil.copyfile(original_path, working_path)
 
-    # Validate it actually opens as a docx
+    # Validate it actually opens as a docx (and isn't a zip bomb -- checked
+    # from the archive directory first, before anything is decompressed)
+    try:
+        de.validate_docx_archive(working_path)
+    except de.UnsafeDocx as e:
+        shutil.rmtree(tpl_dir, ignore_errors=True)
+        session.delete(tpl)
+        session.commit()
+        raise HTTPException(400, str(e))
     try:
         de.load(working_path)
     except Exception:
@@ -2734,6 +2823,7 @@ def upload_document_for_signature(
                     if written > MAX_TEMPLATE_UPLOAD_BYTES:
                         raise HTTPException(400, f"That file is too large -- uploads are limited to {MAX_TEMPLATE_UPLOAD_BYTES // (1024 * 1024)}MB.")
                     f.write(chunk)
+            de.validate_docx_archive(out_path)  # zip-bomb check, before anything is decompressed
             de.load(out_path)  # fail fast on a corrupt/non-docx upload, not later inside docx_engine or DocuSeal
         except HTTPException:
             try:
@@ -2741,6 +2831,12 @@ def upload_document_for_signature(
             except OSError:
                 pass
             raise
+        except de.UnsafeDocx as e:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            raise HTTPException(400, str(e))
         except Exception:
             try:
                 os.remove(out_path)

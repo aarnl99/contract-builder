@@ -34,7 +34,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 EMAIL_AGENT_MODEL = os.environ.get("EMAIL_AGENT_MODEL", "claude-3-5-sonnet-latest")
 
 _ALIAS_RE = re.compile(
-    r"drafts\+([a-z0-9]+)\+(\d{6})(?:\+continue-(\d+))?@" + re.escape(EMAIL_DOMAIN),
+    r"drafts\+([a-z0-9]+)\+([a-z0-9]{6,32})(?:\+continue-(\d+))?@" + re.escape(EMAIL_DOMAIN),
     re.IGNORECASE,
 )
 
@@ -48,10 +48,18 @@ def slugify_company(name: str) -> str:
     return slug or "account"
 
 
+ALIAS_NUMBER_LENGTH = 12
+_ALIAS_CHARS = string.ascii_lowercase + string.digits
+
+
 def generate_alias_number() -> str:
-    """A 6-digit number that isn't guessable from the company name -- the
-    entire point of it existing is to make the address hard to spoof."""
-    return "".join(secrets.choice(string.digits) for _ in range(6))
+    """A random token that isn't guessable from the company name -- the
+    entire point of it existing is to make the address hard to spoof.
+    Security (QA): this used to be 6 digits (1M possibilities, trivially
+    enumerable by anyone who knows a company slug). Now 12 chars of
+    a-z0-9 (~62 bits). Existing 6-digit aliases keep working until their
+    owner regenerates -- the parser below still accepts them."""
+    return "".join(secrets.choice(_ALIAS_CHARS) for _ in range(ALIAS_NUMBER_LENGTH))
 
 
 def alias_address(company_slug: str, number: str) -> str:
@@ -78,7 +86,7 @@ def parse_alias(to_header: str) -> Optional[dict]:
     company_slug, number, continue_id = m.groups()
     return {
         "company_slug": company_slug.lower(),
-        "number": number,
+        "number": number.lower(),
         "continue_request_id": int(continue_id) if continue_id else None,
     }
 

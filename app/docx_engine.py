@@ -733,3 +733,44 @@ def append_signature_block(
         doc.add_paragraph("{{%s Signature;type=signature;role=%s;required=true}}" % (role, role))
         doc.add_paragraph("Date: {{%s Date;type=datenow;role=%s}}" % (role, role))
     doc.save(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Upload safety (QA: zip-bomb gap). A .docx is a zip, and the upload size cap
+# only limits the COMPRESSED bytes -- a few KB of zeros can inflate to
+# gigabytes the moment python-docx opens it. These limits are checked from the
+# zip's central directory (cheap, nothing is decompressed) before any load.
+# ---------------------------------------------------------------------------
+
+MAX_DOCX_ENTRIES = 2_000
+MAX_DOCX_ENTRY_UNCOMPRESSED = 50 * 1024 * 1024    # any single part
+MAX_DOCX_TOTAL_UNCOMPRESSED = 150 * 1024 * 1024   # all parts together
+MAX_DOCX_RATIO = 200                              # per-entry inflate ratio...
+_RATIO_FLOOR = 1 * 1024 * 1024                    # ...ignored for tiny entries
+
+
+class UnsafeDocx(ValueError):
+    """The file is a zip we refuse to open (bomb-shaped or malformed)."""
+
+
+def validate_docx_archive(path: str) -> None:
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as e:
+        raise UnsafeDocx("That file isn't a valid .docx (it isn't a readable zip archive).") from e
+    with zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_DOCX_ENTRIES:
+            raise UnsafeDocx("That document has too many internal parts to be a normal Word file.")
+        total = 0
+        for i in infos:
+            total += i.file_size
+            if i.file_size > MAX_DOCX_ENTRY_UNCOMPRESSED:
+                raise UnsafeDocx("That document contains a part that is unreasonably large when unpacked.")
+            if i.file_size > _RATIO_FLOOR and i.compress_size > 0 and i.file_size / i.compress_size > MAX_DOCX_RATIO:
+                raise UnsafeDocx("That document is compressed in a suspicious way and was rejected.")
+            if i.file_size > _RATIO_FLOOR and i.compress_size == 0:
+                raise UnsafeDocx("That document is compressed in a suspicious way and was rejected.")
+        if total > MAX_DOCX_TOTAL_UNCOMPRESSED:
+            raise UnsafeDocx("That document is unreasonably large when unpacked.")

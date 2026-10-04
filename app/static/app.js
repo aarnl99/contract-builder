@@ -2888,7 +2888,15 @@ function DocumentsView() {
 
   function openDetail(d) {
     api(`/api/generated/${d.id}`).then((full) => {
-      const valuesHtml = full.values.map((v) => `<div class="field-row"><div class="k">${v.label}</div><div class="v">${v.value || "—"}</div></div>`).join("");
+      // Stored-XSS fix (QA, HIGH): these labels/values include text a client
+      // typed into a redline, so they must NEVER go through innerHTML. Built
+      // as DOM nodes via el() so everything is set as text, not markup.
+      const valueRows = full.values.map((v) =>
+        el("div", { class: "field-row" }, [
+          el("div", { class: "k" }, String(v.label == null ? "" : v.label)),
+          el("div", { class: "v" }, String(v.value || "—")),
+        ])
+      );
       const lineageLink = el("a", { onclick: () => { document.querySelectorAll(".panel-overlay").forEach((o) => o.remove()); location.hash = "#/masters"; } }, full.template_name);
       const panelOverlay = el("div", { class: "panel-overlay" });
       const panel = el("div", { class: "slide-panel" }, [
@@ -2899,7 +2907,7 @@ function DocumentsView() {
         el("div", { class: "lineage-box" }, [
           el("div", { class: "txt" }, ["Originated from master document", el("br"), lineageLink]),
         ]),
-        el("div", {}, valuesHtml ? el("div", { html: valuesHtml }) : el("div", { style: "color:var(--muted);font-size:13px;" }, "No field values recorded.")),
+        el("div", {}, valueRows.length ? el("div", {}, valueRows) : el("div", { style: "color:var(--muted);font-size:13px;" }, "No field values recorded.")),
         el("div", { class: "panel-actions" }, [
           el("a", { class: "btn", href: `/api/generated/${d.id}/download` }, "Download .docx"),
           // Close the panel before opening either modal -- .panel-overlay is
