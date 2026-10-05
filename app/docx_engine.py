@@ -493,14 +493,17 @@ def validate_no_overlaps(doc: Document, edits: List[dict]) -> None:
         _tag_and_check_overlaps(original_runs, group)
 
 
-def mark_placeholder(
+def replace_selection_with_token(
     doc: Document,
     paragraph_index: int,
     segments: List[dict],
-    field_key: str,
+    token_text: str,
     container_path: Optional[List[List[int]]] = None,
 ) -> None:
-    """
+    """Replace a selection with an arbitrary token string -- the shared core
+    of mark_placeholder ({{field_key}} tokens) and apply_signature_field_tags
+    (DocuSeal {{...;type=...}} text tags) below.
+
     segments: list of {"r": run_index, "start": int, "end": int}, all within
     the same paragraph, referring to ORIGINAL (pre-edit) run indices/offsets
     as captured by the browser at selection time.
@@ -533,13 +536,164 @@ def mark_placeholder(
         normalized_segments.append(seg)
     segments = normalized_segments
 
-    token_text = token_for(field_key)
     first_seg = segments[0]
     _split_run_insert_token(
         original_runs[first_seg["r"]], first_seg["start"], first_seg["end"], token_text
     )
     for seg in segments[1:]:
         _remove_range_from_run(original_runs[seg["r"]], seg["start"], seg["end"])
+
+
+def mark_placeholder(
+    doc: Document,
+    paragraph_index: int,
+    segments: List[dict],
+    field_key: str,
+    container_path: Optional[List[List[int]]] = None,
+) -> None:
+    """
+    segments: list of {"r": run_index, "start": int, "end": int}, all within
+    the same paragraph, referring to ORIGINAL (pre-edit) run indices/offsets
+    as captured by the browser at selection time.
+
+    container_path: [] (or None) for a top-level body paragraph, or a list
+    of [table_index, row_index, col_index] triples locating the table cell
+    the paragraph lives in (see module docstring).
+    """
+    replace_selection_with_token(
+        doc, paragraph_index, segments, token_for(field_key), container_path
+    )
+
+
+# ---------------------------------------------------------------------------
+# Signature fields: Google-eSign-style "highlight text -> signature field"
+# ---------------------------------------------------------------------------
+
+#: field_type -> DocuSeal text-tag type. Only types a signer can actually
+#: fill make sense here (signature/initials/date/text) -- the builder's
+#: number/checkbox/select/radio need option lists the highlight flow
+#: doesn't collect.
+SIGNATURE_FIELD_TYPES = ("signature", "initials", "date", "text")
+
+#: signer roles the highlight flow can assign a field to. Must stay in sync
+#: with the "Client"/"Sender" roles create_signature_request sends to
+#: DocuSeal, since the tag's role= has to match a submitter's role or the
+#: field won't bind to anyone.
+SIGNATURE_FIELD_ROLES = ("Client", "Sender")
+
+
+def signature_field_tag(label: str, field_type: str, role: str) -> str:
+    """Build the DocuSeal text tag for one placed signature field, e.g.
+    {{Client Signature 1;type=signature;role=Client;required=true}}.
+    DocuSeal parses these into real fillable fields wherever the tag sits
+    in the document -- which is exactly the highlighted range, since
+    apply_signature_field_tags splices the tag in place of the selection."""
+    return "{{%s;type=%s;role=%s;required=true}}" % (label, field_type, role)
+
+
+def apply_signature_field_tags(doc: Document, fields: List[dict]) -> None:
+    """Splice every placed signature field's DocuSeal text tag into the
+    document in place of the exact range the owner highlighted.
+
+    fields: list of {paragraph_index, table_path, segments, role,
+    field_type, label, original_text}, as stored on
+    GeneratedContract.signature_fields_json. table_path is the browser's
+    "t,r,c;..." string ("" for the top-level body); segments are
+    {"r", "start", "end"} dicts in ORIGINAL run indices/offsets.
+
+    Every field is staleness-checked against original_text BEFORE anything
+    is written, so a document edited after placement fails loudly instead
+    of misplacing tags. Fields are then applied latest-first within each
+    paragraph (all against one snapshot of the paragraph's runs), so one
+    field's inserted tag never shifts another field's offsets.
+    """
+    # Phase 1: validate everything against the untouched document.
+    checked = []
+    for f in fields:
+        container_path = _parse_container_path_str(f.get("table_path") or "")
+        try:
+            current_text = extract_text_at(
+                doc, container_path, f["paragraph_index"], f["segments"]
+            )
+        except MarkError as e:
+            raise MarkError(f"Signature field '{f.get('label', '?')}': {e}")
+        if current_text != f.get("original_text"):
+            raise MarkError(
+                f"Signature field '{f.get('label', '?')}' no longer lines up "
+                "with the document text -- the document changed after the "
+                "field was placed. Remove it and place it again."
+            )
+        checked.append((container_path, f))
+
+    # Phase 2: group by paragraph, then apply every edit per run,
+    # latest-offset-first within each run. Every edit indexes into the
+    # same pre-edit original_runs snapshot. Within one run, processing
+    # strictly descending offsets guarantees each edit's offsets are
+    # still valid, because all previously applied edits touched only
+    # higher offsets in that same run. Edits to different runs never
+    # interfere (separate elements), and an edit at offset 0 detaches
+    # the run element -- descending order guarantees that happens last
+    # for its run, so no later edit ever targets a detached run.
+    # (Sorting ops by first-segment only is NOT enough: a multi-run
+    # field's later segments can sit in a run that another field edits
+    # at lower offsets, which would silently shift them.)
+    groups: Dict[tuple, list] = {}
+    for container_path, f in checked:
+        key = (f.get("table_path") or "", f["paragraph_index"])
+        groups.setdefault(key, []).append((container_path, f))
+
+    for (path_str, p_idx), items in groups.items():
+        container_path = items[0][0]
+        container = _resolve_container(doc, container_path)
+        paragraphs = container.paragraphs
+        if p_idx < 0 or p_idx >= len(paragraphs):
+            raise MarkError("Invalid paragraph index")
+        paragraph = paragraphs[p_idx]
+        original_runs = list(paragraph.runs)
+
+        run_edits: Dict[int, list] = {}  # run_idx -> [(start, end, tag_or_None)]
+        for _, f in items:
+            tag = signature_field_tag(f["label"], f["field_type"], f["role"])
+            segs = []
+            for seg in f["segments"]:
+                r_idx = seg["r"]
+                if r_idx < 0 or r_idx >= len(original_runs):
+                    raise MarkError(f"Invalid run index {r_idx}")
+                norm = _normalize_segment_offsets(seg, original_runs[r_idx].text or "")
+                run_text = original_runs[r_idx].text or ""
+                if not (0 <= norm["start"] <= norm["end"] <= len(run_text)):
+                    raise MarkError(f"Invalid offsets for run {r_idx}")
+                segs.append(norm)
+            segs.sort(key=lambda s: s["r"])
+            if not segs:
+                raise MarkError("No selection segments provided")
+            for j, seg in enumerate(segs):
+                # The visually-first segment gets the tag; the rest of a
+                # multi-run selection are just removed -- the same
+                # contract as replace_selection_with_token.
+                run_edits.setdefault(seg["r"], []).append(
+                    (seg["start"], seg["end"], tag if j == 0 else None)
+                )
+
+        for r_idx, edits in run_edits.items():
+            edits.sort(key=lambda e: (e[0], e[1]), reverse=True)
+            run = original_runs[r_idx]
+            for start, end, tag in edits:
+                if tag is not None:
+                    _split_run_insert_token(run, start, end, tag)
+                else:
+                    _remove_range_from_run(run, start, end)
+
+
+def _parse_container_path_str(path_str: str) -> List[List[int]]:
+    """Parse the browser's "t,r,c;t,r,c" container path string back into
+    [[t, r, c], ...]. Empty string means the top-level document body."""
+    if not path_str:
+        return []
+    try:
+        return [[int(x) for x in step.split(",")] for step in path_str.split(";") if step]
+    except ValueError:
+        raise MarkError("Invalid table path")
 
 
 # ---------------------------------------------------------------------------

@@ -204,6 +204,17 @@ class GeneratedContract(SQLModel, table=True):
     docuseal_template_id: Optional[int] = None
     docuseal_template_doc_hash: Optional[str] = None
 
+    # Google-eSign-style "highlight text -> signature field" placements
+    # (see main.py's signature-field endpoints): a JSON list of
+    # {paragraph_index, table_path, segments, role, field_type, label,
+    # original_text}. Stored as data, NOT written into the document --
+    # create_signature_request splices the DocuSeal {{...;type=...}} tags
+    # into a throwaway prepped copy at send time, so the owner's document
+    # stays clean and fields can be removed/reassigned before sending.
+    # Supersedes the docuseal_template_id flow above as the primary
+    # field-placement UX.
+    signature_fields_json: str = "[]"
+
     owner: Optional[User] = Relationship(back_populates="generated_contracts")
 
 
