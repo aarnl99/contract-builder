@@ -2698,6 +2698,11 @@ def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
         # to notice a document is actually done is the manual refresh
         # button, forever.
         "webhook_configured": bool(ds.DOCUSEAL_WEBHOOK_SECRET),
+        # The frontend used to build this URL from location.origin, which
+        # is wrong on any non-canonical domain (staging, Render default
+        # URL). The backend knows the canonical base, so it sends the exact
+        # URL to configure.
+        "webhook_url": f"{_canonical_base_url()}/api/webhooks/docuseal",
         "signers": [
             {
                 "role": s.role,
@@ -2959,6 +2964,153 @@ class CreateSignatureRequestBody(BaseModel):
     signature_anchor_paragraph_index: Optional[int] = None
 
 
+class SignatureFieldBody(BaseModel):
+    paragraph_index: int
+    table_path: str = ""
+    segments: list[MarkSegment]
+    expected_text: str = ""
+    role: str = "Client"
+    field_type: str = "signature"
+
+
+def _read_signature_fields(gc) -> list:
+    """Placed signature fields for the Google-eSign-style highlight flow."""
+    try:
+        fields = json.loads(gc.signature_fields_json or "[]")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        fields = []
+    return fields if isinstance(fields, list) else []
+
+
+def _write_signature_fields(gc, fields: list, session) -> None:
+    gc.signature_fields_json = json.dumps(fields)
+    session.add(gc)
+    session.commit()
+
+
+def _esign_preview_payload(gc) -> dict:
+    """The document's HTML with every placed signature field's exact range
+    highlighted (via render_paragraphs_html's field-position mechanism --
+    each covered run gets the field-value class and a data-field-key the
+    frontend turns into a badge), plus the raw field list."""
+    fields = _read_signature_fields(gc)
+    doc = de.load(gc.file_path)
+    positions = []
+    for i, f in enumerate(fields):
+        key = f"sigfield:{i}"
+        for seg in f.get("segments", []):
+            positions.append({
+                "path": f.get("table_path") or "",
+                "p": f["paragraph_index"],
+                "r": seg["r"],
+                "field_key": key,
+            })
+    return {"fields": fields, "html": de.render_paragraphs_html(doc, positions or None)}
+
+
+@app.get("/api/generated/{generated_id}/esign-preview")
+def esign_preview(
+    generated_id: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Document HTML with placed signature fields highlighted, for the
+    highlight-to-field step of the signature modal."""
+    gc = _get_owned_generated(session, user, generated_id)
+    if not gc.file_path or not os.path.exists(gc.file_path):
+        raise HTTPException(404, "This document's file is missing on disk.")
+    return _esign_preview_payload(gc)
+
+
+@app.post("/api/generated/{generated_id}/signature-fields")
+def place_signature_field(
+    generated_id: int,
+    body: SignatureFieldBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Google-eSign-style placement: turn the owner's highlighted text range
+    into a signature field assigned to a signer. The range is stored as data
+    (validated against the live document with the same expected-text
+    staleness guard as placeholder marking); the DocuSeal text tag is only
+    spliced into a throwaway copy at send time, so the document itself
+    stays clean and fields can be removed or reassigned freely."""
+    gc = _get_owned_generated(session, user, generated_id)
+    role = (body.role or "").strip()
+    field_type = (body.field_type or "").strip()
+    if role not in de.SIGNATURE_FIELD_ROLES:
+        raise HTTPException(400, "A field can only be assigned to the Client or the Sender.")
+    if field_type not in de.SIGNATURE_FIELD_TYPES:
+        raise HTTPException(400, "Unknown field type.")
+    if not body.segments:
+        raise HTTPException(400, "No text was selected.")
+    if not gc.file_path or not os.path.exists(gc.file_path):
+        raise HTTPException(404, "This document's file is missing on disk.")
+
+    container_path = _parse_table_path(body.table_path)
+    seg_dicts = [s.dict() for s in body.segments]
+    doc = de.load(gc.file_path)
+    try:
+        current_text = de.extract_text_at(doc, container_path, body.paragraph_index, seg_dicts)
+    except de.MarkError as e:
+        raise HTTPException(400, str(e))
+    if not body.expected_text:
+        raise HTTPException(
+            400,
+            "That selection is no longer valid -- please reselect the text and try again.",
+        )
+    if current_text != body.expected_text:
+        raise HTTPException(
+            400,
+            "That selection is no longer valid -- the document changed since you selected this text. Please reselect and try again.",
+        )
+
+    fields = _read_signature_fields(gc)
+    # No two fields may cover the same characters of the same run --
+    # otherwise send-time tag splicing would eat one of them.
+    existing_intervals = {}
+    for f in fields:
+        for s in f.get("segments", []):
+            existing_intervals.setdefault(
+                (f.get("table_path") or "", f["paragraph_index"], s["r"]), []
+            ).append((s["start"], s["end"]))
+    for s in seg_dicts:
+        for (es, ee) in existing_intervals.get(
+            (body.table_path, body.paragraph_index, s["r"]), []
+        ):
+            if s["start"] < ee and es < s["end"]:
+                raise HTTPException(400, "That text already has a signature field on it.")
+
+    n = sum(1 for f in fields if f.get("role") == role and f.get("field_type") == field_type) + 1
+    fields.append({
+        "paragraph_index": body.paragraph_index,
+        "table_path": body.table_path,
+        "segments": seg_dicts,
+        "role": role,
+        "field_type": field_type,
+        "label": f"{role} {field_type.capitalize()} {n}",
+        "original_text": current_text,
+    })
+    _write_signature_fields(gc, fields, session)
+    return _esign_preview_payload(gc)
+
+
+@app.delete("/api/generated/{generated_id}/signature-fields/{field_index}")
+def delete_signature_field(
+    generated_id: int,
+    field_index: int,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    gc = _get_owned_generated(session, user, generated_id)
+    fields = _read_signature_fields(gc)
+    if not 0 <= field_index < len(fields):
+        raise HTTPException(404, "Field not found.")
+    fields.pop(field_index)
+    _write_signature_fields(gc, fields, session)
+    return _esign_preview_payload(gc)
+
+
 @app.post("/api/generated/{generated_id}/signature-request")
 def create_signature_request(
     generated_id: int,
@@ -2982,13 +3134,14 @@ def create_signature_request(
     cancelable afterward (see get_signature_request/cancel_signature_
     request, which both only look at one row). Reproduced live pre-fix.
 
-    Uses gc's DocuSeal template (visually field-placed via
-    get_signature_builder_token) when one exists and still matches the
-    document's current content -- this is the normal path now. Falls back
-    to the original blind text-tag/anchor-detection embedding
-    (docx_engine.append_signature_block) only when no such template
-    exists yet or the document changed since it was built, so a document
-    sent without ever opening the field designer still works exactly as
+    Uses the owner's highlight-placed signature fields first (DocuSeal
+    text tags spliced into a throwaway copy at send time). Falls back to
+    gc's DocuSeal template (visually field-placed via
+    get_signature_builder_token) when one exists, still matches the
+    document's current content, and no highlight fields were placed.
+    Falls back to the original blind text-tag/anchor-detection embedding
+    (docx_engine.append_signature_block) only when neither exists, so a
+    document sent without ever placing fields still works exactly as
     before rather than erroring out."""
     with _signature_request_lock_for(generated_id):
         gc = _get_owned_generated(session, user, generated_id)
@@ -3027,15 +3180,23 @@ def create_signature_request(
         if not gc.file_path or not os.path.exists(gc.file_path):
             raise HTTPException(404, "This document's file is missing on disk and can't be sent for signature.")
 
-        # Use the template the owner visually placed fields on in the
-        # DocuSeal Form Builder (see get_signature_builder_token above) as
-        # long as it was built from this EXACT file content -- a stale
-        # template (document edited since fields were placed) falls back
-        # to the old blind-append path below instead of sending out fields
-        # positioned against content that no longer matches.
+        # Field placement, newest first: the Google-eSign-style highlight
+        # flow (see place_signature_field) stores each field's exact range
+        # as data. Splice the DocuSeal text tags into a throwaway copy in
+        # place of each highlighted range, then send that via the docx
+        # path -- this is the primary path now, ahead of the embedded
+        # builder template below. A legacy template only applies when no
+        # highlight fields were placed; otherwise the owner's explicit
+        # placements win.
+        placed_fields = _read_signature_fields(gc)
+
         with open(gc.file_path, "rb") as f:
             current_hash = hashlib.sha256(f.read()).hexdigest()
-        use_template = bool(gc.docuseal_template_id) and gc.docuseal_template_doc_hash == current_hash
+        use_template = (
+            bool(gc.docuseal_template_id)
+            and gc.docuseal_template_doc_hash == current_hash
+            and not placed_fields
+        )
 
         prepped_path = None
         try:
@@ -3052,11 +3213,29 @@ def create_signature_request(
                 sig_dir = os.path.join(UPLOADS_DIR, str(user.id), "signatures")
                 os.makedirs(sig_dir, exist_ok=True)
                 prepped_path = os.path.join(sig_dir, f"{gc.id}_{secrets.token_hex(6)}_for_signature.docx")
-                de.append_signature_block(
-                    gc.file_path, prepped_path,
-                    [{"role": s["role"], "label": f'{s["name"]} ({s["role"]})'} for s in signer_specs],
-                    anchor_paragraph_index=body.signature_anchor_paragraph_index,
-                )
+                if placed_fields:
+                    roles_needed = {f.get("role") for f in placed_fields}
+                    have_roles = {"Client"} | ({"Sender"} if body.include_sender else set())
+                    missing = roles_needed - have_roles
+                    if missing:
+                        raise HTTPException(
+                            400,
+                            "You placed a signature field for the sender but didn't check "
+                            "\"Also require a signature from your side\" -- either include "
+                            "the sender or remove that field first.",
+                        )
+                    doc = de.load(gc.file_path)
+                    try:
+                        de.apply_signature_field_tags(doc, placed_fields)
+                    except de.MarkError as e:
+                        raise HTTPException(400, str(e))
+                    de.save(doc, prepped_path)
+                else:
+                    de.append_signature_block(
+                        gc.file_path, prepped_path,
+                        [{"role": s["role"], "label": f'{s["name"]} ({s["role"]})'} for s in signer_specs],
+                        anchor_paragraph_index=body.signature_anchor_paragraph_index,
+                    )
                 with open(prepped_path, "rb") as f:
                     prepped_bytes = f.read()
 
@@ -3335,31 +3514,38 @@ def _apply_signer_completed(session: Session, submitter_id) -> None:
     signer = session.exec(
         select(SigningRequestSigner).where(SigningRequestSigner.docuseal_submitter_id == submitter_id)
     ).first()
-    if signer and signer.status != "completed":
-        signer.status = "completed"
-        signer.completed_at = datetime.utcnow()
-        session.add(signer)
-        session.commit()
+    if not signer or signer.status == "completed":
+        return
+    sr = session.get(SigningRequest, signer.signing_request_id)
+    # Terminal-state guard: a late or out-of-order form.completed must not
+    # mutate signer rows (or fire "waiting on ..." bells) on a request that
+    # already cancelled, expired, or declined -- same resurrection class as
+    # the _apply_submission_completed bug.
+    if not sr or sr.status != "pending":
+        return
+    signer.status = "completed"
+    signer.completed_at = datetime.utcnow()
+    session.add(signer)
+    session.commit()
 
-        sr = session.get(SigningRequest, signer.signing_request_id)
-        gc = session.get(GeneratedContract, sr.generated_contract_id) if sr else None
-        if sr and gc:
-            still_pending = session.exec(
-                select(SigningRequestSigner).where(
-                    SigningRequestSigner.signing_request_id == sr.id,
-                    SigningRequestSigner.status != "completed",
+    gc = session.get(GeneratedContract, sr.generated_contract_id)
+    if gc:
+        still_pending = session.exec(
+            select(SigningRequestSigner).where(
+                SigningRequestSigner.signing_request_id == sr.id,
+                SigningRequestSigner.status != "completed",
+            )
+        ).all()
+        if still_pending:
+            owner = session.get(User, gc.owner_id)
+            if owner and owner.notify_signature_events:
+                waiting_on = ", ".join(p.name for p in still_pending)
+                _notify(
+                    session, owner.id, "signature_signed",
+                    title=f'{signer.name} signed "{gc.name}"',
+                    body=f"Waiting on {waiting_on} to sign.",
+                    generated_contract_id=gc.id,
                 )
-            ).all()
-            if still_pending:
-                owner = session.get(User, gc.owner_id)
-                if owner and owner.notify_signature_events:
-                    waiting_on = ", ".join(p.name for p in still_pending)
-                    _notify(
-                        session, owner.id, "signature_signed",
-                        title=f'{signer.name} signed "{gc.name}"',
-                        body=f"Waiting on {waiting_on} to sign.",
-                        generated_contract_id=gc.id,
-                    )
 
 
 def _apply_signer_declined(session: Session, submitter_id) -> None:
@@ -3405,7 +3591,13 @@ def _apply_submission_completed(session: Session, submission_id) -> None:
     sr = session.exec(
         select(SigningRequest).where(SigningRequest.docuseal_submission_id == submission_id)
     ).first()
-    if sr and sr.status != "completed":
+    # Terminal-state guard: only a pending request can complete. A late or
+    # retried submission.completed webhook (DocuSeal retries on timeouts
+    # and can deliver out of order) must never resurrect a cancelled,
+    # expired, or declined request back to completed -- the sibling
+    # _apply_submission_expired/_apply_submission_declined handlers both
+    # use this same pending-only guard.
+    if sr and sr.status == "pending":
         sr.status = "completed"
         sr.completed_at = datetime.utcnow()
         gc = session.get(GeneratedContract, sr.generated_contract_id)
