@@ -1435,7 +1435,7 @@ async function openSignatureModal(generatedId) {
         el("div", { class: "warn-box" }, [
           el("strong", {}, "Status won't update automatically yet. "),
           "Add this URL as a webhook endpoint in your DocuSeal account (Settings → Webhooks) to get live updates, or use “Check for updates” below in the meantime: ",
-          el("code", {}, `${location.origin}/api/webhooks/docuseal`),
+          el("code", {}, sr.webhook_url || `${location.origin}/api/webhooks/docuseal`),
         ])
       );
     }
@@ -1514,71 +1514,171 @@ async function openSignatureModal(generatedId) {
     body.appendChild(el("div", { class: "modal-actions" }, actions));
   }
 
-  // The DocuSeal Form Builder embed (<docuseal-builder>) replaces the old
-  // click-a-paragraph anchor picker entirely -- instead of guessing where
-  // a signature line is and letting someone nudge that guess, the owner
-  // now drags real field boxes (signature, text, date, initials, etc.)
-  // straight onto the document and assigns each one to a role, the same
-  // way Google eSign/DocuSign's own builders work. See renderFieldDesigner
-  // below and main.py's get_signature_builder_token.
-  function ensureDocusealBuilderScript() {
-    if (window.customElements && window.customElements.get("docuseal-builder")) return Promise.resolve();
-    if (window.__docusealBuilderScriptPromise) return window.__docusealBuilderScriptPromise;
-    window.__docusealBuilderScriptPromise = new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = "https://cdn.docuseal.com/js/builder.js";
-      s.onload = () => resolve();
-      s.onerror = () => {
-        window.__docusealBuilderScriptPromise = null;
-        reject(new Error("Couldn't load the signature field designer. Check your connection and try again."));
-      };
-      document.head.appendChild(s);
-    });
-    return window.__docusealBuilderScriptPromise;
-  }
+  // Highlight-to-field flow (replaces the old DocuSeal Form Builder
+  // embed): the owner highlights any text in the document -- the ______,
+  // a "Signature:" line, whatever -- and that exact range becomes a
+  // signature field assigned to a signer. Same interaction as Google
+  // Docs eSignature. Field placements are stored as data on the
+  // GeneratedContract (see main.py's place_signature_field); the DocuSeal
+  // text tags are only spliced into a throwaway copy at send time.
 
   // identities: { client_name, client_email, include_sender, sender_name, sender_email }
   // collected by renderIntakeForm below, passed through unchanged once the
   // owner clicks "Continue to send" here -- this step only ever places
   // fields, it doesn't re-collect who's signing.
-  async function renderFieldDesigner(identities) {
+  async function renderFieldPlacer(identities) {
     body.innerHTML = "";
-    body.appendChild(el("p", { class: "subtitle" }, "Loading the field designer..."));
+    body.appendChild(el("p", { class: "subtitle" }, "Highlight any text in the document (like the ______) to turn it into a signature field, then pick who signs it. Placed fields are highlighted below -- remove one anytime before sending."));
     const errBox = el("div", {});
+    const previewWrap = el("div", { class: "esign-preview" });
+    const fieldListWrap = el("div", { class: "esign-field-list" });
+    body.appendChild(previewWrap);
+    body.appendChild(fieldListWrap);
+    body.appendChild(errBox);
 
-    let builderData;
-    try {
-      await ensureDocusealBuilderScript();
-      builderData = await api(`/api/generated/${generatedId}/signature-builder-token`, {
-        method: "POST",
-        body: { include_sender: identities.include_sender },
-      });
-    } catch (e) {
-      body.innerHTML = "";
-      body.appendChild(el("div", { class: "error-box" }, e.message));
-      body.appendChild(
-        el("div", { class: "modal-actions" }, [
-          el("button", { class: "btn secondary", onclick: () => renderIntakeForm() }, "Back"),
-        ])
-      );
-      return;
+    const toolbar = el("div", { class: "esign-toolbar" }, [el("button", {}, "Make signature field")]);
+    body.appendChild(toolbar);
+    let currentSelection = null;
+    let currentFields = [];
+
+    function hideToolbar() {
+      toolbar.style.display = "none";
+      currentSelection = null;
     }
 
-    body.innerHTML = "";
-    body.appendChild(
-      el("p", { class: "subtitle" }, "Drag fields onto the document and assign each one to who should fill it in -- signature, initials, text, date, or anything else in the list on the right. Changes save automatically.")
-    );
-    const builderEl = el("docuseal-builder", {
-      "data-token": builderData.token,
-      "data-roles": builderData.roles.join(","),
-      "data-field-types": "signature,initials,text,date,number,checkbox,select,radio",
-      "data-with-send-button": "false",
-      "data-with-upload-button": "false",
-      "data-with-sign-yourself-button": "false",
-      style: "display:block;height:560px;margin-top:10px;",
+    // Turn the backend's data-field-key="sigfield:{i}" markers into
+    // visible badges showing each field's role and type.
+    function decorateBadges() {
+      previewWrap.querySelectorAll(".run.field-value[data-field-key]").forEach((runEl) => {
+        const m = /^sigfield:(\d+)$/.exec(runEl.dataset.fieldKey || "");
+        if (!m || runEl.querySelector(".esign-badge")) return;
+        const f = currentFields[parseInt(m[1], 10)];
+        if (!f) return;
+        const badge = el("span", { class: "esign-badge" }, `\u270D ${f.role} ${f.field_type}`);
+        runEl.appendChild(badge);
+      });
+    }
+
+    function renderFieldList() {
+      fieldListWrap.innerHTML = "";
+      if (!currentFields.length) {
+        fieldListWrap.appendChild(el("p", { class: "subtitle" }, "No fields placed yet."));
+        return;
+      }
+      currentFields.forEach((f, i) => {
+        const row = el("div", { class: "esign-field-chip" }, [
+          el("div", {}, [
+            el("div", { class: "k" }, `\u270D ${f.label}`),
+            el("div", { class: "t" }, `assigned to ${f.role} \u00B7 "${(f.original_text || "").slice(0, 40)}${(f.original_text || "").length > 40 ? "..." : ""}"`),
+          ]),
+          el("button", {}, "Remove"),
+        ]);
+        row.querySelector("button").addEventListener("click", async () => {
+          errBox.innerHTML = "";
+          try {
+            const data = await api(`/api/generated/${generatedId}/signature-fields/${i}`, { method: "DELETE" });
+            paintPreview(data);
+          } catch (e) {
+            errBox.appendChild(el("div", { class: "error-box" }, e.message));
+          }
+        });
+        fieldListWrap.appendChild(row);
+      });
+    }
+
+    function paintPreview(data) {
+      currentFields = data.fields || [];
+      previewWrap.innerHTML = data.html || "";
+      decorateBadges();
+      renderFieldList();
+      hideToolbar();
+    }
+
+    async function reloadPreview() {
+      errBox.innerHTML = "";
+      try {
+        const data = await api(`/api/generated/${generatedId}/esign-preview`);
+        paintPreview(data);
+      } catch (e) {
+        errBox.appendChild(el("div", { class: "error-box" }, e.message));
+      }
+    }
+
+    previewWrap.addEventListener("mouseup", () => {
+      setTimeout(() => {
+        const info = computeSelectionSegments(previewWrap);
+        if (!info) { hideToolbar(); return; }
+        if (info.error === "cross-paragraph") {
+          hideToolbar();
+          alert("Please select text within a single paragraph.");
+          return;
+        }
+        currentSelection = info;
+        const sel = window.getSelection();
+        const rect = sel.getRangeAt(0).getBoundingClientRect();
+        toolbar.style.left = Math.max(8, rect.left) + "px";
+        toolbar.style.top = Math.max(8, rect.top - 46) + "px";
+        toolbar.style.display = "block";
+      }, 0);
     });
-    body.appendChild(builderEl);
-    body.appendChild(errBox);
+
+    toolbar.querySelector("button").addEventListener("click", () => {
+      if (!currentSelection) return;
+      hideToolbar();
+      openPlaceFieldModal(currentSelection);
+    });
+
+    function openPlaceFieldModal(selectionInfo) {
+      const overlay2 = el("div", { class: "modal-overlay" });
+      const inner = el("div", { class: "modal-box" });
+      const errBox2 = el("div", {});
+      const roleSelect = el("select", {}, [
+        el("option", { value: "Client" }, `Client (${identities.client_name})`),
+        identities.include_sender ? el("option", { value: "Sender" }, `Sender (${identities.sender_name || "you"})`) : null,
+      ]);
+      const typeSelect = el("select", {}, [
+        el("option", { value: "signature" }, "Signature"),
+        el("option", { value: "initials" }, "Initials"),
+        el("option", { value: "date" }, "Date"),
+        el("option", { value: "text" }, "Text"),
+      ]);
+      inner.appendChild(el("h3", {}, "Make signature field"));
+      inner.appendChild(el("p", { class: "subtitle" }, `Selected: "${(selectionInfo.text || "").slice(0, 80)}${(selectionInfo.text || "").length > 80 ? "..." : ""}"`));
+      inner.appendChild(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Who signs it"), roleSelect]));
+      inner.appendChild(el("div", { class: "form-row", style: "margin-top:10px;" }, [el("label", { class: "field-label" }, "Field type"), typeSelect]));
+      inner.appendChild(errBox2);
+      const placeBtn = el("button", { class: "btn", style: "margin-top:12px;" }, "Place field");
+      placeBtn.addEventListener("click", async () => {
+        errBox2.innerHTML = "";
+        placeBtn.disabled = true;
+        try {
+          const data = await api(`/api/generated/${generatedId}/signature-fields`, {
+            method: "POST",
+            body: {
+              paragraph_index: selectionInfo.paragraph_index,
+              table_path: selectionInfo.table_path,
+              segments: selectionInfo.segments,
+              expected_text: selectionInfo.text,
+              role: roleSelect.value,
+              field_type: typeSelect.value,
+            },
+          });
+          overlay2.remove();
+          paintPreview(data);
+        } catch (e) {
+          errBox2.appendChild(el("div", { class: "error-box" }, e.message));
+          placeBtn.disabled = false;
+        }
+      });
+      inner.appendChild(
+        el("div", { class: "modal-actions" }, [
+          el("button", { class: "btn secondary", onclick: () => overlay2.remove() }, "Cancel"),
+          placeBtn,
+        ])
+      );
+      overlay2.appendChild(inner);
+      body.appendChild(overlay2);
+    }
 
     const continueBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Continue to send");
     continueBtn.addEventListener("click", async () => {
@@ -1605,10 +1705,12 @@ async function openSignatureModal(generatedId) {
     });
     body.appendChild(
       el("div", { class: "modal-actions" }, [
-        el("button", { class: "btn secondary", onclick: () => renderIntakeForm() }, "Back"),
+        el("button", { class: "btn secondary", onclick: () => { toolbar.remove(); renderIntakeForm(); } }, "Back"),
         continueBtn,
       ])
     );
+
+    await reloadPreview();
   }
 
   async function renderIntakeForm() {
@@ -1681,7 +1783,7 @@ async function openSignatureModal(generatedId) {
         identities.sender_name = senderNameInput.value.trim();
         identities.sender_email = senderEmailInput.value.trim();
       }
-      renderFieldDesigner(identities);
+      renderFieldPlacer(identities);
     });
     body.appendChild(
       el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), nextBtn])
