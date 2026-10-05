@@ -422,6 +422,31 @@ label.field-label .req { color: var(--danger); }
 .placeholder-chip .t { color: var(--muted); font-size: 11px; margin-top: 1px; }
 .placeholder-chip button { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 12.5px; font-family: inherit; }
 
+/* ---------- Signature field placer (highlight-to-field flow) ---------- */
+.esign-preview {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  max-height: 380px; overflow-y: auto; padding: 16px 18px; margin-top: 10px;
+  background: white; font-size: 13.5px; line-height: 1.65; user-select: text;
+}
+.esign-preview .para { margin: 0 0 10px; }
+.esign-preview .run.field-value {
+  background: #fef3c7; border-bottom: 2px solid #f59e0b; border-radius: 3px; padding: 0 2px;
+}
+.esign-badge {
+  display: inline-block; background: #f59e0b; color: white; font-size: 10px; font-weight: 700;
+  border-radius: 4px; padding: 1px 6px; margin-left: 4px; vertical-align: 2px; white-space: nowrap;
+}
+.esign-toolbar {
+  position: fixed; z-index: 70; background: var(--ink); color: white; padding: 6px 8px; border-radius: 8px;
+  font-size: 13px; display: none; box-shadow: var(--shadow-md);
+}
+.esign-toolbar button { background: var(--accent); color: white; border: none; border-radius: 6px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.esign-field-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.esign-field-chip { display: flex; align-items: center; justify-content: space-between; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 11px; font-size: 12.5px; }
+.esign-field-chip .k { font-weight: 700; }
+.esign-field-chip .t { color: var(--muted); font-size: 11px; margin-top: 1px; }
+.esign-field-chip button { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 12.5px; font-family: inherit; }
+
 .preset-list { display: flex; flex-direction: column; gap: 10px; }
 .preset-row { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; }
 .preset-row-head { display: flex; gap: 8px; margin-bottom: 6px; }
