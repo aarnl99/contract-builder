@@ -1623,14 +1623,15 @@ async function openSignatureModal(generatedId) {
     });
 
     toolbar.querySelector("button").addEventListener("click", () => {
-      if (!currentSelection) return;
+      const sel = currentSelection;
+      if (!sel) return;
       hideToolbar();
-      openPlaceFieldModal(currentSelection);
+      openPlaceFieldModal(sel);
     });
 
     function openPlaceFieldModal(selectionInfo) {
       const overlay2 = el("div", { class: "modal-overlay" });
-      const inner = el("div", { class: "modal-box" });
+      const inner = el("div", { class: "modal", style: "width:440px;" });
       const errBox2 = el("div", {});
       const roleSelect = el("select", {}, [
         el("option", { value: "Client" }, `Client (${identities.client_name})`),
