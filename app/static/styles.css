@@ -725,7 +725,9 @@ a.link:hover { text-decoration: underline; }
    that wrap across lines. */
 .text-selection-highlight {
   position: fixed; z-index: 40; pointer-events: none;
-  background: var(--accent-soft-border); border-radius: 2px;
+  /* Translucent + multiply so the selected words stay readable underneath;
+     the old opaque fill painted over them and the text looked blank. */
+  background: rgba(67, 56, 202, 0.2); mix-blend-mode: multiply; border-radius: 2px;
 }
 .field-action-chip {
   position: fixed; z-index: 55; background: var(--ink); color: white; border: none; border-radius: 20px;

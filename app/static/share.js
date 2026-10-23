@@ -53,11 +53,22 @@ async function api(path, opts = {}) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   if (!res.ok) {
-    let msg = res.statusText;
+    // HTTP/2 (Render's edge) has no status-reason phrase, so statusText is
+    // "" -- and an unhandled server crash is a plain-text 500 with no JSON
+    // "detail". Both used to surface as a blank error box. FastAPI's 422
+    // also sends detail as an ARRAY of {msg, loc}, which "[object Object]"-ed.
+    let msg = "";
     try {
       const data = await res.json();
-      msg = data.detail || msg;
+      const d = data && data.detail;
+      if (typeof d === "string") msg = d;
+      else if (Array.isArray(d)) msg = d.map((x) => (x && x.msg) || "").filter(Boolean).join("; ");
+      else if (d && typeof d === "object") msg = d.message || "";
     } catch (e) {}
+    if (!msg) msg = res.statusText || "";
+    if (!msg) msg = res.status >= 500
+      ? `Something went wrong on our end (error ${res.status}). Please try again in a moment.`
+      : `Something went wrong (error ${res.status}). Please try again.`;
     throw new Error(msg);
   }
   return res.json();
@@ -575,8 +586,19 @@ function DocumentView(data) {
     selectionHighlightEls = [];
   }
 
+  // The overlays are position:fixed, so they have to be redrawn when the page
+  // scrolls or resizes or they float away from the words they mark.
+  let highlightedRange = null;
+  function redrawHighlight() {
+    if (!highlightedRange) return;
+    try { highlightRange(highlightedRange); } catch (e) { clearSelectionHighlight(); }
+  }
+  window.addEventListener("scroll", redrawHighlight, true);
+  window.addEventListener("resize", redrawHighlight);
+
   function highlightRange(range) {
     clearSelectionHighlight();
+    highlightedRange = range;
     Array.from(range.getClientRects()).forEach((r) => {
       if (r.width <= 0 || r.height <= 0) return;
       const box = el("div", { class: "text-selection-highlight" });
@@ -592,6 +614,7 @@ function DocumentView(data) {
   function deselectField() {
     selectedEls.forEach((elx) => elx.classList.remove("selected"));
     selectedEls = [];
+    highlightedRange = null;
     clearSelectionHighlight();
     if (actionChip) { actionChip.remove(); actionChip = null; }
   }
