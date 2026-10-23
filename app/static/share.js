@@ -67,9 +67,44 @@ const app = document.getElementById("app");
 function render(view) {
   app.innerHTML = "";
   app.appendChild(view);
+  if (BRAND) app.appendChild(poweredBy());
+}
+
+
+// ---- owner's branding (logo or name) in place of the Rotely wordmark, plus
+// a small "Powered by Rotely.ai" footer. Loaded once, in the background, so
+// the page never waits on it; if it can't be loaded the page just keeps the
+// default Rotely look.
+let BRAND = null;
+
+function poweredBy() {
+  return el("div", { class: "powered-by" }, [
+    "Powered by ",
+    el("a", { href: "https://rotely.ai", target: "_blank", rel: "noopener" }, ["Rotely", el("span", { class: "dot" }, ".ai")]),
+  ]);
+}
+
+async function loadBrand() {
+  try {
+    const res = await fetch(`/api/share/${TOKEN}/brand`);
+    if (!res.ok) return;
+    BRAND = await res.json();
+    if (!BRAND || !BRAND.name) { BRAND = null; return; }
+    document.querySelectorAll(".share-topbar").forEach((n) => n.replaceWith(topbar()));
+    if (!document.querySelector(".powered-by")) app.appendChild(poweredBy());
+  } catch (e) { /* keep the default look */ }
 }
 
 function topbar() {
+  if (BRAND && BRAND.name) {
+    return el("div", { class: "share-topbar" }, [
+      el("div", { class: "brand brand-custom" }, [
+        BRAND.logo_url
+          ? el("img", { class: "brand-logo", src: BRAND.logo_url, alt: BRAND.name })
+          : el("div", { class: "brand-name" }, BRAND.name),
+      ]),
+    ]);
+  }
   return el("div", { class: "share-topbar" }, [
     el("a", { class: "brand", href: "https://rotely.ai", style: "text-decoration:none;color:inherit;" }, [el("div", { class: "word" }, ["Rotely", el("span", { class: "dot" }, ".ai")])]),
   ]);
@@ -1152,8 +1187,41 @@ function DocumentView(data) {
   return shell;
 }
 
+// One link for the whole deal: once the sender has agreed the final text and
+// sent it for signature, the client's own signing step appears right here, so
+// they don't have to find a second email. The signing page itself (consent,
+// photo, turn order) is the same /sign page the emailed link opens.
+function signingBanner(signing) {
+  if (!signing) return null;
+  let title = null, text = "", action = null;
+  if (signing.state === "ready") {
+    title = "Ready for your signature";
+    text = "The sender has finished this document and is waiting for you to sign it.";
+    action = el("a", { class: "btn", href: signing.sign_url }, "Review and sign");
+  } else if (signing.state === "waiting_turn") {
+    title = "You're up after " + ((signing.waiting_on || []).join(", ") || "another signer");
+    text = "This document is signed in order. You'll get an email as soon as it's your turn, and the signing button will appear here too.";
+  } else if (signing.state === "signed") {
+    title = "You've signed";
+    text = signing.waiting_on && signing.waiting_on.length
+      ? "Still waiting on " + signing.waiting_on.join(", ") + "."
+      : "Thank you.";
+  } else if (signing.state === "all_signed") {
+    title = "Everyone has signed";
+    text = "This document is complete. No further action is needed.";
+  } else {
+    return null;
+  }
+  return el("div", { class: "sign-banner-wrap" }, [
+    el("div", { class: "sign-banner" }, [
+      el("div", { class: "sb-text" }, [el("div", { class: "sb-title" }, title), el("div", { class: "sb-sub" }, text)]),
+      action,
+    ]),
+  ]);
+}
+
 function showDocument(data) {
-  render(el("div", {}, [topbar(), DocumentView(data), JoinCta()]));
+  render(el("div", {}, [topbar(), signingBanner(data.signing), DocumentView(data), JoinCta()]));
 }
 
 async function loadDocument() {
@@ -1203,3 +1271,4 @@ async function loadDocument() {
 }
 
 render(el("div", {}, [topbar(), GateView()]));
+loadBrand();
