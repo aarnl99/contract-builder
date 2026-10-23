@@ -943,6 +943,12 @@ def _generated_count(session: Session, template_id: int) -> int:
     return len(rows)
 
 
+def _last_generated_at(session: Session, template_id: int):
+    """When this master document was most recently drafted from (None if never)."""
+    rows = session.exec(select(GeneratedContract.created_at).where(GeneratedContract.template_id == template_id)).all()
+    return max(rows) if rows else None
+
+
 @app.get("/api/templates")
 def list_templates(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     tpls = session.exec(select(Template).where(Template.owner_id == user.id).order_by(Template.created_at.desc())).all()
@@ -955,6 +961,8 @@ def list_templates(user: User = Depends(get_current_user), session: Session = De
             "placeholder_count": len(t.placeholders),
             "status": "ready" if len(t.placeholders) > 0 else "draft",
             "generated_count": _generated_count(session, t.id),
+            "last_used_at": (lambda d: d.isoformat() if d else None)(_last_generated_at(session, t.id)),
+            "field_labels": [p.label for p in t.placeholders][:8],
         }
         for t in tpls
     ]
@@ -1305,6 +1313,71 @@ def delete_template(template_id: int, user: User = Depends(get_current_user), se
     session.delete(tpl)
     session.commit()
     return {"ok": True}
+
+
+def _copy_name(session: Session, user: User, base: str) -> str:
+    """'Name (copy)', then 'Name (copy 2)', ... -- the first one not already
+    used by one of this user's master documents."""
+    taken = {t.name.strip().lower() for t in session.exec(select(Template).where(Template.owner_id == user.id)).all()}
+    root = re.sub(r"\s*\(copy(?: \d+)?\)$", "", base.strip()) or base.strip()
+    candidate = f"{root} (copy)"
+    n = 2
+    while candidate.lower() in taken:
+        candidate = f"{root} (copy {n})"
+        n += 1
+    return candidate[:200]
+
+
+@app.post("/api/templates/{template_id}/duplicate")
+def duplicate_template(template_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Copy a master document -- its Word file (including everything already
+    marked) and every field -- as an independent new master document, so a
+    variant can be tweaked without re-marking from scratch. Documents
+    already drafted from the original are not copied or affected."""
+    src = _get_owned_template(session, user, template_id)
+    if not src.working_path or not os.path.exists(src.working_path):
+        raise HTTPException(404, "This master document's file is missing, so it can't be duplicated.")
+
+    copy = Template(
+        owner_id=user.id,
+        name=_copy_name(session, user, src.name),
+        document_type=src.document_type,
+        original_filename=src.original_filename,
+        working_path="",
+    )
+    session.add(copy)
+    session.commit()
+    session.refresh(copy)
+
+    new_dir = _template_dir(user.id, copy.id)
+    try:
+        os.makedirs(new_dir, exist_ok=True)
+        new_working = os.path.join(new_dir, "working.docx")
+        shutil.copyfile(src.working_path, new_working)
+        # "Reset" restores original.docx; fall back to the working copy if the
+        # source somehow never had one.
+        src_original = os.path.join(_template_dir(user.id, src.id), "original.docx")
+        shutil.copyfile(src_original if os.path.exists(src_original) else src.working_path, os.path.join(new_dir, "original.docx"))
+        copy.working_path = new_working
+        copy.finalized = src.finalized
+        session.add(copy)
+        for ph in src.placeholders:
+            session.add(Placeholder(
+                template_id=copy.id, field_key=ph.field_key, label=ph.label, field_type=ph.field_type,
+                required=ph.required, order=ph.order, original_text=ph.original_text,
+                preset_options_json=ph.preset_options_json, threshold_type=ph.threshold_type,
+                threshold_config=ph.threshold_config,
+            ))
+        session.commit()
+    except Exception:
+        shutil.rmtree(new_dir, ignore_errors=True)
+        session.rollback()
+        for ph in session.exec(select(Placeholder).where(Placeholder.template_id == copy.id)).all():
+            session.delete(ph)
+        session.delete(session.get(Template, copy.id))
+        session.commit()
+        raise HTTPException(500, "Couldn't duplicate that master document. Please try again.")
+    return {"id": copy.id, "name": copy.name}
 
 
 class GenerateBody(BaseModel):
