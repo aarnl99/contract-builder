@@ -537,6 +537,11 @@ class SigningRequest(SQLModel, table=True):
     # (e.g. CFO, then CEO, then client); False when everyone signs at once.
     # Rotely only emails the next signer once the previous one has signed.
     sign_in_order: bool = False
+    # What Rotely asks each signer for before they reach DocuSeal's form,
+    # chosen by the sender per request: "none" (consent only), "selfie", or
+    # "selfie_id" (selfie plus a photo of their ID). The photos are a record
+    # kept with the signature, not an identity check by themselves.
+    photo_check: str = "none"
     # Populated once every signer has completed, by downloading from
     # DocuSeal immediately (its document URLs expire ~40 minutes after
     # being issued -- see docuseal_engine.get_submission_documents) rather
@@ -575,8 +580,19 @@ class SigningRequestSigner(SQLModel, table=True):
     embed_src: str = ""
     status: str = "awaiting_consent"  # awaiting_consent | ready_to_sign | completed | declined
     consent_given_at: Optional[datetime] = None
-    photo_path: str = ""  # relative-to-UPLOADS_DIR path to the captured consent photo
+    photo_path: str = ""  # path to the captured selfie (encrypted ".enc" file; older rows are plain images)
     photo_captured_at: Optional[datetime] = None
+    # Photo of the signer's ID, only collected when the request's
+    # photo_check is "selfie_id". Always stored encrypted (see photostore).
+    id_photo_path: str = ""
+    id_photo_captured_at: Optional[datetime] = None
+    # DocuSeal's own record of this signer's signing session, copied from its
+    # form.completed webhook (or a manual refresh) so it sits next to our
+    # photos. All stay empty until the signer finishes.
+    ds_ip: str = ""
+    ds_user_agent: str = ""
+    ds_opened_at: Optional[datetime] = None
+    ds_completed_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     # When this signer was first emailed their link (in sign-in-order mode
     # that's when the person before them signed, not when the request was
