@@ -21,6 +21,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 from test_multi_signer import env  # noqa: E402,F401
 from app import email_engine as ee  # noqa: E402
 from app import main as m  # noqa: E402
+from app.db import engine  # noqa: E402
+from app.models import GeneratedContract, User  # noqa: E402
+from sqlmodel import Session  # noqa: E402
 
 KEY = base64.b64encode(b"super-secret-bytes").decode()
 SIGNING = "whsec_" + KEY
@@ -71,7 +74,10 @@ def hook(env, monkeypatch):
     monkeypatch.setattr(m, "_process_draft_request",
                         lambda session, user, req, subject, body: got.append(
                             {"user": user.id, "from": req.from_address, "subject": subject, "body": body}))
-    monkeypatch.setattr(ee, "fetch_received_email", lambda email_id: {"text": "Client is Acme", "html": "<p>ignored</p>"})
+    monkeypatch.setattr(ee, "fetch_received_email", lambda email_id: {
+        "text": "Client is Acme", "html": "<p>ignored</p>", "authentication": {"spf": "pass", "dkim": "pass", "dmarc": "pass"}})
+    with Session(engine) as s:
+        env.owner_email = s.get(User, s.get(GeneratedContract, env.gid).owner_id).email
     env.address, env.got = address, got
     return env
 
@@ -89,16 +95,16 @@ def received(address, **over):
 
 
 def test_forwarded_email_reaches_the_right_account(hook):
-    r = post(hook, received(hook.address))
+    r = post(hook, received(hook.address, **{"from": f"Boss <{hook.owner_email}>"}))
     assert r.status_code == 200 and r.json() == {"ok": True}
     assert len(hook.got) == 1
     g = hook.got[0]
-    assert g["from"] == "boss@acme.test" and g["subject"] == "NDA for Acme" and g["body"] == "Client is Acme"
+    assert g["from"] == hook.owner_email and g["subject"] == "NDA for Acme" and g["body"] == "Client is Acme"
 
 
 def test_html_body_is_used_when_there_is_no_text_part(hook, monkeypatch):
-    monkeypatch.setattr(ee, "fetch_received_email", lambda email_id: {"text": None, "html": "<p>Client: Acme</p>"})
-    post(hook, received(hook.address))
+    monkeypatch.setattr(ee, "fetch_received_email", lambda email_id: {"text": None, "html": "<p>Client: Acme</p>", "authentication": {"dmarc": "pass"}})
+    post(hook, received(hook.address, **{"from": hook.owner_email}))
     assert hook.got[0]["body"] == "Client: Acme"
 
 
@@ -132,6 +138,7 @@ def test_unknown_address_is_not_drafted(hook):
 
 def test_sendgrid_form_posts_still_work(hook):
     r = TestClient(m.app).post(f"/api/email/inbound/{PATH_SECRET}", data={
-        "to": hook.address, "from": "boss@acme.test", "subject": "NDA for Acme", "text": "Client is Acme"})
+        "to": hook.address, "from": hook.owner_email, "subject": "NDA for Acme", "text": "Client is Acme",
+        "dkim": "{@x.test : pass}"})
     assert r.status_code == 200 and r.json() == {"ok": True}
     assert hook.got[0]["body"] == "Client is Acme"
