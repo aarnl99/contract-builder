@@ -787,9 +787,44 @@ function DocumentView(data) {
 
   function attachRunHandlers() {
     preview.addEventListener("mouseup", onPreviewMouseUp);
+    // Phones: long-press + dragging the selection handles never sends a
+    // mouse-up, so also react once a selection inside the document has
+    // stopped changing.
+    document.addEventListener("selectionchange", onSelectionChange);
+  }
+
+  // Turns the current (non-empty) selection inside the document into the
+  // "Suggest edit" chip. Shared by the mouse and touch paths; a selection
+  // that was already handled is cleared, so the second path sees nothing.
+  function processSelection() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return false;
+    const range = sel.getRangeAt(0);
+    if (!preview.contains(range.commonAncestorContainer)) return false;
+    const rect = range.getBoundingClientRect();
+    const info = computeSelectionSegments(preview);
+    sel.removeAllRanges();
+    if (!info) return true;
+    if (info.error === "cross-paragraph") {
+      alert("Please select text within a single paragraph.");
+      return true;
+    }
+    handleTextSelection(info, rect, range);
+    return true;
+  }
+
+  let selectionTimer = null;
+  function onSelectionChange() {
+    clearTimeout(selectionTimer);
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+    if (!preview.contains(sel.getRangeAt(0).commonAncestorContainer)) return;
+    // Wait for the person to stop adjusting the handles.
+    selectionTimer = setTimeout(processSelection, 450);
   }
 
   function onPreviewMouseUp(e) {
+    clearTimeout(selectionTimer);
     setTimeout(() => {
       const sel = window.getSelection();
       if (!sel || sel.rangeCount === 0) return;
@@ -799,17 +834,7 @@ function DocumentView(data) {
         handleRunClick(runEl);
         return;
       }
-      const range = sel.getRangeAt(0);
-      if (!preview.contains(range.commonAncestorContainer)) return;
-      const rect = range.getBoundingClientRect();
-      const info = computeSelectionSegments(preview);
-      sel.removeAllRanges();
-      if (!info) return;
-      if (info.error === "cross-paragraph") {
-        alert("Please select text within a single paragraph.");
-        return;
-      }
-      handleTextSelection(info, rect, range);
+      processSelection();
     }, 0);
   }
 
