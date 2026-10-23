@@ -602,3 +602,13 @@ class Notification(SQLModel, table=True):
     generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     read_at: Optional[datetime] = None
+
+
+class AiUsage(SQLModel, table=True):
+    """How many AI suggestions an account has used in one calendar month
+    (UTC, "YYYY-MM"). See app/ai_usage.py for the monthly limit."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    month: str = Field(index=True)
+    count: int = 0
