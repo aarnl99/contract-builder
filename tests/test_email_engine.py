@@ -95,3 +95,48 @@ def test_compute_missing_required_only_flags_required_and_blank():
     values = {"client_name": "Acme", "effective_date": ""}
     missing = ee.compute_missing_required(placeholders, values)
     assert missing == ["effective_date"]
+
+
+# --- provider switch: Resend when RESEND_API_KEY is set, else SendGrid ------
+
+def test_send_email_uses_resend_when_its_key_is_set(monkeypatch):
+    import httpx
+    from app import email_engine as ee
+    seen = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen.update(url=url, json=json, headers=headers)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(ee, "RESEND_API_KEY", "re_test")
+    monkeypatch.setattr(ee, "SENDGRID_API_KEY", "sg_test")  # Resend wins when both are set
+    monkeypatch.setattr(ee, "EMAIL_FROM", "hello@example.com")
+    monkeypatch.setattr(ee.httpx, "post", fake_post)
+    ee.send_email("a@b.co", "Hi", "Body", reply_to="me@x.co",
+                  attachments=[{"filename": "f.docx", "content_bytes": b"abc"}])
+    assert seen["url"] == "https://api.resend.com/emails"
+    assert seen["headers"]["Authorization"] == "Bearer re_test"
+    j = seen["json"]
+    assert j["to"] == ["a@b.co"] and j["subject"] == "Hi" and j["text"] == "Body"
+    assert j["reply_to"] == "me@x.co" and j["from"].endswith("<hello@example.com>")
+    assert j["attachments"][0]["filename"] == "f.docx"
+
+
+def test_send_email_falls_back_to_sendgrid(monkeypatch):
+    import httpx
+    from app import email_engine as ee
+    seen = {}
+    monkeypatch.setattr(ee, "RESEND_API_KEY", "")
+    monkeypatch.setattr(ee, "SENDGRID_API_KEY", "sg_test")
+    monkeypatch.setattr(ee.httpx, "post", lambda url, **k: seen.update(url=url) or httpx.Response(202, request=httpx.Request("POST", url)))
+    ee.send_email("a@b.co", "Hi", "Body")
+    assert seen["url"] == "https://api.sendgrid.com/v3/mail/send"
+
+
+def test_send_email_with_no_provider_raises_runtimeerror(monkeypatch):
+    import pytest
+    from app import email_engine as ee
+    monkeypatch.setattr(ee, "RESEND_API_KEY", "")
+    monkeypatch.setattr(ee, "SENDGRID_API_KEY", "")
+    with pytest.raises(RuntimeError):
+        ee.send_email("a@b.co", "Hi", "Body")

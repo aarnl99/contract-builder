@@ -92,8 +92,27 @@ def parse_alias(to_header: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Outbound mail (SendGrid)
+# Outbound mail (Resend if RESEND_API_KEY is set, otherwise SendGrid)
 # ---------------------------------------------------------------------------
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+# Resend only sends from a domain verified in its dashboard. EMAIL_FROM wins
+# over the older SendGrid variable so switching providers is one env var.
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
+
+
+def _from_address() -> str:
+    return EMAIL_FROM or SENDGRID_FROM_EMAIL
+
+
+def email_provider() -> str:
+    """Which provider send_email will use right now: "resend", "sendgrid" or "" (none)."""
+    if RESEND_API_KEY:
+        return "resend"
+    if SENDGRID_API_KEY:
+        return "sendgrid"
+    return ""
+
 
 def send_email(
     to_address: str,
@@ -103,14 +122,44 @@ def send_email(
     attachments: Optional[list] = None,
 ) -> None:
     """attachments: list of {"filename": str, "content_bytes": bytes,
-    "mime_type": str}. Raises RuntimeError if SENDGRID_API_KEY isn't set,
-    so callers can tell "not configured" apart from a real send failure."""
-    if not SENDGRID_API_KEY:
-        raise RuntimeError("SENDGRID_API_KEY is not configured.")
+    "mime_type": str}. Raises RuntimeError if no provider key is set, so
+    callers can tell "not configured" apart from a real send failure (which
+    raises httpx.HTTPError)."""
+    provider = email_provider()
+    if not provider:
+        raise RuntimeError("No email provider is configured (set RESEND_API_KEY or SENDGRID_API_KEY).")
+    if provider == "resend":
+        return _send_via_resend(to_address, subject, text_body, reply_to, attachments)
+    return _send_via_sendgrid(to_address, subject, text_body, reply_to, attachments)
 
+
+def _send_via_resend(to_address, subject, text_body, reply_to, attachments) -> None:
+    payload = {
+        "from": f"{SENDGRID_FROM_NAME} <{_from_address()}>",
+        "to": [to_address],
+        "subject": subject,
+        "text": text_body,
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
+    if attachments:
+        payload["attachments"] = [
+            {"filename": a["filename"], "content": base64.b64encode(a["content_bytes"]).decode("ascii")}
+            for a in attachments
+        ]
+    resp = httpx.post(
+        "https://api.resend.com/emails",
+        json=payload,
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+
+
+def _send_via_sendgrid(to_address, subject, text_body, reply_to, attachments) -> None:
     payload = {
         "personalizations": [{"to": [{"email": to_address}]}],
-        "from": {"email": SENDGRID_FROM_EMAIL, "name": SENDGRID_FROM_NAME},
+        "from": {"email": _from_address(), "name": SENDGRID_FROM_NAME},
         "subject": subject,
         "content": [{"type": "text/plain", "value": text_body}],
     }
@@ -126,7 +175,6 @@ def send_email(
             }
             for a in attachments
         ]
-
     resp = httpx.post(
         "https://api.sendgrid.com/v3/mail/send",
         json=payload,
