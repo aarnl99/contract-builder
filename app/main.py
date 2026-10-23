@@ -35,6 +35,7 @@ from . import docuseal_engine as ds
 from . import renewals as rn
 from . import advisor as adv
 from . import ai_usage
+from . import draftfrom as dfm
 from . import rate_limit as ratelimit
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1391,6 +1392,66 @@ def duplicate_template(template_id: int, user: User = Depends(get_current_user),
         session.commit()
         raise HTTPException(500, "Couldn't duplicate that master document. Please try again.")
     return {"id": copy.id, "name": copy.name}
+
+
+class DraftFromTextBody(BaseModel):
+    text: str
+
+
+@app.post("/api/draft-from-text")
+def draft_from_text(body: DraftFromTextBody, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Proposes a master document and field values from pasted email/notes.
+    Creates nothing: the browser opens the proposal in the normal fill-in
+    form for the owner to review. Counts against the account's monthly AI
+    allowance (shared with the redline advisor); a failed call is refunded."""
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Paste an email or some notes first.")
+    if len(text) > dfm.MAX_TEXT_CHARS:
+        raise HTTPException(400, f"That's a lot of text. Please keep it under {dfm.MAX_TEXT_CHARS:,} characters.")
+    if not ee.ANTHROPIC_API_KEY:
+        raise HTTPException(503, "AI suggestions aren't switched on for this site yet.")
+    tpls = [
+        t for t in session.exec(select(Template).where(Template.owner_id == user.id).order_by(Template.created_at.desc())).all()
+        if t.placeholders
+    ][: dfm.MAX_TEMPLATES]
+    if not tpls:
+        raise HTTPException(400, "Create a master document first, then Rotely can draft from it.")
+    offered = {}
+    catalog = []
+    for t in tpls:
+        phs = [
+            {
+                "field_key": p.field_key, "label": p.label, "field_type": p.field_type, "required": p.required,
+                "preset_options": json.loads(p.preset_options_json or "[]"),
+            }
+            for p in t.placeholders
+        ]
+        offered[t.id] = {"placeholders": phs[: dfm.MAX_FIELDS], "name": t.name}
+        catalog.append(dfm.catalog_entry(t.id, t.name, t.document_type, phs))
+    if not ai_usage.reserve(session, user.id):
+        raise HTTPException(429, dfm.LIMIT_MESSAGE.format(limit=ai_usage.MONTHLY_LIMIT))
+    try:
+        raw = dfm.propose_draft(text, catalog)
+    except Exception:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't read that just now. Please try again in a minute.")
+    if not raw:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't read that just now. Please try again in a minute.")
+    result = dfm.clean_proposal(raw, offered)
+    tid = result["template_id"]
+    return {
+        "template_id": tid,
+        "template_name": offered[tid]["name"] if tid else None,
+        "values": result["values"],
+        "other_party": result["other_party"],
+        "notes": result["notes"],
+        "filled": len(result["values"]),
+        "total": len(offered[tid]["placeholders"]) if tid else 0,
+        "usage": ai_usage.status(session, user.id),
+        "disclaimer": "AI suggestion. Check every field before you generate.",
+    }
 
 
 class GenerateBody(BaseModel):
