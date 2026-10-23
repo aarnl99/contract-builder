@@ -186,6 +186,16 @@ _RISK_TOPICS = [
 ]
 _RISK_RES = [(name, re.compile(rx, re.I)) for name, rx in _RISK_TOPICS]
 
+# "Limited liability company" (and partnership, corporation...) names a type of
+# business, not a liability clause. Changing LLC to S Corp is a change to who
+# the party is, so those phrases are blanked out before the topic words are
+# looked for. A real liability clause in the same text still has its own
+# "liability" and is still caught.
+_ENTITY_NAMES = re.compile(
+    r"\blimited[- ]liability[- ](?:company|companies|(?:limited[- ])?partnerships?|corporations?|co\b\.?|entity|entities)",
+    re.I,
+)
+
 # A free-text change this much longer or shorter is a rewrite of wording, not a tweak.
 LARGE_REWRITE_CHARS = 150
 LARGE_DELETE_MIN = 80
@@ -196,7 +206,7 @@ def clause_risk(*, label, original, proposed, comment="", free_text=False) -> Op
     """None for an ordinary change, else {"topics": [...], "message": "..."}.
     Looks at the term's name and the wording before and after (and the
     client's note), so a change is caught whichever side mentions the topic."""
-    haystack = "\n".join(str(x or "") for x in (label, original, proposed, comment))
+    haystack = _ENTITY_NAMES.sub(" ", "\n".join(str(x or "") for x in (label, original, proposed, comment)))
     topics = [name for name, rx in _RISK_RES if rx.search(haystack)]
     o, p = str(original or ""), str(proposed or "")
     if free_text:
