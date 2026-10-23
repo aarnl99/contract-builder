@@ -1,5 +1,5 @@
 """Database models for the contract template tool."""
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List
 
 from sqlmodel import SQLModel, Field, Relationship
@@ -89,6 +89,9 @@ class User(SQLModel, table=True):
     # haven't signed (day 3, 6 and 9 after they were emailed). The owner can
     # always send one by hand regardless of this setting.
     auto_remind_signers: bool = True
+    # Email the owner 30 and 7 days before a contract's end date (see
+    # app/renewals.py). Only goes to the document owner, never a counterparty.
+    renewal_emails: bool = True
 
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
@@ -181,6 +184,17 @@ class GeneratedContract(SQLModel, table=True):
     parties_json: str = "[]"
     archived: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # Contract term / renewal tracking (see app/renewals.py). end_date is what
+    # the owner confirmed; end_date_suggestion_json holds an AI suggestion
+    # that is waiting for them to confirm, edit or dismiss it -- never used
+    # for emails or the "Renewing soon" strip until confirmed.
+    end_date: Optional[date] = None
+    auto_renews: bool = False
+    renewal_terms: str = ""
+    end_date_suggestion_json: str = ""
+    renewal_30_sent_at: Optional[datetime] = None
+    renewal_7_sent_at: Optional[datetime] = None
 
     # Set when this generated contract was produced by applying accepted
     # redlines from a client review round, so it's traceable back to the
