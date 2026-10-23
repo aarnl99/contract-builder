@@ -415,7 +415,8 @@ def test_suggest_term_reads_the_models_tool_answer(monkeypatch):
     monkeypatch.setattr(rn.ee, "ANTHROPIC_API_KEY", "k")
     got = rn.suggest_term("This Agreement ends on March 1, 2027.", today=TODAY)
     assert got["end_date"] == "2027-03-01" and got["auto_renews"] is True
-    assert calls[0]["tool_choice"] == {"type": "tool", "name": "record_term"}
+    assert calls[0]["tool_choice"] == {"type": "auto"}  # forced choice is rejected by newer models
+    assert "record_term tool" in calls[0]["messages"][0]["content"]
     assert "March 1, 2027" in calls[0]["messages"][0]["content"]
     assert "not instructions" in calls[0]["messages"][0]["content"]
 

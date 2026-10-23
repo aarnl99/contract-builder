@@ -193,7 +193,8 @@ def extract_field_values(body_text: str, placeholders: list) -> dict:
         model=EMAIL_AGENT_MODEL,
         max_tokens=1024,
         tools=[tool],
-        tool_choice={"type": "tool", "name": "record_values"},
+        # Newer models reject a forced tool choice, so ask for the tool in the prompt.
+        tool_choice={"type": "auto"},
         messages=[
             {
                 "role": "user",
@@ -201,7 +202,8 @@ def extract_field_values(body_text: str, placeholders: list) -> dict:
                     "This is an email asking for a contract to be drafted. Extract values for the fields "
                     "below using only information explicitly present in the email. Never guess or invent a "
                     "value, and leave a field out entirely if the email doesn't cover it.\n\n"
-                    f"Fields:\n{fields_desc}\n\nEmail:\n{body_text}"
+                    f"Fields:\n{fields_desc}\n\nEmail:\n{body_text}\n\n"
+                    "Answer only by calling the record_values tool."
                 ),
             }
         ],
