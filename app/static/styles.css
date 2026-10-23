@@ -1051,3 +1051,35 @@ label.field-label { color: var(--ink); font-weight: 500; }
 .share-info-box .row-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 .share-info-box .v.waiting-note { font-family: inherit; font-weight: 500; font-size: 12.5px; word-break: normal; }
 .share-info-box .v.waiting-note.overdue { font-weight: 600; }
+
+/* Contract term and renewals: "Renewing soon" strip, end-date tags, and the Contract term block. */
+.term-tag { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 10px; background: var(--surface, #eeeeeb); color: var(--muted, #6b7280); white-space: nowrap; }
+.term-tag.soon { background: #fbefd6; color: #8a5300; }
+.term-tag.confirm { background: #e9e7fb; color: #4338ca; }
+.renew-strip { margin: 4px 0 22px; }
+.renew-title { font-size: 12px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted, #6b7280); margin-bottom: 10px; }
+.renew-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.renew-card { text-align: left; border: 0; border-radius: 14px; background: #fff; padding: 14px 16px; height: 72px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; gap: 4px; min-width: 0; cursor: pointer; font: inherit; color: inherit; box-shadow: 0 1px 2px rgba(14,17,22,.06), 0 4px 14px rgba(14,17,22,.04); }
+.renew-card:hover { box-shadow: 0 1px 2px rgba(14,17,22,.08), 0 6px 18px rgba(14,17,22,.08); }
+.renew-card.urgent .renew-when { color: #b3361f; font-weight: 600; }
+.renew-card.confirm { background: #f1f0fd; }
+.renew-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.renew-name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.renew-when { font-size: 12.5px; color: var(--muted, #6b7280); }
+.renew-chip { flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: #e9e7fb; color: #4338ca; }
+.term-box { margin: 18px 0 6px; padding: 16px; border-radius: 14px; background: var(--surface, #eeeeeb); }
+.term-title { font-size: 13px; font-weight: 700; margin-bottom: 10px; }
+.term-status { font-size: 13px; margin-bottom: 10px; }
+.term-status.soon { color: #8a5300; font-weight: 600; }
+.term-status.muted { color: var(--muted, #6b7280); }
+.term-suggestion { background: #fff; border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; }
+.term-sg-label { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: #4338ca; margin-bottom: 6px; }
+.term-sg-main { font-size: 14px; font-weight: 600; }
+.term-sg-note { font-size: 13px; margin-top: 4px; }
+.term-sg-quote { font-size: 12.5px; color: var(--muted, #6b7280); margin-top: 6px; font-style: italic; }
+.term-sg-actions, .term-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.term-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: end; }
+.term-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; color: var(--muted, #6b7280); }
+.term-field.wide { grid-column: 1 / -1; }
+.term-field input { height: 38px; box-sizing: border-box; border: 0; border-radius: 10px; padding: 0 12px; font-size: 14px; font-family: inherit; background: #fff; color: var(--ink, #0e1116); }
+.term-check { display: flex; align-items: center; gap: 8px; font-size: 13px; height: 38px; cursor: pointer; }

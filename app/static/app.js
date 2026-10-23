@@ -299,6 +299,7 @@ function toggleAvatarMenu() {
     { key: "redline_comment", label: "Client comments on a redline" },
     { key: "signature_events", label: "Someone signs (or finishes signing) a document" },
     { key: "auto_remind_signers", label: "Remind signers who haven't signed yet (day 3, 6, 9)" },
+    { key: "renewal_emails", label: "Email me 30 and 7 days before a contract ends" },
   ];
   const notifList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:2px;" }, [
     el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."),
@@ -2899,8 +2900,50 @@ function DocumentsView() {
   );
   wrap.appendChild(toolbar);
 
+  // "Renewing soon": confirmed end dates in the next 90 days (and anything
+  // that ended in the last two weeks), plus suggested dates waiting to be
+  // confirmed. Hidden entirely when there's nothing to show.
+  const renewalWrap = el("div", {});
+  wrap.appendChild(renewalWrap);
+
   const listWrap = el("div", {});
   wrap.appendChild(listWrap);
+
+  async function loadRenewals() {
+    try {
+      const res = await api("/api/renewals");
+      renewalWrap.innerHTML = "";
+      if (!res.renewing.length && !res.to_confirm.length) return;
+      const cards = [];
+      res.renewing.forEach((r) =>
+        cards.push(
+          el("button", { class: "renew-card" + (r.days_left <= 7 ? " urgent" : ""), type: "button", title: r.name, onclick: () => openDetail({ id: r.id }) }, [
+            el("div", { class: "renew-head" }, [el("div", { class: "renew-name" }, r.name), r.auto_renews ? el("span", { class: "renew-chip" }, "Auto-renews") : null]),
+            el("div", { class: "renew-when" }, `${fmtDay(r.end_date)} · ${endsText(r.days_left)}`),
+          ])
+        )
+      );
+      res.to_confirm.forEach((r) =>
+        cards.push(
+          el("button", { class: "renew-card confirm", type: "button", onclick: () => openDetail({ id: r.id }) }, [
+            el("div", { class: "renew-name" }, r.name),
+            el("div", { class: "renew-when" }, "Suggested end date to confirm"),
+          ])
+        )
+      );
+      renewalWrap.appendChild(el("div", { class: "renew-strip" }, [el("div", { class: "renew-title" }, "Renewing soon"), el("div", { class: "renew-cards" }, cards)]));
+    } catch (e) {
+      renewalWrap.innerHTML = ""; // a nicety: the document list below still works without it
+    }
+  }
+  loadRenewals();
+
+  // "Ends Mar 1, 2027" / "Confirm end date" next to a document's name.
+  function termTagEl(d) {
+    if (d.end_date) return el("span", { class: "term-tag" + (daysUntil(d.end_date) <= 30 ? " soon" : "") }, "Ends " + fmtDay(d.end_date));
+    if (d.has_end_date_suggestion) return el("span", { class: "term-tag confirm" }, "Confirm end date");
+    return null;
+  }
 
   // Small colored pill for a document's current step (drafted, shared,
   // redlines submitted, response sent, applied) -- reuses the same
@@ -2932,7 +2975,7 @@ function DocumentsView() {
       el("div", { class: "left" }, [
         el("div", { class: "file-icon" }, "✓"),
         el("div", {}, [
-          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status), signatureTagEl(d.signature, d.id), unresolvedBadgeEl(d.unresolved_count)]),
+          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status), signatureTagEl(d.signature, d.id), termTagEl(d), unresolvedBadgeEl(d.unresolved_count)]),
           el("div", { class: "lineage" }, ["Originated from ", el("span", { class: "tag" }, d.template_name)]),
           partiesLineEl(d.parties),
         ]),
@@ -3043,6 +3086,7 @@ function DocumentsView() {
             el("span", { class: "version-count" }, `${familyDocs.length} versions`),
             statusTagEl(latest.status),
             signatureTagEl(latest.signature, latest.id),
+            termTagEl(latest),
             unresolvedBadgeEl(latest.unresolved_count),
           ]),
           el("div", { class: "folder-sub" }, ["Originated from ", el("span", { class: "tag" }, latest.template_name)]),
@@ -3252,6 +3296,7 @@ function DocumentsView() {
           el("div", { class: "txt" }, ["Originated from master document", el("br"), lineageLink]),
         ]),
         el("div", {}, valueRows.length ? el("div", {}, valueRows) : el("div", { style: "color:var(--muted);font-size:13px;" }, "No field values recorded.")),
+        renewalSectionEl(d.id, () => { loadRenewals(); load(); }),
         el("div", { class: "panel-actions" }, [
           el("a", { class: "btn", href: `/api/generated/${d.id}/download` }, "Download .docx"),
           // Close the panel before opening either modal -- .panel-overlay is
@@ -3919,6 +3964,143 @@ function fmtBytes(n) {
 
 function fmtShortDate(iso) {
   return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+// A plain calendar day ("2027-03-01") as local text. Parsed by hand because
+// new Date("2027-03-01") is UTC midnight, which shows as the day before in
+// any timezone west of UTC.
+function parseDay(iso) {
+  const [y, m, d] = String(iso).slice(0, 10).split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+function fmtDay(iso) {
+  return parseDay(iso).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+}
+function daysUntil(iso) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((parseDay(iso) - today) / 86400000);
+}
+function endsText(days) {
+  if (days < 0) return days === -1 ? "ended yesterday" : `ended ${-days} days ago`;
+  if (days === 0) return "ends today";
+  if (days === 1) return "ends tomorrow";
+  return `ends in ${days} days`;
+}
+
+// "Contract term" block in a document's detail panel: confirmed end date,
+// auto-renew flag and renewal notes, plus the AI suggestion (if any) that
+// still needs the owner to confirm, edit or dismiss it. A suggestion never
+// counts for the "Renewing soon" strip or emails until confirmed.
+function renewalSectionEl(docId, onChange) {
+  const box = el("div", { class: "term-box" }, el("div", { class: "term-title" }, "Contract term"));
+  const body = el("div", {}, el("div", { class: "term-status" }, "Loading..."));
+  box.appendChild(body);
+
+  async function save(values, btn) {
+    if (btn) { btn.disabled = true; }
+    try {
+      const res = await api(`/api/generated/${docId}/renewal`, { method: "PUT", body: values });
+      paint(res);
+      if (onChange) onChange();
+    } catch (err) {
+      if (btn) btn.disabled = false;
+      alert(err.message);
+    }
+  }
+
+  function paint(info, note) {
+    body.innerHTML = "";
+    const dateInput = el("input", { type: "date", class: "term-date", value: info.end_date || "" });
+    const autoCheck = el("input", { type: "checkbox", id: `term-auto-${docId}` });
+    autoCheck.checked = !!info.auto_renews;
+    const notes = el("input", { type: "text", class: "term-notes", maxlength: "300", placeholder: "Renewal or notice terms (optional)", value: info.renewal_terms || "" });
+
+    if (info.suggestion) {
+      const sg = info.suggestion;
+      const summary = [sg.end_date ? "Ends " + fmtDay(sg.end_date) : "No end date found", sg.auto_renews ? "renews automatically" : null].filter(Boolean).join(" · ");
+      const useBtn = sg.end_date
+        ? el("button", { class: "btn small", type: "button", onclick: (e) => save({ end_date: sg.end_date, auto_renews: !!sg.auto_renews, renewal_terms: sg.renewal_terms || "" }, e.currentTarget) }, "Use this")
+        : null;
+      body.appendChild(
+        el("div", { class: "term-suggestion" }, [
+          el("div", { class: "term-sg-label" }, "AI suggestion · check it against the contract"),
+          el("div", { class: "term-sg-main" }, summary),
+          sg.renewal_terms ? el("div", { class: "term-sg-note" }, sg.renewal_terms) : null,
+          sg.evidence ? el("div", { class: "term-sg-quote" }, `\u201c${sg.evidence}\u201d`) : null,
+          el("div", { class: "term-sg-actions" }, [
+            useBtn,
+            el("button", {
+              class: "btn secondary small", type: "button",
+              onclick: () => {
+                if (sg.end_date) dateInput.value = sg.end_date;
+                autoCheck.checked = !!sg.auto_renews;
+                notes.value = sg.renewal_terms || "";
+                dateInput.focus();
+              },
+            }, "Edit first"),
+            el("button", {
+              class: "btn secondary small", type: "button",
+              onclick: async (e) => {
+                e.currentTarget.disabled = true;
+                try { paint(await api(`/api/generated/${docId}/renewal/dismiss`, { method: "POST" })); if (onChange) onChange(); }
+                catch (err) { alert(err.message); }
+              },
+            }, "Dismiss"),
+          ]),
+        ])
+      );
+    }
+
+    if (info.end_date) {
+      const d = info.days_left;
+      body.appendChild(el("div", { class: "term-status" + (d <= 30 ? " soon" : "") }, `Ends ${fmtDay(info.end_date)} · ${endsText(d)}`));
+    } else if (!info.suggestion) {
+      body.appendChild(el("div", { class: "term-status muted" }, "No end date set. Add one and Rotely will email you before it ends."));
+    }
+    if (note) body.appendChild(el("div", { class: "term-status muted" }, note));
+
+    body.appendChild(
+      el("div", { class: "term-form" }, [
+        el("label", { class: "term-field" }, [el("span", {}, "End date"), dateInput]),
+        el("label", { class: "term-check", for: `term-auto-${docId}` }, [autoCheck, "Renews automatically"]),
+        el("label", { class: "term-field wide" }, [el("span", {}, "Notes"), notes]),
+      ])
+    );
+    const actions = [
+      el("button", {
+        class: "btn small", type: "button",
+        onclick: (e) => save({ end_date: dateInput.value || null, auto_renews: autoCheck.checked, renewal_terms: notes.value }, e.currentTarget),
+      }, "Save"),
+    ];
+    if (info.ai_available && !info.suggestion) {
+      actions.push(
+        el("button", {
+          class: "btn secondary small", type: "button",
+          onclick: async (e) => {
+            const btn = e.currentTarget;
+            btn.disabled = true;
+            btn.textContent = "Reading...";
+            try {
+              const res = await api(`/api/generated/${docId}/renewal/suggest`, { method: "POST" });
+              paint(res, res.found ? null : "Couldn't find a clear end date in this document.");
+              if (onChange) onChange();
+            } catch (err) {
+              btn.disabled = false;
+              btn.textContent = "Suggest from document";
+              alert(err.message);
+            }
+          },
+        }, "Suggest from document")
+      );
+    }
+    body.appendChild(el("div", { class: "term-actions" }, actions));
+  }
+
+  api(`/api/generated/${docId}/renewal`)
+    .then((info) => paint(info))
+    .catch((err) => { body.innerHTML = ""; body.appendChild(el("div", { class: "error-box" }, err.message || "Couldn't load the contract term.")); });
+  return box;
 }
 
 function fmtRelativeTime(iso) {
