@@ -11,7 +11,7 @@ import threading
 import time
 import httpx
 from collections import Counter
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import Optional
 
 _ai_log = logging.getLogger("rotely.ai")
@@ -25,7 +25,7 @@ def _log_ai_failure(what: str, exc: Exception) -> None:
 
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from sqlmodel import Session, select
@@ -48,6 +48,7 @@ from . import advisor as adv
 from . import ai_usage
 from . import draftfrom as dfm
 from . import rate_limit as ratelimit
+from . import photostore as ps
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SECRET_KEY_PATH = os.path.join(BASE_DIR, "secret.key")
@@ -2422,11 +2423,7 @@ def delete_generated_forever(generated_id: int, user: User = Depends(get_current
         for signer in session.exec(
             select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
         ).all():
-            if signer.photo_path and os.path.exists(signer.photo_path):
-                try:
-                    os.remove(signer.photo_path)
-                except OSError:
-                    pass
+            _remove_signer_photos(signer)
             session.delete(signer)
         if sr.signed_file_path and os.path.exists(sr.signed_file_path):
             try:
@@ -2849,6 +2846,55 @@ def close_share_link(
 
 _SIGNATURE_ROLES = ("Client", "Sender")
 
+# What the sender can require from each signer before DocuSeal's form opens.
+_PHOTO_CHECKS = ("none", "selfie", "selfie_id")
+
+
+def _clean_photo_check(value) -> str:
+    level = str(value or "none").strip().lower()
+    if level not in _PHOTO_CHECKS:
+        raise HTTPException(400, "Photo check must be none, selfie, or selfie_id.")
+    return level
+
+
+def _parse_ds_time(value) -> Optional[datetime]:
+    """DocuSeal timestamps (ISO 8601, usually with a Z) as naive UTC, or None."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _record_docuseal_check(signer: "SigningRequestSigner", info: dict) -> None:
+    """Copies DocuSeal's own record of a signing session (IP, browser,
+    opened/completed times) onto the signer row so it sits next to our
+    photos. `info` is a webhook `data` object or a submitter from
+    GET /submissions/{id}; missing keys are simply left blank."""
+    if not isinstance(info, dict):
+        return
+    ip = info.get("ip")
+    ua = info.get("ua")
+    if isinstance(ip, str) and ip:
+        signer.ds_ip = ip[:64]
+    if isinstance(ua, str) and ua:
+        signer.ds_user_agent = ua[:300]
+    signer.ds_opened_at = _parse_ds_time(info.get("opened_at")) or signer.ds_opened_at
+    signer.ds_completed_at = _parse_ds_time(info.get("completed_at")) or signer.ds_completed_at
+
+
+def _remove_signer_photos(signer: "SigningRequestSigner") -> None:
+    for path in (signer.photo_path, signer.id_photo_path):
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
 
 def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
     ordered, turn = _signer_turns(sr, signers)
@@ -2873,6 +2919,7 @@ def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
         # URL to configure.
         "webhook_url": f"{_canonical_base_url()}/api/webhooks/docuseal",
         "sign_in_order": bool(sr.sign_in_order),
+        "photo_check": sr.photo_check or "none",
         "waiting_on": [
             {
                 "name": w.name,
@@ -2893,6 +2940,14 @@ def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
                 "consent_given_at": s.consent_given_at.isoformat() if s.consent_given_at else None,
                 "completed_at": s.completed_at.isoformat() if s.completed_at else None,
                 "has_photo": bool(s.photo_path),
+                "has_id_photo": bool(s.id_photo_path),
+                "signer_id": s.id,
+                "photo_captured_at": s.photo_captured_at.isoformat() if s.photo_captured_at else None,
+                "id_photo_captured_at": s.id_photo_captured_at.isoformat() if s.id_photo_captured_at else None,
+                "ds_ip": s.ds_ip or "",
+                "ds_user_agent": s.ds_user_agent or "",
+                "ds_opened_at": s.ds_opened_at.isoformat() if s.ds_opened_at else None,
+                "ds_completed_at": s.ds_completed_at.isoformat() if s.ds_completed_at else None,
                 "waiting_since": _signer_waiting_since(sr, s, signers).isoformat() if s.id in waiting_ids else None,
                 "days_waiting": _days_between(_signer_waiting_since(sr, s, signers), now) if s.id in waiting_ids else None,
                 "reminder_count": s.reminder_count or 0,
@@ -3084,7 +3139,17 @@ def _document_signature_summaries(session: Session, doc_ids: list) -> dict:
     return out
 
 
-def _send_signature_request_email(request: Optional[Request], user: User, gc: GeneratedContract, signer: SigningRequestSigner) -> None:
+def _signing_email_note(photo_check: str) -> str:
+    if photo_check == "selfie_id":
+        return ("Before signing you'll be asked for a quick selfie and a photo of your ID -- "
+                "they're stored encrypted with the signing record, not in a separate account or download.")
+    if photo_check == "selfie":
+        return ("Before signing you'll be asked for a quick selfie -- it's stored encrypted "
+                "with the signing record, not in a separate account or download.")
+    return "Before signing you'll be asked to agree to sign electronically -- no account or download needed."
+
+
+def _send_signature_request_email(request: Optional[Request], user: User, gc: GeneratedContract, signer: SigningRequestSigner, photo_check: str = "none") -> None:
     sender_name = user.name.strip() or user.email
     # request is None when this runs from a webhook (next signer's turn).
     base = _base_url(request) if request is not None else _canonical_base_url()
@@ -3094,8 +3159,8 @@ def _send_signature_request_email(request: Optional[Request], user: User, gc: Ge
         f"Hi {first_name},\n\n"
         f'{sender_name} sent you "{gc.name}" to sign.\n\n'
         f"Open it here:\n{sign_url}\n\n"
-        "You'll be asked to agree to a quick photo step before signing -- this is "
-        "part of the signing record, not a separate account or download.\n\n"
+        + _signing_email_note(photo_check) +
+        "\n\n"
         "- Rotely"
     )
     try:
@@ -3394,6 +3459,8 @@ class CreateSignatureRequestBody(BaseModel):
     # True: signers sign one after another in list order (the next one is
     # emailed only when the previous has signed). False: everyone at once.
     sign_in_order: bool = False
+    # "none" | "selfie" | "selfie_id" -- see SigningRequest.photo_check.
+    photo_check: str = "none"
     client_name: str = ""
     client_email: str = ""
     include_sender: bool = False
@@ -3602,6 +3669,7 @@ def create_signature_request(
         # Bug tracker #52 (distinct emails per signer) is enforced inside
         # _build_signer_specs.
         signer_specs = _build_signer_specs(body, user)
+        photo_check = _clean_photo_check(body.photo_check)
         sign_in_order = bool(body.sign_in_order) and len(signer_specs) > 1
         docuseal_order = "preserved" if sign_in_order else "random"
 
@@ -3716,6 +3784,7 @@ def create_signature_request(
             generated_contract_id=gc.id,
             docuseal_submission_id=submission_id,
             sign_in_order=sign_in_order,
+            photo_check=photo_check,
         )
         session.add(sr)
         session.commit()
@@ -3755,7 +3824,7 @@ def create_signature_request(
         # _apply_signer_completed).
         to_email = signers[:1] if sign_in_order else signers
         for signer in to_email:
-            _send_signature_request_email(request, user, gc, signer)
+            _send_signature_request_email(request, user, gc, signer, photo_check)
         _mark_notified(session, to_email)
 
         return _signing_request_payload(sr, signers)
@@ -4163,6 +4232,7 @@ def get_sign_status(token: str, session: Session = Depends(get_session)):
         "role": signer.role,
         "status": signer.status,
         "request_status": sr.status if sr else "",
+        "photo_check": (sr.photo_check or "none") if sr else "none",
         "embed_src": signer.embed_src if signer.status != "awaiting_consent" and your_turn else None,
     }
 
@@ -4184,18 +4254,20 @@ def _signer_turn_info(session: Session, sr, signer):
 
 class SignConsentBody(BaseModel):
     consent: bool = False
-    photo: str = ""  # data URL, e.g. "data:image/jpeg;base64,...."
-
-
-_MAX_CONSENT_PHOTO_BYTES = 8 * 1024 * 1024  # 8MB -- generous for a browser-captured selfie, matches the spirit of #15's upload cap
+    photo: str = ""  # selfie as a data URL, e.g. "data:image/jpeg;base64,...."
+    id_photo: str = ""  # photo of the signer's ID, same format
 
 
 @app.post("/api/sign/{token}/consent")
 def submit_sign_consent(token: str, body: SignConsentBody, session: Session = Depends(get_session)):
-    """Records consent + a photo, then (and only then) unlocks the actual
-    DocuSeal signing form for this signer -- see get_sign_status. Does
-    nothing to the signature itself; the photo is a record stored
-    alongside the request, not sent to or checked by DocuSeal."""
+    """Records consent (and, when the sender asked for it, a selfie and/or an
+    ID photo), then -- and only then -- unlocks the actual DocuSeal signing
+    form for this signer; see get_sign_status. What is required depends on
+    the request's photo_check: "none" needs only the agreement, "selfie"
+    adds a selfie, "selfie_id" adds a photo of the signer's ID as well.
+    Nothing here touches the signature itself; the photos are a record kept
+    alongside the request (encrypted, see photostore), not sent to or
+    checked by DocuSeal."""
     signer = _get_signer_or_404(session, token)
     if signer.status != "awaiting_consent":
         raise HTTPException(400, "You've already completed this step.")
@@ -4215,35 +4287,73 @@ def submit_sign_consent(token: str, body: SignConsentBody, session: Session = De
         raise HTTPException(400, "It isn't your turn to sign yet -- waiting on " + ", ".join(waiting_on) + " to sign first.")
     if not body.consent:
         raise HTTPException(400, "You must agree to continue.")
-    if not body.photo or "," not in body.photo:
-        raise HTTPException(400, "A photo is required before continuing.")
 
-    header, _, b64data = body.photo.partition(",")
+    # Validate everything before writing anything, so a bad second photo
+    # never leaves a half-saved first one behind.
+    level = sr.photo_check or "none"
+    selfie_bytes = id_bytes = None
     try:
-        photo_bytes = base64.b64decode(b64data, validate=True)
-    except ValueError:
-        raise HTTPException(400, "That photo couldn't be read. Try again.")
-    if not photo_bytes:
-        raise HTTPException(400, "That photo couldn't be read. Try again.")
-    if len(photo_bytes) > _MAX_CONSENT_PHOTO_BYTES:
-        raise HTTPException(400, "That photo is too large.")
+        if level in ("selfie", "selfie_id"):
+            selfie_bytes, _ = ps.parse_data_url(body.photo)
+        if level == "selfie_id":
+            if not body.id_photo:
+                raise HTTPException(400, "A photo of your ID is required before continuing.")
+            id_bytes, _ = ps.parse_data_url(body.id_photo)
+    except ps.PhotoError as e:
+        raise HTTPException(400, str(e))
 
     gc = session.get(GeneratedContract, sr.generated_contract_id)
     owner_id = gc.owner_id if gc else 0
     photo_dir = os.path.join(UPLOADS_DIR, str(owner_id), "signatures", str(signer.signing_request_id))
-    os.makedirs(photo_dir, exist_ok=True)
-    ext = "png" if "image/png" in header else "jpg"
-    photo_path = os.path.join(photo_dir, f"signer_{signer.id}_consent.{ext}")
-    with open(photo_path, "wb") as f:
-        f.write(photo_bytes)
+    now = datetime.utcnow()
+    if selfie_bytes is not None:
+        signer.photo_path = ps.save_image(os.path.join(photo_dir, f"signer_{signer.id}_consent"), selfie_bytes, SECRET_KEY)
+        signer.photo_captured_at = now
+    if id_bytes is not None:
+        signer.id_photo_path = ps.save_image(os.path.join(photo_dir, f"signer_{signer.id}_id"), id_bytes, SECRET_KEY)
+        signer.id_photo_captured_at = now
 
-    signer.consent_given_at = datetime.utcnow()
-    signer.photo_path = photo_path
-    signer.photo_captured_at = datetime.utcnow()
+    signer.consent_given_at = now
     signer.status = "ready_to_sign"
     session.add(signer)
     session.commit()
     return {"ok": True, "embed_src": signer.embed_src}
+
+
+@app.get("/api/generated/{generated_id}/signature-request/signers/{signer_id}/photo/{kind}")
+def get_signer_photo(
+    generated_id: int,
+    signer_id: int,
+    kind: str,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """The sender's view of a signer's selfie ("selfie") or ID photo ("id").
+    Only the account that owns the document can open it; the image is
+    decrypted on the fly, never cached by the browser, and never written
+    anywhere in readable form."""
+    gc = _get_owned_generated(session, user, generated_id)
+    if kind not in ("selfie", "id"):
+        raise HTTPException(404, "No such photo.")
+    signer = session.get(SigningRequestSigner, signer_id)
+    sr = session.get(SigningRequest, signer.signing_request_id) if signer else None
+    if not signer or not sr or sr.generated_contract_id != gc.id:
+        raise HTTPException(404, "No such photo.")
+    path = signer.photo_path if kind == "selfie" else signer.id_photo_path
+    uploads_root = os.path.realpath(UPLOADS_DIR)
+    if not path or not os.path.realpath(path).startswith(uploads_root + os.sep):
+        raise HTTPException(404, "No such photo.")
+    try:
+        data, mime = ps.read_image(path, SECRET_KEY)
+    except FileNotFoundError:
+        raise HTTPException(404, "This photo is no longer stored.")
+    except ps.PhotoError:
+        raise HTTPException(500, "This photo can't be opened.")
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4258,7 +4368,7 @@ def submit_sign_consent(token: str, body: SignConsentBody, session: Session = De
 # the webhook already delivered, or vice versa.
 # ---------------------------------------------------------------------------
 
-def _apply_signer_completed(session: Session, submitter_id) -> None:
+def _apply_signer_completed(session: Session, submitter_id, info: Optional[dict] = None) -> None:
     """Marks one signer done. If anyone else on this same request still
     hasn't signed, this is the owner's only signal that something happened
     until the rest finish too -- bug tracker: this used to notify no one at
@@ -4274,6 +4384,13 @@ def _apply_signer_completed(session: Session, submitter_id) -> None:
     signer = session.exec(
         select(SigningRequestSigner).where(SigningRequestSigner.docuseal_submitter_id == submitter_id)
     ).first()
+    if signer and signer.status == "completed" and info and not signer.ds_completed_at:
+        # Already marked done (say by a manual refresh that carried no
+        # details); still keep DocuSeal's record when it arrives.
+        _record_docuseal_check(signer, info)
+        session.add(signer)
+        session.commit()
+        return
     if not signer or signer.status == "completed":
         return
     sr = session.get(SigningRequest, signer.signing_request_id)
@@ -4285,6 +4402,8 @@ def _apply_signer_completed(session: Session, submitter_id) -> None:
         return
     signer.status = "completed"
     signer.completed_at = datetime.utcnow()
+    if info:
+        _record_docuseal_check(signer, info)
     session.add(signer)
     session.commit()
 
@@ -4312,7 +4431,7 @@ def _apply_signer_completed(session: Session, submitter_id) -> None:
             # webhook/refresh can't email them twice.)
             if sr.sign_in_order and owner:
                 next_up = sorted(still_pending, key=lambda s: (s.position, s.id or 0))[0]
-                _send_signature_request_email(None, owner, gc, next_up)
+                _send_signature_request_email(None, owner, gc, next_up, sr.photo_check or "none")
                 _mark_notified(session, [next_up])
 
 
@@ -4472,7 +4591,7 @@ def _reconcile_signature_request_from_docuseal(session: Session, sr: SigningRequ
         sub_status = (submitter.get("status") or "").strip().lower()
         submitter_id = submitter.get("id")
         if sub_status == "completed":
-            _apply_signer_completed(session, submitter_id)
+            _apply_signer_completed(session, submitter_id, submitter)
         elif sub_status == "declined":
             _apply_signer_declined(session, submitter_id)
 
@@ -4508,7 +4627,7 @@ async def docuseal_webhook(request: Request, session: Session = Depends(get_sess
     data = payload.get("data", {}) or {}
 
     if event_type == "form.completed":
-        _apply_signer_completed(session, data.get("id"))
+        _apply_signer_completed(session, data.get("id"), data)
     elif event_type == "form.declined":
         _apply_signer_declined(session, data.get("id"))
     elif event_type == "submission.completed":
