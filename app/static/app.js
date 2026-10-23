@@ -2544,17 +2544,78 @@ function DraftView(preselectId) {
           );
           return;
         }
-        const grid = el("div", { class: "grid" });
-        ready.forEach((t) => {
-          const card = el("div", { class: "doc-card" }, [
+        // Search, filter by document type, and a "Recently used" row, so a
+        // long library doesn't turn into one wall of identical cards.
+        const types = [...new Set(ready.map((t) => t.document_type))].sort();
+        let query = "";
+        let typeFilter = "All";
+        const searchInput = el("input", { type: "search", class: "draft-search", placeholder: "Search master documents", "aria-label": "Search master documents" });
+        const pillRow = el("div", { class: "pill-row", role: "group", "aria-label": "Filter by document type" });
+        const results = el("div", {});
+
+        function draftCard(t) {
+          const labels = t.field_labels || [];
+          const chips = labels.slice(0, 3).map((l) => el("span", { class: "field-chip" }, l));
+          if (t.placeholder_count > chips.length) chips.push(el("span", { class: "field-chip more" }, `+${t.placeholder_count - chips.length}`));
+          const used = t.generated_count
+            ? `Drafted ${t.generated_count} time${t.generated_count === 1 ? "" : "s"}${t.last_used_at ? " · last " + fmtShortDate(t.last_used_at) : ""}`
+            : "Not used yet";
+          return el("div", { class: "doc-card" }, [
             el("div", { class: "top-row" }, [el("div", { class: "icon" }, "☰"), el("div", { class: "type-tag" }, t.document_type)]),
             el("div", { class: "name" }, t.name),
-            el("div", { class: "meta" }, `${t.placeholder_count} field${t.placeholder_count === 1 ? "" : "s"} · ${t.generated_count} drafted so far`),
+            el("div", { class: "field-chips" }, chips),
+            el("div", { class: "meta" }, `${t.placeholder_count} field${t.placeholder_count === 1 ? "" : "s"} · ${used}`),
             el("div", { class: "actions" }, [el("button", { class: "btn small block", onclick: () => startDraft(t.id) }, "Use this template")]),
           ]);
-          grid.appendChild(card);
-        });
-        body.appendChild(grid);
+        }
+
+        function section(title, items) {
+          const grid = el("div", { class: "grid" });
+          items.forEach((t) => grid.appendChild(draftCard(t)));
+          return el("div", { class: "draft-section" }, [el("div", { class: "draft-section-title" }, title), grid]);
+        }
+
+        function renderPills() {
+          pillRow.innerHTML = "";
+          ["All", ...types].forEach((ty) => {
+            const n = ty === "All" ? ready.length : ready.filter((t) => t.document_type === ty).length;
+            const b = el("button", { type: "button", class: "pill" + (ty === typeFilter ? " active" : ""), "aria-pressed": ty === typeFilter ? "true" : "false" }, `${ty} ${n}`);
+            b.addEventListener("click", () => { typeFilter = ty; renderPills(); renderResults(); });
+            pillRow.appendChild(b);
+          });
+        }
+
+        function renderResults() {
+          results.innerHTML = "";
+          const q = query.trim().toLowerCase();
+          const matches = ready.filter((t) =>
+            (typeFilter === "All" || t.document_type === typeFilter) &&
+            (!q || t.name.toLowerCase().includes(q) || t.document_type.toLowerCase().includes(q) || (t.field_labels || []).some((l) => l.toLowerCase().includes(q)))
+          );
+          if (!matches.length) {
+            results.appendChild(el("div", { class: "empty-state" }, "No master documents match that. Try a different search or filter."));
+            return;
+          }
+          // Only when browsing everything: surface what you used lately.
+          let rest = matches;
+          let restTitle = q || typeFilter !== "All" ? `${matches.length} result${matches.length === 1 ? "" : "s"}` : "All master documents";
+          if (!q && typeFilter === "All") {
+            const recent = [...ready].filter((t) => t.last_used_at).sort((a, b) => b.last_used_at.localeCompare(a.last_used_at)).slice(0, 3);
+            if (recent.length && ready.length > 3) {
+              results.appendChild(section("Recently used", recent));
+              const recentIds = new Set(recent.map((t) => t.id));
+              rest = matches.filter((t) => !recentIds.has(t.id));
+              restTitle = "More master documents";
+            }
+          }
+          if (rest.length) results.appendChild(section(restTitle, rest));
+        }
+
+        searchInput.addEventListener("input", () => { query = searchInput.value; renderResults(); });
+        body.appendChild(el("div", { class: "draft-toolbar" }, [searchInput, types.length > 1 ? pillRow : null]));
+        body.appendChild(results);
+        renderPills();
+        renderResults();
 
         if (preselectId && ready.some((t) => t.id === preselectId)) {
           startDraft(preselectId);
@@ -2707,6 +2768,9 @@ function MastersView() {
           if (t.status === "ready") {
             actions.push(el("button", { class: "btn small", onclick: () => (location.hash = `#/draft/${t.id}`) }, "Draft"));
           }
+          const dupBtn = el("button", { class: "btn secondary small", title: "Make a copy, fields included" }, "Duplicate");
+          dupBtn.addEventListener("click", () => duplicateTemplate(t.id, dupBtn));
+          actions.push(dupBtn);
           const deleteBtn = el("button", { class: "btn danger small" }, "Delete");
           deleteBtn.addEventListener("click", () => deleteTemplate(t.id, deleteBtn));
           actions.push(deleteBtn);
@@ -2734,6 +2798,19 @@ function MastersView() {
       });
   }
   load();
+
+  async function duplicateTemplate(id, btn) {
+    btn.disabled = true;
+    btn.textContent = "Duplicating...";
+    try {
+      await api(`/api/templates/${id}/duplicate`, { method: "POST" });
+      load();
+    } catch (e) {
+      alert(e.message);
+      btn.disabled = false;
+      btn.textContent = "Duplicate";
+    }
+  }
 
   async function deleteTemplate(id, btn) {
     if (!confirm("Delete this master document? Fields and any editing progress will be lost. Documents already drafted from it are kept in your library.")) return;
