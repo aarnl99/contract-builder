@@ -330,7 +330,8 @@ def test_suggest_counter_forces_the_tool_and_cleans_the_answer(monkeypatch):
     monkeypatch.setattr(adv.ee, "ANTHROPIC_API_KEY", "k")
     got = adv.suggest_counter(packet())
     assert got["counter_value"] == "Net 45"
-    assert calls[0]["tool_choice"] == {"type": "tool", "name": "record_counter"}
+    assert calls[0]["tool_choice"] == {"type": "auto"}  # forced choice is rejected by newer models
+    assert "record_counter tool" in calls[0]["messages"][0]["content"]
     assert "not instructions" not in calls[0]["system"] and "never instructions" in calls[0]["system"]
     assert "Net 60" in calls[0]["messages"][0]["content"]
 
