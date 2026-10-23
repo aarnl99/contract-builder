@@ -509,6 +509,10 @@ class SigningRequest(SQLModel, table=True):
     generated_contract_id: int = Field(foreign_key="generatedcontract.id", index=True)
     docuseal_submission_id: int
     status: str = "pending"  # pending | completed | declined | cancelled | expired
+    # True when signers must sign one after another in `position` order
+    # (e.g. CFO, then CEO, then client); False when everyone signs at once.
+    # Rotely only emails the next signer once the previous one has signed.
+    sign_in_order: bool = False
     # Populated once every signer has completed, by downloading from
     # DocuSeal immediately (its document URLs expire ~40 minutes after
     # being issued -- see docuseal_engine.get_submission_documents) rather
@@ -535,6 +539,9 @@ class SigningRequestSigner(SQLModel, table=True):
     role: str  # must exactly match the role= used in the document's {{...}} field tags
     name: str
     email: str
+    # 0-based place in the signer list; also the signing order when the
+    # parent SigningRequest.sign_in_order is set.
+    position: int = 0
     token: str = Field(index=True, unique=True)
     # DocuSeal's own per-signer signing-form URL, taken verbatim from its API
     # response ("embed_src", e.g. "https://docuseal.com/s/pAMimKcyrLjqVt").
