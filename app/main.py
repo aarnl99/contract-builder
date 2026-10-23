@@ -10,7 +10,7 @@ import threading
 import time
 import httpx
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
@@ -32,6 +32,10 @@ from . import docx_engine as de
 from . import redline_engine as rl
 from . import email_engine as ee
 from . import docuseal_engine as ds
+from . import renewals as rn
+from . import advisor as adv
+from . import ai_usage
+from . import draftfrom as dfm
 from . import rate_limit as ratelimit
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -678,6 +682,7 @@ def _notification_settings_payload(user: User) -> dict:
         "redline_comment": user.notify_redline_comment,
         "signature_events": user.notify_signature_events,
         "auto_remind_signers": user.auto_remind_signers,
+        "renewal_emails": user.renewal_emails,
     }
 
 
@@ -691,6 +696,7 @@ class NotificationSettingsBody(BaseModel):
     redline_comment: Optional[bool] = None
     signature_events: Optional[bool] = None
     auto_remind_signers: Optional[bool] = None
+    renewal_emails: Optional[bool] = None
 
 
 @app.patch("/api/account/notification-settings")
@@ -715,6 +721,8 @@ def set_notification_settings(
         user.notify_signature_events = body.signature_events
     if body.auto_remind_signers is not None:
         user.auto_remind_signers = body.auto_remind_signers
+    if body.renewal_emails is not None:
+        user.renewal_emails = body.renewal_emails
     session.add(user)
     session.commit()
     return _notification_settings_payload(user)
@@ -1386,6 +1394,66 @@ def duplicate_template(template_id: int, user: User = Depends(get_current_user),
     return {"id": copy.id, "name": copy.name}
 
 
+class DraftFromTextBody(BaseModel):
+    text: str
+
+
+@app.post("/api/draft-from-text")
+def draft_from_text(body: DraftFromTextBody, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Proposes a master document and field values from pasted email/notes.
+    Creates nothing: the browser opens the proposal in the normal fill-in
+    form for the owner to review. Counts against the account's monthly AI
+    allowance (shared with the redline advisor); a failed call is refunded."""
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Paste an email or some notes first.")
+    if len(text) > dfm.MAX_TEXT_CHARS:
+        raise HTTPException(400, f"That's a lot of text. Please keep it under {dfm.MAX_TEXT_CHARS:,} characters.")
+    if not ee.ANTHROPIC_API_KEY:
+        raise HTTPException(503, "AI suggestions aren't switched on for this site yet.")
+    tpls = [
+        t for t in session.exec(select(Template).where(Template.owner_id == user.id).order_by(Template.created_at.desc())).all()
+        if t.placeholders
+    ][: dfm.MAX_TEMPLATES]
+    if not tpls:
+        raise HTTPException(400, "Create a master document first, then Rotely can draft from it.")
+    offered = {}
+    catalog = []
+    for t in tpls:
+        phs = [
+            {
+                "field_key": p.field_key, "label": p.label, "field_type": p.field_type, "required": p.required,
+                "preset_options": json.loads(p.preset_options_json or "[]"),
+            }
+            for p in t.placeholders
+        ]
+        offered[t.id] = {"placeholders": phs[: dfm.MAX_FIELDS], "name": t.name}
+        catalog.append(dfm.catalog_entry(t.id, t.name, t.document_type, phs))
+    if not ai_usage.reserve(session, user.id):
+        raise HTTPException(429, dfm.LIMIT_MESSAGE.format(limit=ai_usage.MONTHLY_LIMIT))
+    try:
+        raw = dfm.propose_draft(text, catalog)
+    except Exception:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't read that just now. Please try again in a minute.")
+    if not raw:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't read that just now. Please try again in a minute.")
+    result = dfm.clean_proposal(raw, offered)
+    tid = result["template_id"]
+    return {
+        "template_id": tid,
+        "template_name": offered[tid]["name"] if tid else None,
+        "values": result["values"],
+        "other_party": result["other_party"],
+        "notes": result["notes"],
+        "filled": len(result["values"]),
+        "total": len(offered[tid]["placeholders"]) if tid else 0,
+        "usage": ai_usage.status(session, user.id),
+        "disclaimer": "AI suggestion. Check every field before you generate.",
+    }
+
+
 class GenerateBody(BaseModel):
     values: dict[str, str]
     parties: list[str] = []  # who this contract is between, e.g. ["Rotely AI", "Swift Enterprises"]
@@ -1738,6 +1806,8 @@ def list_generated(
             # Where the latest signature request stands ("Waiting on Morgan
             # \u00b7 4 days"), or null when nothing is out for signature.
             "signature": signature_by_doc.get(g.id),
+            "end_date": g.end_date.isoformat() if g.end_date else None,
+            "has_end_date_suggestion": bool(g.end_date_suggestion_json) and g.end_date is None,
         }
         for g in rows
     ]
@@ -2950,10 +3020,11 @@ def _start_reminder_thread() -> None:
     def loop():
         while True:
             time.sleep(REMINDER_CHECK_SECONDS)
-            try:
-                _send_due_reminders()
-            except Exception:
-                pass  # never let one bad pass kill the loop
+            for job in (_send_due_reminders, _send_due_renewal_emails):
+                try:
+                    job()
+                except Exception:
+                    pass  # never let one bad pass kill the loop
 
     threading.Thread(target=loop, daemon=True, name="signature-reminders").start()
 
@@ -3751,6 +3822,225 @@ def cancel_signature_request(
     return {"ok": True}
 
 
+# ---- contract end dates and renewals --------------------------------------
+# See app/renewals.py. The owner confirms (or edits) an end date; Claude can
+# suggest one from the document text, but a suggestion never counts until the
+# owner confirms it.
+
+class RenewalBody(BaseModel):
+    end_date: Optional[str] = None  # YYYY-MM-DD, or blank to clear
+    auto_renews: bool = False
+    renewal_terms: str = ""
+
+
+def _renewal_payload(gc: GeneratedContract, today: Optional[date] = None) -> dict:
+    today = today or date.today()
+    return {
+        "end_date": gc.end_date.isoformat() if gc.end_date else None,
+        "days_left": rn.days_left(gc.end_date, today) if gc.end_date else None,
+        "auto_renews": bool(gc.auto_renews),
+        "renewal_terms": gc.renewal_terms or "",
+        "suggestion": rn.suggestion_from_json(gc.end_date_suggestion_json),
+        "ai_available": bool(ee.ANTHROPIC_API_KEY),
+    }
+
+
+@app.get("/api/generated/{generated_id}/renewal")
+def get_renewal(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    gc = _get_owned_generated(session, user, generated_id)
+    return _renewal_payload(gc)
+
+
+@app.put("/api/generated/{generated_id}/renewal")
+def set_renewal(
+    generated_id: int,
+    body: RenewalBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Confirms the contract's end date (and renewal terms). Any pending AI
+    suggestion is cleared, since the owner has now answered it."""
+    gc = _get_owned_generated(session, user, generated_id)
+    raw = (body.end_date or "").strip()
+    end = rn.parse_iso_date(raw) if raw else None
+    if raw and not end:
+        raise HTTPException(400, "That isn't a valid date. Use the date picker or YYYY-MM-DD.")
+    if end and (end.year < 2000 or end > date.today() + timedelta(days=365 * 60)):
+        raise HTTPException(400, "That end date looks wrong. Check the year.")
+    if end != gc.end_date:
+        # A new date restarts the 30/7-day email schedule.
+        gc.renewal_30_sent_at = None
+        gc.renewal_7_sent_at = None
+    gc.end_date = end
+    gc.auto_renews = bool(body.auto_renews)
+    gc.renewal_terms = (body.renewal_terms or "").strip()[: rn.MAX_NOTE_CHARS]
+    gc.end_date_suggestion_json = ""
+    session.add(gc)
+    session.commit()
+    return _renewal_payload(gc)
+
+
+@app.post("/api/generated/{generated_id}/renewal/suggest")
+def suggest_renewal(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Asks Claude to read the document and suggest an end date and renewal
+    terms. Stored as a suggestion for the owner to confirm, edit or dismiss."""
+    gc = _get_owned_generated(session, user, generated_id)
+    if not gc.file_path or not os.path.exists(gc.file_path):
+        raise HTTPException(404, "This document's file is missing on disk.")
+    key = f"renewal-suggest:{user.id}"
+    wait = ratelimit.retry_after(key, 10, 3600)
+    if wait:
+        raise HTTPException(429, "That's a lot of suggestions in a short time. Try again in a bit.")
+    try:
+        suggestion = rn.suggest_term(rn.document_text(gc.file_path))
+    except RuntimeError:
+        raise HTTPException(503, "AI suggestions aren't set up on this server yet.")
+    except Exception:
+        raise HTTPException(502, "Couldn't read the document just now. Try again in a moment.")
+    ratelimit.record(key, 3600)
+    gc.end_date_suggestion_json = json.dumps(suggestion) if suggestion else ""
+    session.add(gc)
+    session.commit()
+    return {"found": suggestion is not None, **_renewal_payload(gc)}
+
+
+@app.post("/api/generated/{generated_id}/renewal/dismiss")
+def dismiss_renewal_suggestion(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    gc = _get_owned_generated(session, user, generated_id)
+    gc.end_date_suggestion_json = ""
+    session.add(gc)
+    session.commit()
+    return _renewal_payload(gc)
+
+
+@app.get("/api/renewals")
+def list_renewals(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Feeds the "Renewing soon" strip: confirmed end dates from two weeks ago
+    to three months out, soonest first, plus documents whose suggested end
+    date is still waiting for the owner to confirm."""
+    today = date.today()
+    lo = today - timedelta(days=rn.RECENTLY_ENDED_DAYS)
+    hi = today + timedelta(days=rn.RENEWAL_WINDOW_DAYS)
+    rows = session.exec(
+        select(GeneratedContract)
+        .where(
+            GeneratedContract.owner_id == user.id,
+            GeneratedContract.archived == False,  # noqa: E712
+            GeneratedContract.end_date != None,  # noqa: E711
+            GeneratedContract.end_date >= lo,
+            GeneratedContract.end_date <= hi,
+        )
+        .order_by(GeneratedContract.end_date, GeneratedContract.id)
+    ).all()
+    to_confirm = session.exec(
+        select(GeneratedContract)
+        .where(
+            GeneratedContract.owner_id == user.id,
+            GeneratedContract.archived == False,  # noqa: E712
+            GeneratedContract.end_date == None,  # noqa: E711
+            GeneratedContract.end_date_suggestion_json != "",
+        )
+        .order_by(GeneratedContract.created_at.desc())
+        .limit(10)
+    ).all()
+    return {
+        "renewing": [
+            {
+                "id": g.id,
+                "name": g.name,
+                "end_date": g.end_date.isoformat(),
+                "days_left": rn.days_left(g.end_date, today),
+                "auto_renews": bool(g.auto_renews),
+                "renewal_terms": g.renewal_terms or "",
+            }
+            for g in rows
+        ],
+        "to_confirm": [{"id": g.id, "name": g.name} for g in to_confirm],
+    }
+
+
+def _send_renewal_email(user: User, gc: GeneratedContract, days: int) -> bool:
+    when = "today" if days <= 0 else ("tomorrow" if days == 1 else f"in {days} days")
+    lines = [f'"{gc.name}" ends {when} ({gc.end_date.strftime("%B %d, %Y").replace(" 0", " ")}).']
+    if gc.auto_renews:
+        lines.append("It is set to renew automatically, so check the notice terms if you want to change or end it.")
+    if gc.renewal_terms:
+        lines.append(f"Renewal terms you noted: {gc.renewal_terms}")
+    lines.append(f"Open your documents: {_canonical_base_url()}/#/documents")
+    body = f"Hi,\n\n" + "\n\n".join(lines) + "\n\n- Rotely"
+    try:
+        ee.send_email(user.email, f'Contract ending {when}: "{gc.name}"', body)
+        return True
+    except RuntimeError:
+        return False
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        return False
+
+
+def _send_due_renewal_emails(today: Optional[date] = None) -> int:
+    """One pass of the renewal email job: 30 days and 7 days before a
+    confirmed end date, once each, to the document owner only."""
+    today = today or date.today()
+    sent = 0
+    with Session(engine) as session:
+        rows = session.exec(
+            select(GeneratedContract).where(
+                GeneratedContract.archived == False,  # noqa: E712
+                GeneratedContract.end_date != None,  # noqa: E711
+                GeneratedContract.end_date >= today,
+                GeneratedContract.end_date <= today + timedelta(days=max(rn.EMAIL_DAYS)),
+            )
+        ).all()
+        for gc in rows:
+            owner = session.get(User, gc.owner_id)
+            if not owner or not owner.renewal_emails or getattr(owner, "is_suspended", False):
+                continue
+            stage = rn.email_stage(gc.end_date, today, bool(gc.renewal_30_sent_at), bool(gc.renewal_7_sent_at))
+            if not stage:
+                continue
+            if _send_renewal_email(owner, gc, rn.days_left(gc.end_date, today)):
+                now = datetime.utcnow()
+                if stage == 7:
+                    gc.renewal_7_sent_at = now
+                    gc.renewal_30_sent_at = gc.renewal_30_sent_at or now
+                else:
+                    gc.renewal_30_sent_at = now
+                session.add(gc)
+                session.commit()
+                sent += 1
+    return sent
+
+
+def _run_renewal_suggestion(gc_id: int) -> bool:
+    """Reads a freshly signed document and stores an end-date suggestion for
+    the owner to confirm. Best effort: no key, no file, nothing found or any
+    error just means no suggestion. Never overwrites a confirmed date."""
+    if not ee.ANTHROPIC_API_KEY:
+        return False
+    with Session(engine) as session:
+        gc = session.get(GeneratedContract, gc_id)
+        if not gc or gc.end_date or gc.end_date_suggestion_json or not gc.file_path or not os.path.exists(gc.file_path):
+            return False
+        try:
+            suggestion = rn.suggest_term(rn.document_text(gc.file_path))
+        except Exception:
+            return False
+        if not suggestion:
+            return False
+        gc.end_date_suggestion_json = json.dumps(suggestion)
+        session.add(gc)
+        session.commit()
+        return True
+
+
+def _kick_renewal_suggestion(gc_id: int) -> None:
+    """Runs the suggestion in the background so the DocuSeal webhook that
+    triggered it isn't held up by an AI call."""
+    if os.environ.get("DISABLE_BACKGROUND_JOBS") == "1":
+        return
+    threading.Thread(target=_run_renewal_suggestion, args=(gc_id,), daemon=True, name="renewal-suggestion").start()
+
+
 class RemindBody(BaseModel):
     # Which signer to remind (their 0-based position). Omit to remind
     # everyone who can sign right now.
@@ -4104,6 +4394,7 @@ def _apply_submission_completed(session: Session, submission_id) -> None:
                     body="Everyone has signed. The signed document is in your documents library.",
                     generated_contract_id=gc.id,
                 )
+            _kick_renewal_suggestion(gc.id)
 
 
 def _apply_submission_expired(session: Session, submission_id) -> None:
@@ -4851,6 +5142,196 @@ def _require_share_session(request: Request, token: str, session: Session) -> Sh
     return link
 
 
+# ---- client branding (logo + name on the review and signing pages) --------
+
+MAX_LOGO_BYTES = 1024 * 1024  # 1 MB
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _logo_kind(data: bytes) -> Optional[tuple]:
+    """(extension, mime) from the file's own first bytes, never from the
+    name the browser claims. Only PNG and JPEG are accepted: no SVG, since
+    an SVG can carry scripts."""
+    if data.startswith(_PNG_MAGIC):
+        return "png", "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg", "image/jpeg"
+    return None
+
+
+def _logo_abs_path(user: User) -> Optional[str]:
+    if not user or not user.logo_file:
+        return None
+    path = os.path.join(UPLOADS_DIR, user.logo_file)
+    return path if os.path.isfile(path) else None
+
+
+def _brand_display_name(user: Optional[User]) -> str:
+    if not user:
+        return ""
+    return user.name.strip() or user.email
+
+
+def _brand_payload(user: Optional[User], logo_url: str) -> dict:
+    path = _logo_abs_path(user) if user else None
+    version = int(os.path.getmtime(path)) if path else 0
+    return {
+        "name": _brand_display_name(user),
+        "has_logo": bool(path),
+        "logo_url": f"{logo_url}?v={version}" if path else None,
+    }
+
+
+def _logo_response(user: Optional[User]):
+    path = _logo_abs_path(user) if user else None
+    if not path:
+        raise HTTPException(404, "No logo.")
+    return FileResponse(path, media_type=user.logo_mime or "image/png", headers={"Cache-Control": "private, max-age=300"})
+
+
+@app.get("/api/account/branding")
+def get_branding(user: User = Depends(get_current_user)):
+    return {**_brand_payload(user, "/api/account/logo"), "max_bytes": MAX_LOGO_BYTES}
+
+
+@app.get("/api/account/logo")
+def get_own_logo(user: User = Depends(get_current_user)):
+    return _logo_response(user)
+
+
+@app.post("/api/account/logo")
+async def upload_logo(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    data = await file.read(MAX_LOGO_BYTES + 1)
+    if not data:
+        raise HTTPException(400, "That file is empty.")
+    if len(data) > MAX_LOGO_BYTES:
+        raise HTTPException(400, "That logo is over 1 MB. Please use a smaller PNG or JPG.")
+    kind = _logo_kind(data)
+    if not kind:
+        raise HTTPException(400, "Please upload a PNG or JPG image.")
+    ext, mime = kind
+    rel_dir = os.path.join(str(user.id), "branding")
+    abs_dir = os.path.join(UPLOADS_DIR, rel_dir)
+    os.makedirs(abs_dir, exist_ok=True)
+    for old in os.listdir(abs_dir):
+        if old.startswith("logo."):
+            os.remove(os.path.join(abs_dir, old))
+    with open(os.path.join(abs_dir, f"logo.{ext}"), "wb") as f:
+        f.write(data)
+    user.logo_file = os.path.join(rel_dir, f"logo.{ext}")
+    user.logo_mime = mime
+    session.add(user)
+    session.commit()
+    return {**_brand_payload(user, "/api/account/logo"), "max_bytes": MAX_LOGO_BYTES}
+
+
+@app.delete("/api/account/logo")
+def delete_logo(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    path = _logo_abs_path(user)
+    if path:
+        os.remove(path)
+    user.logo_file = ""
+    user.logo_mime = ""
+    session.add(user)
+    session.commit()
+    return {**_brand_payload(user, "/api/account/logo"), "max_bytes": MAX_LOGO_BYTES}
+
+
+def _share_owner(session: Session, token: str) -> Optional[User]:
+    link = _get_share_link_or_404(session, token)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    return session.get(User, gc.owner_id) if gc else None
+
+
+@app.get("/api/share/{token}/brand")
+def get_share_brand(token: str, session: Session = Depends(get_session)):
+    """Public: who the review page should say it's from. Only a name and an
+    image, nothing about the document, so it works before the access code."""
+    return _brand_payload(_share_owner(session, token), f"/api/share/{token}/logo")
+
+
+@app.get("/api/share/{token}/logo")
+def get_share_logo(token: str, session: Session = Depends(get_session)):
+    return _logo_response(_share_owner(session, token))
+
+
+def _sign_owner(session: Session, token: str) -> Optional[User]:
+    signer = _get_signer_or_404(session, token)
+    sr = session.get(SigningRequest, signer.signing_request_id)
+    gc = session.get(GeneratedContract, sr.generated_contract_id) if sr else None
+    return session.get(User, gc.owner_id) if gc else None
+
+
+@app.get("/api/sign/{token}/brand")
+def get_sign_brand(token: str, session: Session = Depends(get_session)):
+    return _brand_payload(_sign_owner(session, token), f"/api/sign/{token}/logo")
+
+
+@app.get("/api/sign/{token}/logo")
+def get_sign_logo(token: str, session: Session = Depends(get_session)):
+    return _logo_response(_sign_owner(session, token))
+
+
+def _client_signing_state(session: Session, link: ShareLink, gc: GeneratedContract) -> dict:
+    """What the client's one link should offer about signing, so they never
+    need a second email to find the signing page.
+
+    Only shows a way to sign once the deal is agreed: the owner has sent a
+    signature request AND nothing is still being negotiated (no countered
+    redline waiting on the client, no client round waiting on the owner).
+    The signing page itself is the existing /sign/{token} page, so every
+    protection there (consent, photo, turn order) still applies, and the
+    emailed signing links keep working exactly as before."""
+    none = {"state": "none"}
+    email = (link.client_email or "").strip().lower()
+    if not email:
+        return none
+    family = _lineage_doc_ids(gc, session)
+    sr = session.exec(
+        select(SigningRequest)
+        .where(SigningRequest.generated_contract_id.in_(family), SigningRequest.status.in_(["pending", "completed"]))
+        .order_by(SigningRequest.created_at.desc())
+    ).first()
+    if not sr:
+        return none
+    signers = session.exec(
+        select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
+    ).all()
+    mine = next((s for s in sorted(signers, key=lambda s: (s.position, s.id or 0)) if (s.email or "").strip().lower() == email), None)
+    if not mine:
+        return none
+    if mine.status == "completed":
+        if sr.status == "completed":
+            return {"state": "all_signed"}
+        waiting = [s.name for s in signers if s.status != "completed"]
+        return {"state": "signed", "waiting_on": waiting}
+    if mine.status == "declined":
+        return none
+    if sr.status != "pending":
+        return none
+    if _unresolved_counts(session, [gc.id], owner_id=gc.owner_id).get(gc.id, 0) > 0:
+        return {"state": "negotiating"}
+    link_ids = [l.id for l in session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(family))).all()]
+    waiting_on_owner = session.exec(
+        select(RedlineSubmission).where(
+            RedlineSubmission.share_link_id.in_(link_ids),
+            RedlineSubmission.origin == "client",
+            RedlineSubmission.status == "pending",
+            RedlineSubmission.responded_at == None,  # noqa: E711
+        )
+    ).first()
+    if waiting_on_owner:
+        return {"state": "negotiating"}
+    your_turn, ahead = _signer_turn_info(session, sr, mine)
+    if not your_turn:
+        return {"state": "waiting_turn", "waiting_on": ahead}
+    return {"state": "ready", "sign_url": f"/sign/{mine.token}", "role": mine.role}
+
+
 @app.get("/api/share/{token}")
 def get_share_document(token: str, request: Request, session: Session = Depends(get_session)):
     link = _require_share_session(request, token, session)
@@ -5004,6 +5485,7 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
         "draft": draft_payload,
         "response": response_payload,
         "owner_updated_since_last_view": owner_updated_since_last_view,
+        "signing": _client_signing_state(session, link, gc),
     }
 
 
@@ -5490,6 +5972,92 @@ def _get_client_edit(session: Session, link: ShareLink, edit_id: int) -> Redline
     if not edit or not submission or submission.share_link_id != link.id:
         raise HTTPException(404, "That redline no longer exists.")
     return edit
+
+
+@app.get("/api/ai-usage")
+def get_ai_usage(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """This month's AI suggestion allowance for the signed-in account."""
+    return ai_usage.status(session, user.id)
+
+
+def _negotiation_history(session: Session, gc: GeneratedContract, edit: RedlineEdit) -> list:
+    """Every earlier redline on the same term (same field, or same label for
+    free-text edits) anywhere in this document's lineage, oldest first."""
+    link_ids = [
+        l.id for l in session.exec(
+            select(ShareLink).where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)))
+        ).all()
+    ]
+    if not link_ids:
+        return []
+    subs = {
+        s.id: s for s in session.exec(
+            select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(link_ids), RedlineSubmission.status != "draft")
+        ).all()
+    }
+    if not subs:
+        return []
+    rows = session.exec(
+        select(RedlineEdit).where(RedlineEdit.submission_id.in_(list(subs)), RedlineEdit.id < edit.id).order_by(RedlineEdit.id)
+    ).all()
+    out = []
+    for e in rows:
+        same = (edit.field_key and e.field_key == edit.field_key) or (not edit.field_key and e.label == edit.label)
+        if not same:
+            continue
+        origin = subs[e.submission_id].origin
+        out.append({
+            "proposed_value": e.proposed_value, "decision": e.decision, "counter_value": e.counter_value,
+            "from_owner": origin in ("owner_edit", "owner_reconsideration"),
+        })
+    return out
+
+
+@app.post("/api/redline-edits/{edit_id}/suggest-counter")
+def suggest_redline_counter(edit_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """AI suggestion for how to counter one redline. Facts are worked out in
+    code (advisor.build_packet); the model only proposes a value and a short
+    reason. Nothing is sent or saved on the redline: the owner edits the
+    suggestion and decides. Counts against the account's monthly allowance
+    (ai_usage), returned in `usage`; a failed model call is refunded."""
+    edit = _get_owned_edit(session, user, edit_id)
+    submission = session.get(RedlineSubmission, edit.submission_id)
+    if submission.origin == "owner_edit":
+        raise HTTPException(400, "That change is your own proposal, so there's nothing to counter.")
+    if not ee.ANTHROPIC_API_KEY:
+        raise HTTPException(503, "AI suggestions aren't switched on for this site yet.")
+    link = session.get(ShareLink, submission.share_link_id)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    ph = next((p for p in tpl.placeholders if p.field_key == edit.field_key), None) if tpl and edit.field_key else None
+    threshold_desc = rl.describe_threshold(ph.threshold_type, ph.threshold_config) if ph else None
+    inside = None
+    if ph and ph.threshold_type in ("numeric_range", "approved_list"):
+        inside = edit.evaluation == "auto_approved"
+    comments = session.exec(select(RedlineComment).where(RedlineComment.edit_id == edit.id).order_by(RedlineComment.created_at)).all()
+    packet = adv.build_packet(
+        document_name=gc.name, document_type=gc.document_type, label=edit.label,
+        original=edit.original_value, proposed=edit.proposed_value, client_comment=edit.comment,
+        threshold_desc=threshold_desc, inside_threshold=inside,
+        history=_negotiation_history(session, gc, edit),
+        thread=[_comment_payload(c) for c in comments],
+    )
+    if not ai_usage.reserve(session, user.id):
+        raise HTTPException(429, ai_usage.LIMIT_MESSAGE.format(limit=ai_usage.MONTHLY_LIMIT))
+    try:
+        result = adv.suggest_counter(packet)
+    except Exception:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't come up with a suggestion just now. Please try again in a minute.")
+    if not result:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't come up with a suggestion just now. Please try again in a minute.")
+    return {
+        "suggestion": result,
+        "facts": packet["arithmetic"],
+        "usage": ai_usage.status(session, user.id),
+        "disclaimer": "AI suggestion, not legal advice.",
+    }
 
 
 class ReconsiderBody(BaseModel):

@@ -299,6 +299,7 @@ function toggleAvatarMenu() {
     { key: "redline_comment", label: "Client comments on a redline" },
     { key: "signature_events", label: "Someone signs (or finishes signing) a document" },
     { key: "auto_remind_signers", label: "Remind signers who haven't signed yet (day 3, 6, 9)" },
+    { key: "renewal_emails", label: "Email me 30 and 7 days before a contract ends" },
   ];
   const notifList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:2px;" }, [
     el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."),
@@ -342,6 +343,54 @@ function toggleAvatarMenu() {
       });
   }
   loadNotifSettings();
+
+  // ---- logo shown to clients on review and signing pages. PNG or JPG up
+  // to 1 MB; without one, clients see your name instead. ----
+  const logoRow = el("div", { class: "plan-row" });
+  logoRow.appendChild(el("div", { class: "label" }, "Your logo"));
+  const logoBody = el("div", { class: "logo-row" });
+  logoRow.appendChild(logoBody);
+  const logoHint = el("div", { style: "font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.4;" }, "Shown to clients on review and signing pages. PNG or JPG, up to 1 MB. Without one, they see your name.");
+  logoRow.appendChild(logoHint);
+  const logoFile = el("input", { type: "file", accept: "image/png,image/jpeg", style: "display:none;" });
+  logoRow.appendChild(logoFile);
+  dd.appendChild(logoRow);
+
+  function paintLogo(b) {
+    logoBody.innerHTML = "";
+    const preview = el("div", { class: "logo-preview" });
+    if (b.has_logo) preview.appendChild(el("img", { src: b.logo_url, alt: "Your logo" }));
+    else preview.textContent = "No logo";
+    const upload = el("button", { class: "btn secondary small", onclick: () => logoFile.click() }, b.has_logo ? "Replace" : "Upload logo");
+    const actions = el("div", { class: "logo-actions" }, [upload]);
+    if (b.has_logo) {
+      actions.appendChild(el("button", {
+        class: "btn secondary small",
+        onclick: async () => {
+          try { paintLogo(await api("/api/account/logo", { method: "DELETE" })); } catch (e) { alert(e.message); }
+        },
+      }, "Remove"));
+    }
+    logoBody.appendChild(preview);
+    logoBody.appendChild(actions);
+  }
+  logoFile.addEventListener("change", async () => {
+    const f = logoFile.files && logoFile.files[0];
+    logoFile.value = "";
+    if (!f) return;
+    if (f.size > 1024 * 1024) { alert("That logo is over 1 MB. Please use a smaller PNG or JPG."); return; }
+    const form = new FormData();
+    form.append("file", f);
+    try {
+      const res = await fetch("/api/account/logo", { method: "POST", body: form, credentials: "same-origin" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "Couldn't upload that logo. Please try again.");
+      paintLogo(data);
+    } catch (e) { alert(e.message); }
+  });
+  api("/api/account/branding").then(paintLogo).catch(() => {
+    logoBody.appendChild(el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Couldn't load your logo settings."));
+  });
 
   const logoutRow = el("div", { class: "logout-row" }, [el("button", { onclick: doLogout }, "Log out")]);
   dd.appendChild(logoutRow);
@@ -2312,9 +2361,50 @@ async function openRedlinesModal(generatedId) {
             rejectBtn.addEventListener("click", () => setStage("rejected"));
             counterBtn.addEventListener("click", () => setStage("countered"));
             acceptBtn.addEventListener("click", () => setStage("accepted"));
-            actions = el("div", { class: "decision-row" }, [
-              el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn]),
-              counterInput,
+            // AI counter advisor: facts are computed server-side and the
+            // model only proposes a value plus a short reason. The result is
+            // an editable draft; nothing is sent until "Send response".
+            const adviceBox = el("div", { class: "advisor-box", style: "display:none;" });
+            const adviceBtn = el("button", { class: "btn secondary small advisor-btn" }, "Suggest a counter");
+            adviceBtn.addEventListener("click", async () => {
+              adviceBtn.disabled = true;
+              adviceBtn.textContent = "Thinking...";
+              adviceBox.style.display = "none";
+              try {
+                const res = await api(`/api/redline-edits/${edit.id}/suggest-counter`, { method: "POST" });
+                const sug = res.suggestion;
+                const input = el("input", { type: "text", value: sug.counter_value, "aria-label": "Suggested counter" });
+                const useBtn = el("button", { class: "btn small" }, "Use as my counter");
+                useBtn.addEventListener("click", () => {
+                  if (stage.decision !== "countered") setStage("countered");
+                  counterInput.value = input.value;
+                  stage.counter_value = input.value;
+                  counterInput.focus();
+                });
+                adviceBox.innerHTML = "";
+                adviceBox.appendChild(el("div", { class: "advisor-tag" }, "AI suggestion, not legal advice"));
+                adviceBox.appendChild(input);
+                if (sug.reasoning) adviceBox.appendChild(el("div", { class: "advisor-why" }, sug.reasoning));
+                adviceBox.appendChild(el("div", { class: "advisor-foot" }, [
+                  useBtn,
+                  el("span", { class: "advisor-left" }, `${res.usage.remaining} of ${res.usage.limit} AI suggestions left this month`),
+                ]));
+                adviceBox.style.display = "";
+              } catch (e) {
+                adviceBox.innerHTML = "";
+                adviceBox.appendChild(el("div", { class: "advisor-why" }, e.message));
+                adviceBox.style.display = "";
+              }
+              adviceBtn.disabled = false;
+              adviceBtn.textContent = "Suggest a counter";
+            });
+            actions = el("div", { class: "decision-col" }, [
+              el("div", { class: "decision-row" }, [
+                el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn]),
+                counterInput,
+              ]),
+              adviceBtn,
+              adviceBox,
             ]);
           }
 
@@ -2508,6 +2598,13 @@ function openFillModal(tpl, prefill, onDone) {
     el("h2", {}, tpl.name),
     el("p", { class: "subtitle", style: "margin:2px 0 16px;" }, `${tpl.document_type} · fill in the blanks below`),
     errBox,
+    prefill && prefill.ai
+      ? el("div", { class: "advisor-box ai-banner" }, [
+          el("div", { class: "advisor-tag" }, "AI suggestion. Check every field."),
+          el("div", { class: "advisor-why" }, prefill.ai.summary),
+          prefill.ai.notes ? el("div", { class: "advisor-why" }, prefill.ai.notes) : null,
+        ])
+      : null,
     el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Party A"), partyAInput]),
     el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Party B"), partyBInput]),
     ...fieldRows,
@@ -2558,6 +2655,11 @@ function DraftView(preselectId) {
   const wrap = el("div", {});
   wrap.appendChild(el("h1", {}, "Draft a document"));
   wrap.appendChild(el("p", { class: "subtitle" }, "Pick a master document below, fill in the blanks, and get a finished .docx."));
+  wrap.appendChild(
+    el("div", { style: "margin:2px 0 16px;" }, [
+      el("button", { class: "btn secondary", onclick: () => startDraftFromText() }, "Draft from an email or notes"),
+    ])
+  );
 
   const body = el("div");
   wrap.appendChild(body);
@@ -2670,6 +2772,59 @@ function DraftView(preselectId) {
       });
   }
   loadTemplates();
+
+  // Paste an email or notes: Claude picks the master document and fills in
+  // what it can, then it opens in the normal fill-in form. Nothing is created
+  // until the owner presses Generate there.
+  function startDraftFromText() {
+    const overlay = el("div", { class: "modal-overlay" });
+    const errBox = el("div");
+    const ta = el("textarea", { rows: "10", maxlength: "12000", placeholder: "Paste the client's email or your notes here...", "aria-label": "Email or notes" });
+    const goBtn = el("button", { class: "btn" }, "Suggest a draft");
+    const modal = el("div", { class: "modal" }, [
+      el("h2", {}, "Draft from an email or notes"),
+      el("p", { class: "subtitle", style: "margin:2px 0 16px;" }, "Rotely picks the master document and fills in what the text says. You review every field before anything is created."),
+      errBox,
+      el("div", { class: "form-row" }, [ta]),
+      el("div", { style: "font-size:11.5px;color:var(--muted);line-height:1.4;" }, "AI suggestion. Each one uses 1 of your 50 monthly AI suggestions."),
+      el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), goBtn]),
+    ]);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    ta.focus();
+    goBtn.addEventListener("click", async () => {
+      if (goBtn.disabled) return;
+      errBox.innerHTML = "";
+      if (!ta.value.trim()) { errBox.appendChild(el("div", { class: "error-box" }, "Paste an email or some notes first.")); return; }
+      goBtn.disabled = true;
+      goBtn.textContent = "Reading...";
+      try {
+        const res = await api("/api/draft-from-text", { method: "POST", body: { text: ta.value } });
+        if (!res.template_id) {
+          errBox.appendChild(el("div", { class: "error-box" }, "That didn't match any of your master documents. " + (res.notes || "")));
+          goBtn.disabled = false;
+          goBtn.textContent = "Suggest a draft";
+          return;
+        }
+        const tpl = await api(`/api/templates/${res.template_id}`);
+        overlay.remove();
+        const left = `${res.usage.remaining} of ${res.usage.limit} AI suggestions left this month`;
+        openFillModal(
+          tpl,
+          {
+            values: res.values,
+            party_b: res.other_party,
+            ai: { summary: `Suggested ${res.template_name}, filled ${res.filled} of ${res.total} fields. ${left}.`, notes: res.notes },
+          },
+          (result, prefill) => showResult(tpl, result, prefill)
+        );
+      } catch (e) {
+        errBox.appendChild(el("div", { class: "error-box" }, e.message));
+        goBtn.disabled = false;
+        goBtn.textContent = "Suggest a draft";
+      }
+    });
+  }
 
   function startDraft(templateId) {
     api(`/api/templates/${templateId}`)
@@ -2899,8 +3054,50 @@ function DocumentsView() {
   );
   wrap.appendChild(toolbar);
 
+  // "Renewing soon": confirmed end dates in the next 90 days (and anything
+  // that ended in the last two weeks), plus suggested dates waiting to be
+  // confirmed. Hidden entirely when there's nothing to show.
+  const renewalWrap = el("div", {});
+  wrap.appendChild(renewalWrap);
+
   const listWrap = el("div", {});
   wrap.appendChild(listWrap);
+
+  async function loadRenewals() {
+    try {
+      const res = await api("/api/renewals");
+      renewalWrap.innerHTML = "";
+      if (!res.renewing.length && !res.to_confirm.length) return;
+      const cards = [];
+      res.renewing.forEach((r) =>
+        cards.push(
+          el("button", { class: "renew-card" + (r.days_left <= 7 ? " urgent" : ""), type: "button", title: r.name, onclick: () => openDetail({ id: r.id }) }, [
+            el("div", { class: "renew-head" }, [el("div", { class: "renew-name" }, r.name), r.auto_renews ? el("span", { class: "renew-chip" }, "Auto-renews") : null]),
+            el("div", { class: "renew-when" }, `${fmtDay(r.end_date)} · ${endsText(r.days_left)}`),
+          ])
+        )
+      );
+      res.to_confirm.forEach((r) =>
+        cards.push(
+          el("button", { class: "renew-card confirm", type: "button", onclick: () => openDetail({ id: r.id }) }, [
+            el("div", { class: "renew-name" }, r.name),
+            el("div", { class: "renew-when" }, "Suggested end date to confirm"),
+          ])
+        )
+      );
+      renewalWrap.appendChild(el("div", { class: "renew-strip" }, [el("div", { class: "renew-title" }, "Renewing soon"), el("div", { class: "renew-cards" }, cards)]));
+    } catch (e) {
+      renewalWrap.innerHTML = ""; // a nicety: the document list below still works without it
+    }
+  }
+  loadRenewals();
+
+  // "Ends Mar 1, 2027" / "Confirm end date" next to a document's name.
+  function termTagEl(d) {
+    if (d.end_date) return el("span", { class: "term-tag" + (daysUntil(d.end_date) <= 30 ? " soon" : "") }, "Ends " + fmtDay(d.end_date));
+    if (d.has_end_date_suggestion) return el("span", { class: "term-tag confirm" }, "Confirm end date");
+    return null;
+  }
 
   // Small colored pill for a document's current step (drafted, shared,
   // redlines submitted, response sent, applied) -- reuses the same
@@ -2932,7 +3129,7 @@ function DocumentsView() {
       el("div", { class: "left" }, [
         el("div", { class: "file-icon" }, "✓"),
         el("div", {}, [
-          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status), signatureTagEl(d.signature, d.id), unresolvedBadgeEl(d.unresolved_count)]),
+          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status), signatureTagEl(d.signature, d.id), termTagEl(d), unresolvedBadgeEl(d.unresolved_count)]),
           el("div", { class: "lineage" }, ["Originated from ", el("span", { class: "tag" }, d.template_name)]),
           partiesLineEl(d.parties),
         ]),
@@ -3043,6 +3240,7 @@ function DocumentsView() {
             el("span", { class: "version-count" }, `${familyDocs.length} versions`),
             statusTagEl(latest.status),
             signatureTagEl(latest.signature, latest.id),
+            termTagEl(latest),
             unresolvedBadgeEl(latest.unresolved_count),
           ]),
           el("div", { class: "folder-sub" }, ["Originated from ", el("span", { class: "tag" }, latest.template_name)]),
@@ -3252,6 +3450,7 @@ function DocumentsView() {
           el("div", { class: "txt" }, ["Originated from master document", el("br"), lineageLink]),
         ]),
         el("div", {}, valueRows.length ? el("div", {}, valueRows) : el("div", { style: "color:var(--muted);font-size:13px;" }, "No field values recorded.")),
+        renewalSectionEl(d.id, () => { loadRenewals(); load(); }),
         el("div", { class: "panel-actions" }, [
           el("a", { class: "btn", href: `/api/generated/${d.id}/download` }, "Download .docx"),
           // Close the panel before opening either modal -- .panel-overlay is
@@ -3919,6 +4118,143 @@ function fmtBytes(n) {
 
 function fmtShortDate(iso) {
   return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+// A plain calendar day ("2027-03-01") as local text. Parsed by hand because
+// new Date("2027-03-01") is UTC midnight, which shows as the day before in
+// any timezone west of UTC.
+function parseDay(iso) {
+  const [y, m, d] = String(iso).slice(0, 10).split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+function fmtDay(iso) {
+  return parseDay(iso).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+}
+function daysUntil(iso) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((parseDay(iso) - today) / 86400000);
+}
+function endsText(days) {
+  if (days < 0) return days === -1 ? "ended yesterday" : `ended ${-days} days ago`;
+  if (days === 0) return "ends today";
+  if (days === 1) return "ends tomorrow";
+  return `ends in ${days} days`;
+}
+
+// "Contract term" block in a document's detail panel: confirmed end date,
+// auto-renew flag and renewal notes, plus the AI suggestion (if any) that
+// still needs the owner to confirm, edit or dismiss it. A suggestion never
+// counts for the "Renewing soon" strip or emails until confirmed.
+function renewalSectionEl(docId, onChange) {
+  const box = el("div", { class: "term-box" }, el("div", { class: "term-title" }, "Contract term"));
+  const body = el("div", {}, el("div", { class: "term-status" }, "Loading..."));
+  box.appendChild(body);
+
+  async function save(values, btn) {
+    if (btn) { btn.disabled = true; }
+    try {
+      const res = await api(`/api/generated/${docId}/renewal`, { method: "PUT", body: values });
+      paint(res);
+      if (onChange) onChange();
+    } catch (err) {
+      if (btn) btn.disabled = false;
+      alert(err.message);
+    }
+  }
+
+  function paint(info, note) {
+    body.innerHTML = "";
+    const dateInput = el("input", { type: "date", class: "term-date", value: info.end_date || "" });
+    const autoCheck = el("input", { type: "checkbox", id: `term-auto-${docId}` });
+    autoCheck.checked = !!info.auto_renews;
+    const notes = el("input", { type: "text", class: "term-notes", maxlength: "300", placeholder: "Renewal or notice terms (optional)", value: info.renewal_terms || "" });
+
+    if (info.suggestion) {
+      const sg = info.suggestion;
+      const summary = [sg.end_date ? "Ends " + fmtDay(sg.end_date) : "No end date found", sg.auto_renews ? "renews automatically" : null].filter(Boolean).join(" · ");
+      const useBtn = sg.end_date
+        ? el("button", { class: "btn small", type: "button", onclick: (e) => save({ end_date: sg.end_date, auto_renews: !!sg.auto_renews, renewal_terms: sg.renewal_terms || "" }, e.currentTarget) }, "Use this")
+        : null;
+      body.appendChild(
+        el("div", { class: "term-suggestion" }, [
+          el("div", { class: "term-sg-label" }, "AI suggestion · check it against the contract"),
+          el("div", { class: "term-sg-main" }, summary),
+          sg.renewal_terms ? el("div", { class: "term-sg-note" }, sg.renewal_terms) : null,
+          sg.evidence ? el("div", { class: "term-sg-quote" }, `\u201c${sg.evidence}\u201d`) : null,
+          el("div", { class: "term-sg-actions" }, [
+            useBtn,
+            el("button", {
+              class: "btn secondary small", type: "button",
+              onclick: () => {
+                if (sg.end_date) dateInput.value = sg.end_date;
+                autoCheck.checked = !!sg.auto_renews;
+                notes.value = sg.renewal_terms || "";
+                dateInput.focus();
+              },
+            }, "Edit first"),
+            el("button", {
+              class: "btn secondary small", type: "button",
+              onclick: async (e) => {
+                e.currentTarget.disabled = true;
+                try { paint(await api(`/api/generated/${docId}/renewal/dismiss`, { method: "POST" })); if (onChange) onChange(); }
+                catch (err) { alert(err.message); }
+              },
+            }, "Dismiss"),
+          ]),
+        ])
+      );
+    }
+
+    if (info.end_date) {
+      const d = info.days_left;
+      body.appendChild(el("div", { class: "term-status" + (d <= 30 ? " soon" : "") }, `Ends ${fmtDay(info.end_date)} · ${endsText(d)}`));
+    } else if (!info.suggestion) {
+      body.appendChild(el("div", { class: "term-status muted" }, "No end date set. Add one and Rotely will email you before it ends."));
+    }
+    if (note) body.appendChild(el("div", { class: "term-status muted" }, note));
+
+    body.appendChild(
+      el("div", { class: "term-form" }, [
+        el("label", { class: "term-field" }, [el("span", {}, "End date"), dateInput]),
+        el("label", { class: "term-check", for: `term-auto-${docId}` }, [autoCheck, "Renews automatically"]),
+        el("label", { class: "term-field wide" }, [el("span", {}, "Notes"), notes]),
+      ])
+    );
+    const actions = [
+      el("button", {
+        class: "btn small", type: "button",
+        onclick: (e) => save({ end_date: dateInput.value || null, auto_renews: autoCheck.checked, renewal_terms: notes.value }, e.currentTarget),
+      }, "Save"),
+    ];
+    if (info.ai_available && !info.suggestion) {
+      actions.push(
+        el("button", {
+          class: "btn secondary small", type: "button",
+          onclick: async (e) => {
+            const btn = e.currentTarget;
+            btn.disabled = true;
+            btn.textContent = "Reading...";
+            try {
+              const res = await api(`/api/generated/${docId}/renewal/suggest`, { method: "POST" });
+              paint(res, res.found ? null : "Couldn't find a clear end date in this document.");
+              if (onChange) onChange();
+            } catch (err) {
+              btn.disabled = false;
+              btn.textContent = "Suggest from document";
+              alert(err.message);
+            }
+          },
+        }, "Suggest from document")
+      );
+    }
+    body.appendChild(el("div", { class: "term-actions" }, actions));
+  }
+
+  api(`/api/generated/${docId}/renewal`)
+    .then((info) => paint(info))
+    .catch((err) => { body.innerHTML = ""; body.appendChild(el("div", { class: "error-box" }, err.message || "Couldn't load the contract term.")); });
+  return box;
 }
 
 function fmtRelativeTime(iso) {

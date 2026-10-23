@@ -1,5 +1,5 @@
 """Database models for the contract template tool."""
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List
 
 from sqlmodel import SQLModel, Field, Relationship
@@ -62,6 +62,12 @@ class User(SQLModel, table=True):
     # email/password.
     google_sub: str = Field(default="", index=True)
 
+    # Optional logo shown to clients on the review and signing pages (see
+    # main.py's branding endpoints). `logo_file` is relative to UPLOADS_DIR;
+    # empty means "no logo, show the account's name instead".
+    logo_file: str = ""
+    logo_mime: str = ""
+
     # Per-type opt-outs for the owner-facing notifications a client's
     # actions can trigger -- both the in-app bell (see main.py's _notify
     # call sites) and the matching email. Each defaults on, since these are
@@ -89,6 +95,9 @@ class User(SQLModel, table=True):
     # haven't signed (day 3, 6 and 9 after they were emailed). The owner can
     # always send one by hand regardless of this setting.
     auto_remind_signers: bool = True
+    # Email the owner 30 and 7 days before a contract's end date (see
+    # app/renewals.py). Only goes to the document owner, never a counterparty.
+    renewal_emails: bool = True
 
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
@@ -181,6 +190,17 @@ class GeneratedContract(SQLModel, table=True):
     parties_json: str = "[]"
     archived: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # Contract term / renewal tracking (see app/renewals.py). end_date is what
+    # the owner confirmed; end_date_suggestion_json holds an AI suggestion
+    # that is waiting for them to confirm, edit or dismiss it -- never used
+    # for emails or the "Renewing soon" strip until confirmed.
+    end_date: Optional[date] = None
+    auto_renews: bool = False
+    renewal_terms: str = ""
+    end_date_suggestion_json: str = ""
+    renewal_30_sent_at: Optional[datetime] = None
+    renewal_7_sent_at: Optional[datetime] = None
 
     # Set when this generated contract was produced by applying accepted
     # redlines from a client review round, so it's traceable back to the
@@ -588,3 +608,13 @@ class Notification(SQLModel, table=True):
     generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     read_at: Optional[datetime] = None
+
+
+class AiUsage(SQLModel, table=True):
+    """How many AI suggestions an account has used in one calendar month
+    (UTC, "YYYY-MM"). See app/ai_usage.py for the monthly limit."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    month: str = Field(index=True)
+    count: int = 0
