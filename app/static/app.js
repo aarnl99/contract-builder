@@ -344,6 +344,54 @@ function toggleAvatarMenu() {
   }
   loadNotifSettings();
 
+  // ---- logo shown to clients on review and signing pages. PNG or JPG up
+  // to 1 MB; without one, clients see your name instead. ----
+  const logoRow = el("div", { class: "plan-row" });
+  logoRow.appendChild(el("div", { class: "label" }, "Your logo"));
+  const logoBody = el("div", { class: "logo-row" });
+  logoRow.appendChild(logoBody);
+  const logoHint = el("div", { style: "font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.4;" }, "Shown to clients on review and signing pages. PNG or JPG, up to 1 MB. Without one, they see your name.");
+  logoRow.appendChild(logoHint);
+  const logoFile = el("input", { type: "file", accept: "image/png,image/jpeg", style: "display:none;" });
+  logoRow.appendChild(logoFile);
+  dd.appendChild(logoRow);
+
+  function paintLogo(b) {
+    logoBody.innerHTML = "";
+    const preview = el("div", { class: "logo-preview" });
+    if (b.has_logo) preview.appendChild(el("img", { src: b.logo_url, alt: "Your logo" }));
+    else preview.textContent = "No logo";
+    const upload = el("button", { class: "btn secondary small", onclick: () => logoFile.click() }, b.has_logo ? "Replace" : "Upload logo");
+    const actions = el("div", { class: "logo-actions" }, [upload]);
+    if (b.has_logo) {
+      actions.appendChild(el("button", {
+        class: "btn secondary small",
+        onclick: async () => {
+          try { paintLogo(await api("/api/account/logo", { method: "DELETE" })); } catch (e) { alert(e.message); }
+        },
+      }, "Remove"));
+    }
+    logoBody.appendChild(preview);
+    logoBody.appendChild(actions);
+  }
+  logoFile.addEventListener("change", async () => {
+    const f = logoFile.files && logoFile.files[0];
+    logoFile.value = "";
+    if (!f) return;
+    if (f.size > 1024 * 1024) { alert("That logo is over 1 MB. Please use a smaller PNG or JPG."); return; }
+    const form = new FormData();
+    form.append("file", f);
+    try {
+      const res = await fetch("/api/account/logo", { method: "POST", body: form, credentials: "same-origin" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "Couldn't upload that logo. Please try again.");
+      paintLogo(data);
+    } catch (e) { alert(e.message); }
+  });
+  api("/api/account/branding").then(paintLogo).catch(() => {
+    logoBody.appendChild(el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Couldn't load your logo settings."));
+  });
+
   const logoutRow = el("div", { class: "logout-row" }, [el("button", { onclick: doLogout }, "Log out")]);
   dd.appendChild(logoutRow);
 

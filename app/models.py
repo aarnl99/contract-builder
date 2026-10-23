@@ -62,6 +62,12 @@ class User(SQLModel, table=True):
     # email/password.
     google_sub: str = Field(default="", index=True)
 
+    # Optional logo shown to clients on the review and signing pages (see
+    # main.py's branding endpoints). `logo_file` is relative to UPLOADS_DIR;
+    # empty means "no logo, show the account's name instead".
+    logo_file: str = ""
+    logo_mime: str = ""
+
     # Per-type opt-outs for the owner-facing notifications a client's
     # actions can trigger -- both the in-app bell (see main.py's _notify
     # call sites) and the matching email. Each defaults on, since these are

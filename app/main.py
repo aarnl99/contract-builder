@@ -5081,6 +5081,196 @@ def _require_share_session(request: Request, token: str, session: Session) -> Sh
     return link
 
 
+# ---- client branding (logo + name on the review and signing pages) --------
+
+MAX_LOGO_BYTES = 1024 * 1024  # 1 MB
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _logo_kind(data: bytes) -> Optional[tuple]:
+    """(extension, mime) from the file's own first bytes, never from the
+    name the browser claims. Only PNG and JPEG are accepted: no SVG, since
+    an SVG can carry scripts."""
+    if data.startswith(_PNG_MAGIC):
+        return "png", "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg", "image/jpeg"
+    return None
+
+
+def _logo_abs_path(user: User) -> Optional[str]:
+    if not user or not user.logo_file:
+        return None
+    path = os.path.join(UPLOADS_DIR, user.logo_file)
+    return path if os.path.isfile(path) else None
+
+
+def _brand_display_name(user: Optional[User]) -> str:
+    if not user:
+        return ""
+    return user.name.strip() or user.email
+
+
+def _brand_payload(user: Optional[User], logo_url: str) -> dict:
+    path = _logo_abs_path(user) if user else None
+    version = int(os.path.getmtime(path)) if path else 0
+    return {
+        "name": _brand_display_name(user),
+        "has_logo": bool(path),
+        "logo_url": f"{logo_url}?v={version}" if path else None,
+    }
+
+
+def _logo_response(user: Optional[User]):
+    path = _logo_abs_path(user) if user else None
+    if not path:
+        raise HTTPException(404, "No logo.")
+    return FileResponse(path, media_type=user.logo_mime or "image/png", headers={"Cache-Control": "private, max-age=300"})
+
+
+@app.get("/api/account/branding")
+def get_branding(user: User = Depends(get_current_user)):
+    return {**_brand_payload(user, "/api/account/logo"), "max_bytes": MAX_LOGO_BYTES}
+
+
+@app.get("/api/account/logo")
+def get_own_logo(user: User = Depends(get_current_user)):
+    return _logo_response(user)
+
+
+@app.post("/api/account/logo")
+async def upload_logo(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    data = await file.read(MAX_LOGO_BYTES + 1)
+    if not data:
+        raise HTTPException(400, "That file is empty.")
+    if len(data) > MAX_LOGO_BYTES:
+        raise HTTPException(400, "That logo is over 1 MB. Please use a smaller PNG or JPG.")
+    kind = _logo_kind(data)
+    if not kind:
+        raise HTTPException(400, "Please upload a PNG or JPG image.")
+    ext, mime = kind
+    rel_dir = os.path.join(str(user.id), "branding")
+    abs_dir = os.path.join(UPLOADS_DIR, rel_dir)
+    os.makedirs(abs_dir, exist_ok=True)
+    for old in os.listdir(abs_dir):
+        if old.startswith("logo."):
+            os.remove(os.path.join(abs_dir, old))
+    with open(os.path.join(abs_dir, f"logo.{ext}"), "wb") as f:
+        f.write(data)
+    user.logo_file = os.path.join(rel_dir, f"logo.{ext}")
+    user.logo_mime = mime
+    session.add(user)
+    session.commit()
+    return {**_brand_payload(user, "/api/account/logo"), "max_bytes": MAX_LOGO_BYTES}
+
+
+@app.delete("/api/account/logo")
+def delete_logo(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    path = _logo_abs_path(user)
+    if path:
+        os.remove(path)
+    user.logo_file = ""
+    user.logo_mime = ""
+    session.add(user)
+    session.commit()
+    return {**_brand_payload(user, "/api/account/logo"), "max_bytes": MAX_LOGO_BYTES}
+
+
+def _share_owner(session: Session, token: str) -> Optional[User]:
+    link = _get_share_link_or_404(session, token)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    return session.get(User, gc.owner_id) if gc else None
+
+
+@app.get("/api/share/{token}/brand")
+def get_share_brand(token: str, session: Session = Depends(get_session)):
+    """Public: who the review page should say it's from. Only a name and an
+    image, nothing about the document, so it works before the access code."""
+    return _brand_payload(_share_owner(session, token), f"/api/share/{token}/logo")
+
+
+@app.get("/api/share/{token}/logo")
+def get_share_logo(token: str, session: Session = Depends(get_session)):
+    return _logo_response(_share_owner(session, token))
+
+
+def _sign_owner(session: Session, token: str) -> Optional[User]:
+    signer = _get_signer_or_404(session, token)
+    sr = session.get(SigningRequest, signer.signing_request_id)
+    gc = session.get(GeneratedContract, sr.generated_contract_id) if sr else None
+    return session.get(User, gc.owner_id) if gc else None
+
+
+@app.get("/api/sign/{token}/brand")
+def get_sign_brand(token: str, session: Session = Depends(get_session)):
+    return _brand_payload(_sign_owner(session, token), f"/api/sign/{token}/logo")
+
+
+@app.get("/api/sign/{token}/logo")
+def get_sign_logo(token: str, session: Session = Depends(get_session)):
+    return _logo_response(_sign_owner(session, token))
+
+
+def _client_signing_state(session: Session, link: ShareLink, gc: GeneratedContract) -> dict:
+    """What the client's one link should offer about signing, so they never
+    need a second email to find the signing page.
+
+    Only shows a way to sign once the deal is agreed: the owner has sent a
+    signature request AND nothing is still being negotiated (no countered
+    redline waiting on the client, no client round waiting on the owner).
+    The signing page itself is the existing /sign/{token} page, so every
+    protection there (consent, photo, turn order) still applies, and the
+    emailed signing links keep working exactly as before."""
+    none = {"state": "none"}
+    email = (link.client_email or "").strip().lower()
+    if not email:
+        return none
+    family = _lineage_doc_ids(gc, session)
+    sr = session.exec(
+        select(SigningRequest)
+        .where(SigningRequest.generated_contract_id.in_(family), SigningRequest.status.in_(["pending", "completed"]))
+        .order_by(SigningRequest.created_at.desc())
+    ).first()
+    if not sr:
+        return none
+    signers = session.exec(
+        select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
+    ).all()
+    mine = next((s for s in sorted(signers, key=lambda s: (s.position, s.id or 0)) if (s.email or "").strip().lower() == email), None)
+    if not mine:
+        return none
+    if mine.status == "completed":
+        if sr.status == "completed":
+            return {"state": "all_signed"}
+        waiting = [s.name for s in signers if s.status != "completed"]
+        return {"state": "signed", "waiting_on": waiting}
+    if mine.status == "declined":
+        return none
+    if sr.status != "pending":
+        return none
+    if _unresolved_counts(session, [gc.id], owner_id=gc.owner_id).get(gc.id, 0) > 0:
+        return {"state": "negotiating"}
+    link_ids = [l.id for l in session.exec(select(ShareLink).where(ShareLink.generated_contract_id.in_(family))).all()]
+    waiting_on_owner = session.exec(
+        select(RedlineSubmission).where(
+            RedlineSubmission.share_link_id.in_(link_ids),
+            RedlineSubmission.origin == "client",
+            RedlineSubmission.status == "pending",
+            RedlineSubmission.responded_at == None,  # noqa: E711
+        )
+    ).first()
+    if waiting_on_owner:
+        return {"state": "negotiating"}
+    your_turn, ahead = _signer_turn_info(session, sr, mine)
+    if not your_turn:
+        return {"state": "waiting_turn", "waiting_on": ahead}
+    return {"state": "ready", "sign_url": f"/sign/{mine.token}", "role": mine.role}
+
+
 @app.get("/api/share/{token}")
 def get_share_document(token: str, request: Request, session: Session = Depends(get_session)):
     link = _require_share_session(request, token, session)
@@ -5234,6 +5424,7 @@ def get_share_document(token: str, request: Request, session: Session = Depends(
         "draft": draft_payload,
         "response": response_payload,
         "owner_updated_since_last_view": owner_updated_since_last_view,
+        "signing": _client_signing_state(session, link, gc),
     }
 
 
