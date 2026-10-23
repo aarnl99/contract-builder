@@ -10,7 +10,7 @@ import threading
 import time
 import httpx
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
@@ -32,6 +32,7 @@ from . import docx_engine as de
 from . import redline_engine as rl
 from . import email_engine as ee
 from . import docuseal_engine as ds
+from . import renewals as rn
 from . import rate_limit as ratelimit
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -678,6 +679,7 @@ def _notification_settings_payload(user: User) -> dict:
         "redline_comment": user.notify_redline_comment,
         "signature_events": user.notify_signature_events,
         "auto_remind_signers": user.auto_remind_signers,
+        "renewal_emails": user.renewal_emails,
     }
 
 
@@ -691,6 +693,7 @@ class NotificationSettingsBody(BaseModel):
     redline_comment: Optional[bool] = None
     signature_events: Optional[bool] = None
     auto_remind_signers: Optional[bool] = None
+    renewal_emails: Optional[bool] = None
 
 
 @app.patch("/api/account/notification-settings")
@@ -715,6 +718,8 @@ def set_notification_settings(
         user.notify_signature_events = body.signature_events
     if body.auto_remind_signers is not None:
         user.auto_remind_signers = body.auto_remind_signers
+    if body.renewal_emails is not None:
+        user.renewal_emails = body.renewal_emails
     session.add(user)
     session.commit()
     return _notification_settings_payload(user)
@@ -1738,6 +1743,8 @@ def list_generated(
             # Where the latest signature request stands ("Waiting on Morgan
             # \u00b7 4 days"), or null when nothing is out for signature.
             "signature": signature_by_doc.get(g.id),
+            "end_date": g.end_date.isoformat() if g.end_date else None,
+            "has_end_date_suggestion": bool(g.end_date_suggestion_json) and g.end_date is None,
         }
         for g in rows
     ]
@@ -2950,10 +2957,11 @@ def _start_reminder_thread() -> None:
     def loop():
         while True:
             time.sleep(REMINDER_CHECK_SECONDS)
-            try:
-                _send_due_reminders()
-            except Exception:
-                pass  # never let one bad pass kill the loop
+            for job in (_send_due_reminders, _send_due_renewal_emails):
+                try:
+                    job()
+                except Exception:
+                    pass  # never let one bad pass kill the loop
 
     threading.Thread(target=loop, daemon=True, name="signature-reminders").start()
 
@@ -3751,6 +3759,225 @@ def cancel_signature_request(
     return {"ok": True}
 
 
+# ---- contract end dates and renewals --------------------------------------
+# See app/renewals.py. The owner confirms (or edits) an end date; Claude can
+# suggest one from the document text, but a suggestion never counts until the
+# owner confirms it.
+
+class RenewalBody(BaseModel):
+    end_date: Optional[str] = None  # YYYY-MM-DD, or blank to clear
+    auto_renews: bool = False
+    renewal_terms: str = ""
+
+
+def _renewal_payload(gc: GeneratedContract, today: Optional[date] = None) -> dict:
+    today = today or date.today()
+    return {
+        "end_date": gc.end_date.isoformat() if gc.end_date else None,
+        "days_left": rn.days_left(gc.end_date, today) if gc.end_date else None,
+        "auto_renews": bool(gc.auto_renews),
+        "renewal_terms": gc.renewal_terms or "",
+        "suggestion": rn.suggestion_from_json(gc.end_date_suggestion_json),
+        "ai_available": bool(ee.ANTHROPIC_API_KEY),
+    }
+
+
+@app.get("/api/generated/{generated_id}/renewal")
+def get_renewal(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    gc = _get_owned_generated(session, user, generated_id)
+    return _renewal_payload(gc)
+
+
+@app.put("/api/generated/{generated_id}/renewal")
+def set_renewal(
+    generated_id: int,
+    body: RenewalBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Confirms the contract's end date (and renewal terms). Any pending AI
+    suggestion is cleared, since the owner has now answered it."""
+    gc = _get_owned_generated(session, user, generated_id)
+    raw = (body.end_date or "").strip()
+    end = rn.parse_iso_date(raw) if raw else None
+    if raw and not end:
+        raise HTTPException(400, "That isn't a valid date. Use the date picker or YYYY-MM-DD.")
+    if end and (end.year < 2000 or end > date.today() + timedelta(days=365 * 60)):
+        raise HTTPException(400, "That end date looks wrong. Check the year.")
+    if end != gc.end_date:
+        # A new date restarts the 30/7-day email schedule.
+        gc.renewal_30_sent_at = None
+        gc.renewal_7_sent_at = None
+    gc.end_date = end
+    gc.auto_renews = bool(body.auto_renews)
+    gc.renewal_terms = (body.renewal_terms or "").strip()[: rn.MAX_NOTE_CHARS]
+    gc.end_date_suggestion_json = ""
+    session.add(gc)
+    session.commit()
+    return _renewal_payload(gc)
+
+
+@app.post("/api/generated/{generated_id}/renewal/suggest")
+def suggest_renewal(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Asks Claude to read the document and suggest an end date and renewal
+    terms. Stored as a suggestion for the owner to confirm, edit or dismiss."""
+    gc = _get_owned_generated(session, user, generated_id)
+    if not gc.file_path or not os.path.exists(gc.file_path):
+        raise HTTPException(404, "This document's file is missing on disk.")
+    key = f"renewal-suggest:{user.id}"
+    wait = ratelimit.retry_after(key, 10, 3600)
+    if wait:
+        raise HTTPException(429, "That's a lot of suggestions in a short time. Try again in a bit.")
+    try:
+        suggestion = rn.suggest_term(rn.document_text(gc.file_path))
+    except RuntimeError:
+        raise HTTPException(503, "AI suggestions aren't set up on this server yet.")
+    except Exception:
+        raise HTTPException(502, "Couldn't read the document just now. Try again in a moment.")
+    ratelimit.record(key, 3600)
+    gc.end_date_suggestion_json = json.dumps(suggestion) if suggestion else ""
+    session.add(gc)
+    session.commit()
+    return {"found": suggestion is not None, **_renewal_payload(gc)}
+
+
+@app.post("/api/generated/{generated_id}/renewal/dismiss")
+def dismiss_renewal_suggestion(generated_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    gc = _get_owned_generated(session, user, generated_id)
+    gc.end_date_suggestion_json = ""
+    session.add(gc)
+    session.commit()
+    return _renewal_payload(gc)
+
+
+@app.get("/api/renewals")
+def list_renewals(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Feeds the "Renewing soon" strip: confirmed end dates from two weeks ago
+    to three months out, soonest first, plus documents whose suggested end
+    date is still waiting for the owner to confirm."""
+    today = date.today()
+    lo = today - timedelta(days=rn.RECENTLY_ENDED_DAYS)
+    hi = today + timedelta(days=rn.RENEWAL_WINDOW_DAYS)
+    rows = session.exec(
+        select(GeneratedContract)
+        .where(
+            GeneratedContract.owner_id == user.id,
+            GeneratedContract.archived == False,  # noqa: E712
+            GeneratedContract.end_date != None,  # noqa: E711
+            GeneratedContract.end_date >= lo,
+            GeneratedContract.end_date <= hi,
+        )
+        .order_by(GeneratedContract.end_date, GeneratedContract.id)
+    ).all()
+    to_confirm = session.exec(
+        select(GeneratedContract)
+        .where(
+            GeneratedContract.owner_id == user.id,
+            GeneratedContract.archived == False,  # noqa: E712
+            GeneratedContract.end_date == None,  # noqa: E711
+            GeneratedContract.end_date_suggestion_json != "",
+        )
+        .order_by(GeneratedContract.created_at.desc())
+        .limit(10)
+    ).all()
+    return {
+        "renewing": [
+            {
+                "id": g.id,
+                "name": g.name,
+                "end_date": g.end_date.isoformat(),
+                "days_left": rn.days_left(g.end_date, today),
+                "auto_renews": bool(g.auto_renews),
+                "renewal_terms": g.renewal_terms or "",
+            }
+            for g in rows
+        ],
+        "to_confirm": [{"id": g.id, "name": g.name} for g in to_confirm],
+    }
+
+
+def _send_renewal_email(user: User, gc: GeneratedContract, days: int) -> bool:
+    when = "today" if days <= 0 else ("tomorrow" if days == 1 else f"in {days} days")
+    lines = [f'"{gc.name}" ends {when} ({gc.end_date.strftime("%B %d, %Y").replace(" 0", " ")}).']
+    if gc.auto_renews:
+        lines.append("It is set to renew automatically, so check the notice terms if you want to change or end it.")
+    if gc.renewal_terms:
+        lines.append(f"Renewal terms you noted: {gc.renewal_terms}")
+    lines.append(f"Open your documents: {_canonical_base_url()}/#/documents")
+    body = f"Hi,\n\n" + "\n\n".join(lines) + "\n\n- Rotely"
+    try:
+        ee.send_email(user.email, f'Contract ending {when}: "{gc.name}"', body)
+        return True
+    except RuntimeError:
+        return False
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        return False
+
+
+def _send_due_renewal_emails(today: Optional[date] = None) -> int:
+    """One pass of the renewal email job: 30 days and 7 days before a
+    confirmed end date, once each, to the document owner only."""
+    today = today or date.today()
+    sent = 0
+    with Session(engine) as session:
+        rows = session.exec(
+            select(GeneratedContract).where(
+                GeneratedContract.archived == False,  # noqa: E712
+                GeneratedContract.end_date != None,  # noqa: E711
+                GeneratedContract.end_date >= today,
+                GeneratedContract.end_date <= today + timedelta(days=max(rn.EMAIL_DAYS)),
+            )
+        ).all()
+        for gc in rows:
+            owner = session.get(User, gc.owner_id)
+            if not owner or not owner.renewal_emails or getattr(owner, "is_suspended", False):
+                continue
+            stage = rn.email_stage(gc.end_date, today, bool(gc.renewal_30_sent_at), bool(gc.renewal_7_sent_at))
+            if not stage:
+                continue
+            if _send_renewal_email(owner, gc, rn.days_left(gc.end_date, today)):
+                now = datetime.utcnow()
+                if stage == 7:
+                    gc.renewal_7_sent_at = now
+                    gc.renewal_30_sent_at = gc.renewal_30_sent_at or now
+                else:
+                    gc.renewal_30_sent_at = now
+                session.add(gc)
+                session.commit()
+                sent += 1
+    return sent
+
+
+def _run_renewal_suggestion(gc_id: int) -> bool:
+    """Reads a freshly signed document and stores an end-date suggestion for
+    the owner to confirm. Best effort: no key, no file, nothing found or any
+    error just means no suggestion. Never overwrites a confirmed date."""
+    if not ee.ANTHROPIC_API_KEY:
+        return False
+    with Session(engine) as session:
+        gc = session.get(GeneratedContract, gc_id)
+        if not gc or gc.end_date or gc.end_date_suggestion_json or not gc.file_path or not os.path.exists(gc.file_path):
+            return False
+        try:
+            suggestion = rn.suggest_term(rn.document_text(gc.file_path))
+        except Exception:
+            return False
+        if not suggestion:
+            return False
+        gc.end_date_suggestion_json = json.dumps(suggestion)
+        session.add(gc)
+        session.commit()
+        return True
+
+
+def _kick_renewal_suggestion(gc_id: int) -> None:
+    """Runs the suggestion in the background so the DocuSeal webhook that
+    triggered it isn't held up by an AI call."""
+    if os.environ.get("DISABLE_BACKGROUND_JOBS") == "1":
+        return
+    threading.Thread(target=_run_renewal_suggestion, args=(gc_id,), daemon=True, name="renewal-suggestion").start()
+
+
 class RemindBody(BaseModel):
     # Which signer to remind (their 0-based position). Omit to remind
     # everyone who can sign right now.
@@ -4104,6 +4331,7 @@ def _apply_submission_completed(session: Session, submission_id) -> None:
                     body="Everyone has signed. The signed document is in your documents library.",
                     generated_contract_id=gc.id,
                 )
+            _kick_renewal_suggestion(gc.id)
 
 
 def _apply_submission_expired(session: Session, submission_id) -> None:
