@@ -149,7 +149,7 @@ def test_suggestion_is_returned_with_usage(ai):
     assert r.status_code == 200, r.text
     got = r.json()
     assert got["suggestion"]["counter_value"] == "Net 45"
-    assert got["disclaimer"] == "AI suggestion, not legal advice."
+    assert got["disclaimer"] == adv.DISCLAIMER
     assert got["usage"]["used"] == 1 and got["usage"]["remaining"] == ai_usage.MONTHLY_LIMIT - 1
     assert got["facts"]["midpoint"] == 45
     sent = ai.calls[0]

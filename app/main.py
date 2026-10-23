@@ -4644,6 +4644,10 @@ def get_redlines(
                 "comment": e.comment,
                 "evaluation": e.evaluation, "decision": e.decision, "counter_value": e.counter_value,
                 "threshold_desc": threshold_desc, "inside_threshold": inside_threshold,
+                # "Worth a lawyer's eye" note, decided in code (advisor.clause_risk).
+                "risk": adv.clause_risk(
+                    label=e.label, original=e.original_value, proposed=e.proposed_value,
+                    comment=e.comment, free_text=not e.field_key),
                 "comments": comments_by_edit.get(e.id, []),
                 "comments_resolved": e.comments_resolved,
                 # See RedlineEdit.source_edit_id -- a client's response to
@@ -6037,6 +6041,16 @@ def suggest_redline_counter(edit_id: int, user: User = Depends(get_current_user)
     submission = session.get(RedlineSubmission, edit.submission_id)
     if submission.origin == "owner_edit":
         raise HTTPException(400, "That change is your own proposal, so there's nothing to counter.")
+    # A change that touches liability, ownership, termination and the like
+    # gets a plain "worth a lawyer's eye" note instead of an AI counter. This
+    # is decided in code, before any AI call, so it costs nothing and works
+    # even when the AI isn't switched on.
+    risk = adv.clause_risk(
+        label=edit.label, original=edit.original_value, proposed=edit.proposed_value,
+        comment=edit.comment, free_text=not edit.field_key)
+    if risk:
+        return {"suggestion": None, "lawyer_flag": risk, "facts": None,
+                "usage": ai_usage.status(session, user.id), "disclaimer": adv.DISCLAIMER}
     if not ee.ANTHROPIC_API_KEY:
         raise HTTPException(503, "AI suggestions aren't switched on for this site yet.")
     link = session.get(ShareLink, submission.share_link_id)
@@ -6070,7 +6084,60 @@ def suggest_redline_counter(edit_id: int, user: User = Depends(get_current_user)
         "suggestion": result,
         "facts": packet["arithmetic"],
         "usage": ai_usage.status(session, user.id),
-        "disclaimer": "AI suggestion, not legal advice.",
+        "disclaimer": adv.DISCLAIMER,
+    }
+
+
+@app.post("/api/redline-submissions/{submission_id}/summary")
+def summarize_redline_submission(submission_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Plain-English summary of the changes in one client round that still
+    need the owner's decision. Which changes are worth a lawyer's eye and the
+    counts come from code; the model only writes a one-line meaning for each
+    and an overview. Counts as one AI suggestion (refunded on failure)."""
+    submission = session.get(RedlineSubmission, submission_id)
+    link = session.get(ShareLink, submission.share_link_id) if submission else None
+    gc = session.get(GeneratedContract, link.generated_contract_id) if link else None
+    if not submission or not gc or gc.owner_id != user.id:
+        raise HTTPException(404, "Round not found")
+    if submission.origin in ("owner_edit", "owner_reconsideration"):
+        raise HTTPException(400, "That round is your own, so there's nothing to summarize.")
+    edits = session.exec(
+        select(RedlineEdit).where(RedlineEdit.submission_id == submission.id, RedlineEdit.decision == "pending").order_by(RedlineEdit.id)
+    ).all()
+    if not edits:
+        raise HTTPException(400, "Nothing in this round is waiting for your decision.")
+    if not ee.ANTHROPIC_API_KEY:
+        raise HTTPException(503, "AI suggestions aren't switched on for this site yet.")
+    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    ph_by_key = {p.field_key: p for p in tpl.placeholders} if tpl else {}
+    rows = []
+    for e in edits:
+        ph = ph_by_key.get(e.field_key)
+        inside = None
+        if ph and ph.threshold_type in ("numeric_range", "approved_list"):
+            inside = e.evaluation == "auto_approved"
+        rows.append({
+            "id": e.id, "field_key": e.field_key, "label": e.label, "original_value": e.original_value,
+            "proposed_value": e.proposed_value, "comment": e.comment, "inside_threshold": inside,
+            "threshold_desc": rl.describe_threshold(ph.threshold_type, ph.threshold_config) if ph else None,
+        })
+    packet = adv.build_summary_packet(gc.name, gc.document_type, rows)
+    if not ai_usage.reserve(session, user.id):
+        raise HTTPException(429, ai_usage.LIMIT_MESSAGE.format(limit=ai_usage.MONTHLY_LIMIT))
+    try:
+        result = adv.summarize_changes(packet)
+    except Exception as e:
+        _log_ai_failure("redline summary", e)
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't summarize these just now. Please try again in a minute.")
+    if not result:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't summarize these just now. Please try again in a minute.")
+    result["left_out"] = max(0, len(edits) - len(packet["changes"]))
+    return {
+        "summary": result,
+        "usage": ai_usage.status(session, user.id),
+        "disclaimer": adv.DISCLAIMER,
     }
 
 

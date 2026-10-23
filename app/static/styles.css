@@ -1094,6 +1094,19 @@ label.field-label { color: var(--ink); font-weight: 500; }
 .advisor-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .advisor-left { font-size: 11.5px; color: var(--muted, #6B7280); }
 
+/* "Worth a lawyer's eye" note and the round summary */
+.lawyer-note { width: 100%; box-sizing: border-box; background: var(--amber-soft); border: 1px solid var(--amber-soft-border); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 6px; text-align: left; }
+.lawyer-note .advisor-why { color: var(--amber); }
+.advisor-tag.lawyer-tag { color: var(--amber); }
+.summary-box { width: 100%; box-sizing: border-box; background: var(--bg-soft, #F7F7F5); border-radius: 12px; padding: 14px; margin: 0 0 12px; display: flex; flex-direction: column; gap: 8px; text-align: left; }
+.summary-counts { font-size: 13px; font-weight: 600; }
+.summary-row { display: grid; grid-template-columns: 96px minmax(0, 1fr); column-gap: 12px; align-items: start; padding-top: 8px; border-top: 1px solid var(--border-soft); }
+.summary-term { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.level-badge { display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; width: 96px; height: 24px; padding: 0 8px; border-radius: 12px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.level-routine { background: #DDF1E7; color: #17704A; }
+.level-review { background: #EEEEEB; color: #4B5563; }
+.level-lawyer { background: var(--amber-soft); color: var(--amber); border: 1px solid var(--amber-soft-border); }
+
 /* Owner branding on client-facing pages */
 .share-topbar .brand-custom { display: flex; align-items: center; text-decoration: none; color: inherit; }
 .brand-logo { display: block; max-height: 34px; max-width: 180px; width: auto; height: auto; object-fit: contain; }
