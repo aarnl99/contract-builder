@@ -101,6 +101,21 @@ SIGNUP_ACCESS_CODE = os.environ.get("SIGNUP_ACCESS_CODE", "")
 app = FastAPI(title="Rotely")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
 
+
+@app.middleware("http")
+async def _always_revalidate_front_end_files(request: Request, call_next):
+    """The pages' scripts and styles keep fixed names (/sign.js, /app.js), so a
+    browser may keep running an old copy after a deploy -- a signer once got
+    the old camera prompt even though the sender had chosen no photo check.
+    "no-cache" makes the browser re-check with the server on every load (a
+    cheap 304 when nothing changed) so a deploy reaches everyone at once."""
+    response = await call_next(request)
+    ctype = response.headers.get("content-type", "")
+    if response.status_code < 400 and ctype.startswith(("text/html", "text/css", "text/javascript", "application/javascript")) \
+            and "cache-control" not in response.headers:
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
 # A fresh random token each time this process starts (i.e. every deploy, since
 # Render restarts the process). The SPA is a single HTML page whose JS is
 # fetched once and never re-fetched until the tab is hard-refreshed -- a tab
