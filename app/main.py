@@ -2457,6 +2457,7 @@ def _share_link_payload(link: ShareLink) -> dict:
         "url": f"/share/{link.token}",
         "status": link.status,
         "created_at": link.created_at.isoformat(),
+        "emailed_at": (link.emailed_at.isoformat() + "Z") if link.emailed_at else None,
         "last_viewed_at": link.last_viewed_at.isoformat() if link.last_viewed_at else None,
     }
 
@@ -2510,7 +2511,7 @@ def _source_summaries_by_id(session: Session, source_ids: list) -> dict:
     }
 
 
-def _send_share_created_email(request: Request, user: User, gc: GeneratedContract, link: ShareLink) -> None:
+def _send_share_created_email(request: Request, user: User, gc: GeneratedContract, link: ShareLink) -> bool:
     """Lets the client know a document is waiting for them the moment a
     NEW share link is created (never re-sent on later visits to the Share
     modal -- see create_share_link, this only runs on the branch that
@@ -2534,8 +2535,9 @@ def _send_share_created_email(request: Request, user: User, gc: GeneratedContrac
             link.client_email, f'{sender_name} shared "{gc.name}" with you for review', body,
             reply_to=(link.sender_email.strip() or user.email),
         )
+        return True
     except (RuntimeError, httpx.HTTPError):
-        pass  # SENDGRID_API_KEY not configured yet -- the link still works, just wasn't emailed
+        return False  # no provider key, or the provider refused -- the link still works, just wasn't emailed
 
 
 def _send_reconsideration_email(
@@ -2798,8 +2800,64 @@ def create_share_link(
     session.add(link)
     session.commit()
     session.refresh(link)
-    _send_share_created_email(request, user, gc, link)
+    if _send_share_created_email(request, user, gc, link):
+        link.emailed_at = datetime.utcnow()
+        session.add(link)
+        session.commit()
+        session.refresh(link)
     return _share_link_payload(link)
+
+
+@app.post("/api/generated/{generated_id}/share/email")
+def resend_share_email(
+    generated_id: int,
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """(Re)send the "shared with you" email for the open link -- for when the
+    first send failed (provider down, wrong address since corrected) or the
+    client lost it. Unlike the automatic send this reports failure."""
+    gc = _get_owned_generated(session, user, generated_id)
+    link = _find_open_share_link(session, gc)
+    if not link:
+        raise HTTPException(404, "No open review link for this document.")
+    if not link.client_email.strip():
+        raise HTTPException(400, "Add the client's email first.")
+    if not _send_share_created_email(request, user, gc, link):
+        raise HTTPException(502, "We couldn't send the email. Copy the link and access code and send them yourself.")
+    link.emailed_at = datetime.utcnow()
+    session.add(link)
+    session.commit()
+    session.refresh(link)
+    return _share_link_payload(link)
+
+
+@app.get("/api/recipients")
+def recent_recipients(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """People this account has shared with or sent to before, newest first,
+    one row per email address -- powers the suggestions on the recipient
+    fields so nobody retypes the same client."""
+    rows = {}
+    shares = session.exec(
+        select(ShareLink).join(GeneratedContract, GeneratedContract.id == ShareLink.generated_contract_id)
+        .where(GeneratedContract.owner_id == user.id).order_by(ShareLink.created_at.desc())
+    ).all()
+    for l in shares:
+        em = (l.client_email or "").strip().lower()
+        if em and em not in rows:
+            rows[em] = {"email": l.client_email.strip(), "first_name": l.client_first_name, "last_name": l.client_last_name}
+    signers = session.exec(
+        select(SigningRequestSigner).join(SigningRequest, SigningRequest.id == SigningRequestSigner.signing_request_id)
+        .join(GeneratedContract, GeneratedContract.id == SigningRequest.generated_contract_id)
+        .where(GeneratedContract.owner_id == user.id).order_by(SigningRequest.id.desc())
+    ).all()
+    for sg in signers:
+        em = (sg.email or "").strip().lower()
+        if em and em not in rows and em != (user.email or "").lower():
+            parts = (sg.name or "").strip().split(" ", 1)
+            rows[em] = {"email": sg.email.strip(), "first_name": parts[0], "last_name": parts[1] if len(parts) > 1 else ""}
+    return list(rows.values())[:50]
 
 
 @app.post("/api/generated/{generated_id}/share/close")
