@@ -260,6 +260,14 @@ async function main() {
     render(MessageView("Already signed", "You've already signed this document. No further action is needed."));
     return;
   }
+  if (status.your_turn === false) {
+    const who = (status.waiting_on || []).join(", ");
+    render(MessageView(
+      "Waiting for your turn",
+      `This document is signed in order, and ${who || "another signer"} still needs to sign first. You'll get an email as soon as it's your turn.`
+    ));
+    return;
+  }
   if (status.status === "awaiting_consent") {
     render(ConsentView(status));
     return;

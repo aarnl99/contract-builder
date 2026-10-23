@@ -2686,6 +2686,7 @@ _SIGNATURE_ROLES = ("Client", "Sender")
 
 
 def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
+    ordered, turn = _signer_turns(sr, signers)
     return {
         "id": sr.id,
         "status": sr.status,
@@ -2703,9 +2704,12 @@ def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
         # URL). The backend knows the canonical base, so it sends the exact
         # URL to configure.
         "webhook_url": f"{_canonical_base_url()}/api/webhooks/docuseal",
+        "sign_in_order": bool(sr.sign_in_order),
         "signers": [
             {
                 "role": s.role,
+                "position": s.position,
+                "your_turn": turn.get(s.id, True),
                 "name": s.name,
                 "email": s.email,
                 "status": s.status,
@@ -2714,14 +2718,31 @@ def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
                 "completed_at": s.completed_at.isoformat() if s.completed_at else None,
                 "has_photo": bool(s.photo_path),
             }
-            for s in signers
+            for s in ordered
         ],
     }
 
 
-def _send_signature_request_email(request: Request, user: User, gc: GeneratedContract, signer: SigningRequestSigner) -> None:
+def _signer_turns(sr: SigningRequest, signers: list):
+    """Signers sorted by signing position, plus {signer.id: bool} saying
+    whether it's that signer's turn. Everyone's turn at once unless the
+    request is sign_in_order, in which case a signer's turn starts only
+    when every signer before them has completed."""
+    ordered = sorted(signers, key=lambda s: (s.position, s.id or 0))
+    turn = {}
+    blocked = False
+    for s in ordered:
+        turn[s.id] = (not blocked) if sr.sign_in_order else True
+        if s.status != "completed":
+            blocked = True
+    return ordered, turn
+
+
+def _send_signature_request_email(request: Optional[Request], user: User, gc: GeneratedContract, signer: SigningRequestSigner) -> None:
     sender_name = user.name.strip() or user.email
-    sign_url = f"{_base_url(request)}/sign/{signer.token}"
+    # request is None when this runs from a webhook (next signer's turn).
+    base = _base_url(request) if request is not None else _canonical_base_url()
+    sign_url = f"{base}/sign/{signer.token}"
     first_name = signer.name.split(" ")[0] if signer.name else "there"
     body = (
         f"Hi {first_name},\n\n"
@@ -2945,9 +2966,90 @@ def get_signature_builder_token(
     return {"template_id": template_id, "token": token, "roles": roles}
 
 
+class SignerBody(BaseModel):
+    name: str
+    email: str
+    role: str
+
+
+# Roles are spliced into DocuSeal text tags ({{label;type=...;role=X;...}}),
+# so they can't contain the tag's own punctuation (; = { }). Letters,
+# numbers, spaces, hyphens, underscores and periods cover CEO, CFO,
+# Client, Co-signer, Witness 2, Landlord, etc.
+_SIGNER_ROLE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.\-]{0,39}")
+_MAX_SIGNERS = 10
+
+
+def _clean_signer_role(raw: str) -> str:
+    role = " ".join((raw or "").split())
+    if not _SIGNER_ROLE_RE.fullmatch(role):
+        raise HTTPException(
+            400,
+            "A signer's role can use letters, numbers, spaces, hyphens, underscores and "
+            "periods, up to 40 characters (for example CEO, CFO or Client).",
+        )
+    return role
+
+
+def _build_signer_specs(body, user) -> list:
+    """The ordered signer list for a new signature request: [{role, name,
+    email}, ...]. Prefers body.signers (any number, custom role labels);
+    falls back to the original client_*/sender_* fields so older callers
+    keep working unchanged."""
+    if body.signers:
+        if len(body.signers) > _MAX_SIGNERS:
+            raise HTTPException(400, f"You can add up to {_MAX_SIGNERS} signers.")
+        specs = []
+        seen_emails = set()
+        seen_roles = set()
+        for i, s in enumerate(body.signers, start=1):
+            name = (s.name or "").strip()[:200]
+            email = (s.email or "").strip()[:200]
+            if not name or not email:
+                raise HTTPException(400, f"Signer {i} needs a name and an email.")
+            if not _EMAIL_ADDR_RE.fullmatch(email):
+                raise HTTPException(400, f"\"{email}\" doesn't look like a valid email address.")
+            role = _clean_signer_role(s.role)
+            # Bug tracker #52: DocuSeal addresses submitters by email, so two
+            # signers sharing one address collapse into a single submitter.
+            if email.lower() in seen_emails:
+                raise HTTPException(400, f"{email} is on the list twice -- each signer needs a distinct email address so DocuSeal can track them separately.")
+            if role.lower() in seen_roles:
+                raise HTTPException(400, f"Two signers can't share the role \"{role}\" -- give each one their own label (for example Client 1 and Client 2).")
+            seen_emails.add(email.lower())
+            seen_roles.add(role.lower())
+            specs.append({"role": role, "name": name, "email": email})
+        return specs
+
+    client_name = (body.client_name or "").strip()[:200]
+    client_email = (body.client_email or "").strip()[:200]
+    if not client_name or not client_email:
+        raise HTTPException(400, "Enter the client's name and email.")
+    if not _EMAIL_ADDR_RE.fullmatch(client_email):
+        raise HTTPException(400, "That doesn't look like a valid client email address.")
+
+    specs = [{"role": "Client", "name": client_name, "email": client_email}]
+    if body.include_sender:
+        sender_name = body.sender_name.strip()[:200] or user.name.strip() or user.email
+        sender_email = body.sender_email.strip()[:200] or user.email
+        if not _EMAIL_ADDR_RE.fullmatch(sender_email):
+            raise HTTPException(400, "That doesn't look like a valid sender email address.")
+        if sender_email.lower() == client_email.lower():
+            raise HTTPException(400, "The client and sender can't use the same email address -- each signer needs a distinct address so DocuSeal can track them separately.")
+        specs.append({"role": "Sender", "name": sender_name, "email": sender_email})
+    return specs
+
+
 class CreateSignatureRequestBody(BaseModel):
-    client_name: str
-    client_email: str
+    # Preferred: an ordered list of any number of signers, each with their
+    # own role label. The client_*/sender_* fields below are the original
+    # two-party shape, still accepted when `signers` is empty.
+    signers: list[SignerBody] = []
+    # True: signers sign one after another in list order (the next one is
+    # emailed only when the previous has signed). False: everyone at once.
+    sign_in_order: bool = False
+    client_name: str = ""
+    client_email: str = ""
     include_sender: bool = False
     sender_name: str = ""
     sender_email: str = ""
@@ -3036,10 +3138,8 @@ def place_signature_field(
     spliced into a throwaway copy at send time, so the document itself
     stays clean and fields can be removed or reassigned freely."""
     gc = _get_owned_generated(session, user, generated_id)
-    role = (body.role or "").strip()
+    role = _clean_signer_role(body.role)
     field_type = (body.field_type or "").strip()
-    if role not in de.SIGNATURE_FIELD_ROLES:
-        raise HTTPException(400, "A field can only be assigned to the Client or the Sender.")
     if field_type not in de.SIGNATURE_FIELD_TYPES:
         raise HTTPException(400, "Unknown field type.")
     if not body.segments:
@@ -3153,29 +3253,11 @@ def create_signature_request(
         if existing:
             raise HTTPException(400, "A signature request is already pending for this document. Cancel it first to send a new one.")
 
-        client_name = body.client_name.strip()[:200]
-        client_email = body.client_email.strip()[:200]
-        if not client_name or not client_email:
-            raise HTTPException(400, "Enter the client's name and email.")
-        if not _EMAIL_ADDR_RE.fullmatch(client_email):
-            raise HTTPException(400, "That doesn't look like a valid client email address.")
-
-        signer_specs = [{"role": "Client", "name": client_name, "email": client_email}]
-        if body.include_sender:
-            sender_name = body.sender_name.strip()[:200] or user.name.strip() or user.email
-            sender_email = body.sender_email.strip()[:200] or user.email
-            if not _EMAIL_ADDR_RE.fullmatch(sender_email):
-                raise HTTPException(400, "That doesn't look like a valid sender email address.")
-            # Bug tracker #52: DocuSeal addresses submitters by email, so two
-            # signer_specs sharing one email collapse into a single DocuSeal
-            # submitter -- by_email below (keyed on email) can then only
-            # ever resolve one of the two local SigningRequestSigner rows to
-            # a real docuseal_submitter_id, leaving the other permanently
-            # stuck with no submitter behind it. Reject this combination
-            # upfront instead of letting it reach DocuSeal.
-            if sender_email.lower() == client_email.lower():
-                raise HTTPException(400, "The client and sender can't use the same email address -- each signer needs a distinct address so DocuSeal can track them separately.")
-            signer_specs.append({"role": "Sender", "name": sender_name, "email": sender_email})
+        # Bug tracker #52 (distinct emails per signer) is enforced inside
+        # _build_signer_specs.
+        signer_specs = _build_signer_specs(body, user)
+        sign_in_order = bool(body.sign_in_order) and len(signer_specs) > 1
+        docuseal_order = "preserved" if sign_in_order else "random"
 
         if not gc.file_path or not os.path.exists(gc.file_path):
             raise HTTPException(404, "This document's file is missing on disk and can't be sent for signature.")
@@ -3196,6 +3278,8 @@ def create_signature_request(
             bool(gc.docuseal_template_id)
             and gc.docuseal_template_doc_hash == current_hash
             and not placed_fields
+            # A builder-made template only knows the Client/Sender roles.
+            and all(s["role"] in ("Client", "Sender") for s in signer_specs)
         )
 
         prepped_path = None
@@ -3204,6 +3288,7 @@ def create_signature_request(
                 raw_submitters = ds.create_submission_from_template(
                     template_id=gc.docuseal_template_id,
                     submitters=[{"role": s["role"], "email": s["email"], "name": s["name"]} for s in signer_specs],
+                    order=docuseal_order,
                 )
                 if not raw_submitters:
                     raise HTTPException(502, "DocuSeal returned an empty response.")
@@ -3214,15 +3299,28 @@ def create_signature_request(
                 os.makedirs(sig_dir, exist_ok=True)
                 prepped_path = os.path.join(sig_dir, f"{gc.id}_{secrets.token_hex(6)}_for_signature.docx")
                 if placed_fields:
-                    roles_needed = {f.get("role") for f in placed_fields}
-                    have_roles = {"Client"} | ({"Sender"} if body.include_sender else set())
-                    missing = roles_needed - have_roles
-                    if missing:
+                    field_counts = {}
+                    for f in placed_fields:
+                        field_counts[f.get("role")] = field_counts.get(f.get("role"), 0) + 1
+                    signer_roles = {s["role"] for s in signer_specs}
+                    # A field whose signer isn't on the list: nobody could
+                    # fill it, and DocuSeal needs a submitter for every role.
+                    orphaned = sorted(r for r in field_counts if r not in signer_roles)
+                    if orphaned:
                         raise HTTPException(
                             400,
-                            "You placed a signature field for the sender but didn't check "
-                            "\"Also require a signature from your side\" -- either include "
-                            "the sender or remove that field first.",
+                            "These signers have fields placed but aren't on the signer list: "
+                            + ", ".join(f"{r} ({field_counts[r]})" for r in orphaned)
+                            + ". Add them back, or remove their fields first.",
+                        )
+                    # A signer with no field would get a signing link with
+                    # nothing to sign.
+                    fieldless = [s["role"] for s in signer_specs if s["role"] not in field_counts]
+                    if fieldless:
+                        raise HTTPException(
+                            400,
+                            "No signature field is assigned to: " + ", ".join(fieldless)
+                            + ". Highlight a spot for each signer, or take them off the list.",
                         )
                     doc = de.load(gc.file_path)
                     try:
@@ -3244,6 +3342,7 @@ def create_signature_request(
                     file_bytes=prepped_bytes,
                     file_name=f"{gc.name}.docx",
                     submitters=[{"role": s["role"], "email": s["email"], "name": s["name"]} for s in signer_specs],
+                    order=docuseal_order,
                 )
                 if not submitters_resp or not submitters_resp.get("submitters"):
                     raise HTTPException(502, "DocuSeal returned an empty response.")
@@ -3267,7 +3366,11 @@ def create_signature_request(
                 except OSError:
                     pass
 
-        sr = SigningRequest(generated_contract_id=gc.id, docuseal_submission_id=submission_id)
+        sr = SigningRequest(
+            generated_contract_id=gc.id,
+            docuseal_submission_id=submission_id,
+            sign_in_order=sign_in_order,
+        )
         session.add(sr)
         session.commit()
         session.refresh(sr)
@@ -3282,13 +3385,14 @@ def create_signature_request(
         # of the raw string DocuSeal happened to return.
         by_email = {item["email"].strip().lower(): item for item in submitters_list}
         signers = []
-        for spec in signer_specs:
+        for position, spec in enumerate(signer_specs):
             item = by_email.get(spec["email"].strip().lower())
             if not item:
                 continue  # shouldn't happen -- DocuSeal echoes back every submitter we sent
             signer = SigningRequestSigner(
                 signing_request_id=sr.id,
                 docuseal_submitter_id=item["id"],
+                position=position,
                 role=spec["role"],
                 name=spec["name"],
                 email=spec["email"],
@@ -3300,6 +3404,11 @@ def create_signature_request(
         session.commit()
         for signer in signers:
             session.refresh(signer)
+        # In sign-in-order mode only the first signer is emailed now; each
+        # later signer is emailed when the one before them signs (see
+        # _apply_signer_completed).
+        to_email = signers[:1] if sign_in_order else signers
+        for signer in to_email:
             _send_signature_request_email(request, user, gc, signer)
 
         return _signing_request_payload(sr, signers)
@@ -3414,15 +3523,33 @@ def get_sign_status(token: str, session: Session = Depends(get_session)):
     sr = session.get(SigningRequest, signer.signing_request_id)
     gc = session.get(GeneratedContract, sr.generated_contract_id) if sr else None
     owner = session.get(User, gc.owner_id) if gc else None
+    your_turn, waiting_on = _signer_turn_info(session, sr, signer)
     return {
+        "your_turn": your_turn,
+        "waiting_on": waiting_on,
         "document_name": gc.name if gc else "",
         "sender_name": (owner.name.strip() or owner.email) if owner else "",
         "signer_name": signer.name,
         "role": signer.role,
         "status": signer.status,
         "request_status": sr.status if sr else "",
-        "embed_src": signer.embed_src if signer.status != "awaiting_consent" else None,
+        "embed_src": signer.embed_src if signer.status != "awaiting_consent" and your_turn else None,
     }
+
+
+def _signer_turn_info(session: Session, sr, signer):
+    """(your_turn, names of signers still ahead of this one). Always
+    (True, []) unless the request is sign-in-order."""
+    if not sr or not sr.sign_in_order:
+        return True, []
+    all_signers = session.exec(
+        select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
+    ).all()
+    ahead = [
+        s.name for s in sorted(all_signers, key=lambda s: (s.position, s.id or 0))
+        if (s.position, s.id or 0) < (signer.position, signer.id or 0) and s.status != "completed"
+    ]
+    return (not ahead), ahead
 
 
 class SignConsentBody(BaseModel):
@@ -3453,6 +3580,9 @@ def submit_sign_consent(token: str, body: SignConsentBody, session: Session = De
         # archived/expired/declined: a dead signing link that looked live.
         # Checking the parent request's own status here closes that.
         raise HTTPException(400, "This signature request is no longer active, so this link can't be used.")
+    your_turn, waiting_on = _signer_turn_info(session, sr, signer)
+    if not your_turn:
+        raise HTTPException(400, "It isn't your turn to sign yet -- waiting on " + ", ".join(waiting_on) + " to sign first.")
     if not body.consent:
         raise HTTPException(400, "You must agree to continue.")
     if not body.photo or "," not in body.photo:
@@ -3546,6 +3676,13 @@ def _apply_signer_completed(session: Session, submitter_id) -> None:
                     body=f"Waiting on {waiting_on} to sign.",
                     generated_contract_id=gc.id,
                 )
+            # Sign-in-order: it's now the next signer's turn, and this is
+            # the first time they hear about it. (This function returns
+            # early for an already-completed signer, so a duplicate
+            # webhook/refresh can't email them twice.)
+            if sr.sign_in_order and owner:
+                next_up = sorted(still_pending, key=lambda s: (s.position, s.id or 0))[0]
+                _send_signature_request_email(None, owner, gc, next_up)
 
 
 def _apply_signer_declined(session: Session, submitter_id) -> None:
