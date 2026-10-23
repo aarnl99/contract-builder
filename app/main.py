@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import logging
 import base64
 import hashlib
 import shutil
@@ -12,6 +13,16 @@ import httpx
 from collections import Counter
 from datetime import datetime, timedelta, date
 from typing import Optional
+
+_ai_log = logging.getLogger("rotely.ai")
+
+
+def _log_ai_failure(what: str, exc: Exception) -> None:
+    """Says why an AI call failed (error type, status code and message) so it
+    shows up in the server logs. Never logs the key or the user's text."""
+    _ai_log.warning("AI call failed (%s): %s status=%s %s", what, type(exc).__name__,
+                    getattr(exc, "status_code", "-"), str(exc)[:300])
+
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
@@ -1433,7 +1444,8 @@ def draft_from_text(body: DraftFromTextBody, user: User = Depends(get_current_us
         raise HTTPException(429, dfm.LIMIT_MESSAGE.format(limit=ai_usage.MONTHLY_LIMIT))
     try:
         raw = dfm.propose_draft(text, catalog)
-    except Exception:
+    except Exception as e:
+        _log_ai_failure("draft from text", e)
         ai_usage.refund(session, user.id)
         raise HTTPException(502, "The AI couldn't read that just now. Please try again in a minute.")
     if not raw:
@@ -4023,7 +4035,8 @@ def _run_renewal_suggestion(gc_id: int) -> bool:
             return False
         try:
             suggestion = rn.suggest_term(rn.document_text(gc.file_path))
-        except Exception:
+        except Exception as e:
+            _log_ai_failure("renewal term", e)
             return False
         if not suggestion:
             return False
@@ -6046,7 +6059,8 @@ def suggest_redline_counter(edit_id: int, user: User = Depends(get_current_user)
         raise HTTPException(429, ai_usage.LIMIT_MESSAGE.format(limit=ai_usage.MONTHLY_LIMIT))
     try:
         result = adv.suggest_counter(packet)
-    except Exception:
+    except Exception as e:
+        _log_ai_failure("redline advisor", e)
         ai_usage.refund(session, user.id)
         raise HTTPException(502, "The AI couldn't come up with a suggestion just now. Please try again in a minute.")
     if not result:
