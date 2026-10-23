@@ -182,6 +182,40 @@ label.field-label .req { color: var(--danger); }
   padding: 10px 13px; border-radius: var(--radius-sm); font-size: 13px; margin-bottom: 14px;
 }
 
+/* ---------- Photo check: sender's choice, signer capture, evidence ---------- */
+
+.photo-choice-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.photo-choice {
+  display: flex; flex-direction: column; gap: 6px; min-height: 92px; padding: 12px 13px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.photo-choice.selected { border-color: var(--accent); background: var(--accent-soft); }
+.photo-choice-head { display: flex; align-items: center; gap: 8px; }
+.photo-choice-title { font-weight: 600; font-size: 13.5px; color: var(--ink); }
+.photo-choice-desc { font-size: 12.5px; color: var(--muted); line-height: 1.4; }
+@media (max-width: 720px) { .photo-choice-grid { grid-template-columns: 1fr; } }
+
+.evidence-panel {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 14px; margin: -2px 0 10px;
+}
+.evidence-title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; font-weight: 700; color: var(--accent-dark); margin-bottom: 8px; }
+.evidence-row { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; padding: 6px 0; border-top: 1px solid var(--border-soft); font-size: 13px; }
+.evidence-row:first-of-type { border-top: none; }
+.evidence-k { color: var(--muted); }
+.evidence-v { color: var(--ink); word-break: break-word; }
+.evidence-muted { color: var(--muted-soft); font-size: 12.5px; }
+.evidence-photo { display: block; width: 100%; max-width: 180px; height: 120px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 4px; }
+.evidence-note { grid-column: 1 / -1; font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--border-soft); padding-top: 10px; }
+@media (max-width: 720px) { .evidence-panel { grid-template-columns: 1fr; } }
+
+.capture-steps { display: flex; gap: 8px; margin: 0 0 14px; }
+.capture-step { flex: 1; text-align: center; padding: 7px 8px; border-radius: 999px; font-size: 12.5px; font-weight: 600; background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
+.capture-step.active { background: var(--accent-soft); color: var(--accent-dark); border-color: var(--accent-soft-border); }
+.capture-step.done { background: var(--success-soft); color: var(--success); border-color: var(--success-soft-border); }
+.capture-frame { width: 100%; border-radius: 8px; background: #000; }
+
 /* ---------- Cards, tabs ---------- */
 
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; margin-bottom: 16px; box-shadow: var(--shadow-sm); }

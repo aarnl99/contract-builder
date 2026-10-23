@@ -155,97 +155,169 @@ function SigningFormView(status) {
 }
 
 function ConsentView(status) {
+  // What the sender asked for: nothing beyond agreeing, a selfie, or a
+  // selfie plus a photo of the signer's ID. Each photo step happens in
+  // order, then everything is sent in one request.
+  const level = status.photo_check || "none";
+  const steps = level === "selfie_id" ? ["selfie", "id"] : level === "selfie" ? ["selfie"] : [];
+  const STEP_LABEL = { selfie: "Selfie", id: "Photo ID" };
+  const photos = { selfie: null, id: null };
+  let stepIndex = -1; // -1 = still on the agreement
   let stream = null;
-  let capturedDataUrl = null;
+  let pending = null; // photo just taken, not yet accepted
+
+  const sender = status.sender_name || "the sender";
+  const agreeText = {
+    none: "I agree to review and sign this document electronically.",
+    selfie: `Before signing, we'll take a quick selfie. It's stored encrypted alongside this signed document as part of the signing record, and only ${sender} can view it. It isn't used to automatically verify your identity.`,
+    selfie_id: `Before signing, we'll take a quick selfie and a photo of your ID. Both are stored encrypted alongside this signed document as part of the signing record, and only ${sender} can view them. They are not sent to DocuSeal and are not matched automatically.`,
+  }[level];
 
   const consentCheckbox = el("input", { type: "checkbox", id: "consent-checkbox" });
   const errBox = el("div");
-  const video = el("video", { autoplay: "true", playsinline: "true", style: "width:100%;border-radius:8px;background:#000;display:none;" });
+  const stepsBar = el("div", { class: "capture-steps", style: steps.length ? "" : "display:none;" });
+  const hint = el("p", { class: "subtitle", style: "display:none;margin:0 0 10px;" });
+  const video = el("video", { autoplay: "true", playsinline: "true", muted: "true", class: "capture-frame", style: "display:none;" });
   const canvas = el("canvas", { style: "display:none;" });
-  const photoPreview = el("img", { style: "width:100%;border-radius:8px;display:none;" });
-  const startCameraBtn = el("button", { class: "btn block" }, "Agree & continue");
+  const photoPreview = el("img", { class: "capture-frame", style: "display:none;" });
+  const startBtn = el("button", { class: "btn block" }, steps.length ? "Agree & continue" : "Agree & continue to signing");
   const captureBtn = el("button", { class: "btn block", style: "display:none;" }, "Take photo");
   const retakeBtn = el("button", { class: "btn secondary", style: "display:none;" }, "Retake");
-  const confirmBtn = el("button", { class: "btn", style: "display:none;" }, "Confirm & continue to signing");
+  const confirmBtn = el("button", { class: "btn", style: "display:none;" }, "Use this photo");
 
   function showError(msg) {
     errBox.innerHTML = "";
     errBox.appendChild(el("div", { class: "error-box" }, msg));
   }
 
+  function drawSteps() {
+    stepsBar.innerHTML = "";
+    steps.forEach((k, i) => {
+      const cls = "capture-step" + (i < stepIndex || photos[k] ? " done" : i === stepIndex ? " active" : "");
+      stepsBar.appendChild(el("div", { class: cls }, `${i + 1}. ${STEP_LABEL[k]}`));
+    });
+  }
+
+  function stopStream() {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+
   async function startCamera() {
+    errBox.innerHTML = "";
+    const kind = steps[stepIndex];
+    hint.textContent = kind === "id"
+      ? "Hold your ID flat in good light so the text and your photo are readable, then take the photo."
+      : "Look at the camera in good light, then take the photo.";
+    hint.style.display = "block";
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showError("This browser can't access the camera. Try a recent version of Chrome, Safari, or Firefox.");
+      return false;
+    }
+    try {
+      const facing = kind === "id" ? { ideal: "environment" } : "user";
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing }, audio: false });
+      video.srcObject = stream;
+      video.style.display = "block";
+      photoPreview.style.display = "none";
+      captureBtn.style.display = "block";
+      retakeBtn.style.display = "none";
+      confirmBtn.style.display = "none";
+      return true;
+    } catch (e) {
+      showError("Camera access was blocked. You'll need to allow camera access in your browser to continue.");
+      return false;
+    }
+  }
+
+  async function begin() {
     errBox.innerHTML = "";
     if (!consentCheckbox.checked) {
       showError("Please check the box above to continue.");
       return;
     }
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      showError("This browser can't access the camera. Try a recent version of Chrome, Safari, or Firefox.");
+    if (!steps.length) {
+      submitAll();
       return;
     }
-    startCameraBtn.disabled = true;
-    startCameraBtn.textContent = "Requesting camera access...";
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
-      video.srcObject = stream;
-      video.style.display = "block";
-      captureBtn.style.display = "block";
-      startCameraBtn.style.display = "none";
+    startBtn.disabled = true;
+    startBtn.textContent = "Requesting camera access...";
+    stepIndex = 0;
+    drawSteps();
+    const ok = await startCamera();
+    if (ok) {
+      startBtn.style.display = "none";
       consentCheckbox.disabled = true;
-    } catch (e) {
-      showError("Camera access was blocked. You'll need to allow camera access in your browser to continue.");
-      startCameraBtn.disabled = false;
-      startCameraBtn.textContent = "Agree & continue";
+    } else {
+      stepIndex = -1;
+      drawSteps();
+      startBtn.disabled = false;
+      startBtn.textContent = "Agree & continue";
     }
   }
 
   function takePhoto() {
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    capturedDataUrl = canvas.toDataURL("image/jpeg", 0.85);
-    photoPreview.src = capturedDataUrl;
+    const maxSide = 1600;
+    let w = video.videoWidth || 640;
+    let h = video.videoHeight || 480;
+    const scale = Math.min(1, maxSide / Math.max(w, h));
+    canvas.width = Math.round(w * scale);
+    canvas.height = Math.round(h * scale);
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+    pending = canvas.toDataURL("image/jpeg", 0.85);
+    photoPreview.src = pending;
     photoPreview.style.display = "block";
     video.style.display = "none";
     captureBtn.style.display = "none";
     retakeBtn.style.display = "inline-block";
     confirmBtn.style.display = "inline-block";
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop());
+    confirmBtn.textContent = stepIndex < steps.length - 1 ? "Use this photo & continue" : "Confirm & continue to signing";
+    stopStream();
+  }
+
+  async function retake() {
+    pending = null;
+    await startCamera();
+  }
+
+  async function acceptPhoto() {
+    if (!pending) return;
+    photos[steps[stepIndex]] = pending;
+    pending = null;
+    if (stepIndex < steps.length - 1) {
+      stepIndex += 1;
+      drawSteps();
+      await startCamera();
+      return;
     }
+    drawSteps();
+    await submitAll();
   }
 
-  function retake() {
-    capturedDataUrl = null;
-    photoPreview.style.display = "none";
-    retakeBtn.style.display = "none";
-    confirmBtn.style.display = "none";
-    startCamera();
-  }
-
-  async function confirmAndSubmit() {
-    if (!capturedDataUrl) return;
+  async function submitAll() {
     errBox.innerHTML = "";
     confirmBtn.disabled = true;
+    startBtn.disabled = true;
     confirmBtn.textContent = "Submitting...";
     try {
       const result = await api(`/api/sign/${TOKEN}/consent`, {
         method: "POST",
-        body: { consent: true, photo: capturedDataUrl },
+        body: { consent: true, photo: photos.selfie || "", id_photo: photos.id || "" },
       });
+      stopStream();
       render(SigningFormView({ ...status, embed_src: result.embed_src }));
     } catch (e) {
       showError(e.message || "Something went wrong. Try again.");
       confirmBtn.disabled = false;
+      startBtn.disabled = false;
       confirmBtn.textContent = "Confirm & continue to signing";
     }
   }
 
-  startCameraBtn.addEventListener("click", startCamera);
+  startBtn.addEventListener("click", begin);
   captureBtn.addEventListener("click", takePhoto);
   retakeBtn.addEventListener("click", retake);
-  confirmBtn.addEventListener("click", confirmAndSubmit);
+  confirmBtn.addEventListener("click", acceptPhoto);
 
   return el("div", {}, [
     topbar(),
@@ -255,16 +327,16 @@ function ConsentView(status) {
       el("div", { class: "card", style: "background:var(--bg);box-shadow:none;margin-bottom:16px;" }, [
         el("label", { style: "display:flex;gap:10px;align-items:flex-start;cursor:pointer;" }, [
           consentCheckbox,
-          el("span", {}, [
-            "Before signing, we'll take a quick photo of you with your camera. It's stored alongside this signed document as part of the signing record -- it isn't used to verify your identity, just to discourage and record who was present when the document was signed.",
-          ]),
+          el("span", {}, [agreeText]),
         ]),
       ]),
+      stepsBar,
+      hint,
       video,
       canvas,
       photoPreview,
       errBox,
-      el("div", { style: "display:flex;gap:10px;margin-top:8px;" }, [startCameraBtn, captureBtn, retakeBtn, confirmBtn]),
+      el("div", { style: "display:flex;gap:10px;margin-top:8px;" }, [startBtn, captureBtn, retakeBtn, confirmBtn]),
     ]),
   ]);
 }
