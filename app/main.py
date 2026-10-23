@@ -7,6 +7,7 @@ import shutil
 import secrets
 import string
 import threading
+import time
 import httpx
 from collections import Counter
 from datetime import datetime, timedelta
@@ -20,7 +21,7 @@ from sqlmodel import Session, select
 from pydantic import BaseModel
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
-from .db import init_db, get_session, UPLOADS_DIR, DATA_DIR
+from .db import init_db, get_session, engine, UPLOADS_DIR, DATA_DIR
 from .models import (
     User, Template, Placeholder, GeneratedContract, GenerationEvent, PLAN_LIMITS, DEFAULT_PLAN, DOCUMENT_TYPES,
     ShareLink, ShareLinkView, RedlineSubmission, RedlineEdit, RedlineComment, EmailAlias, EmailDraftRequest, Notification,
@@ -121,6 +122,7 @@ def _verify_share_session(token: str, share_link_id: int) -> bool:
 @app.on_event("startup")
 def on_startup():
     init_db()
+    _start_reminder_thread()
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +677,7 @@ def _notification_settings_payload(user: User) -> dict:
         "redline_submitted": user.notify_redline_submitted,
         "redline_comment": user.notify_redline_comment,
         "signature_events": user.notify_signature_events,
+        "auto_remind_signers": user.auto_remind_signers,
     }
 
 
@@ -687,6 +690,7 @@ class NotificationSettingsBody(BaseModel):
     redline_submitted: Optional[bool] = None
     redline_comment: Optional[bool] = None
     signature_events: Optional[bool] = None
+    auto_remind_signers: Optional[bool] = None
 
 
 @app.patch("/api/account/notification-settings")
@@ -709,6 +713,8 @@ def set_notification_settings(
         user.notify_redline_comment = body.redline_comment
     if body.signature_events is not None:
         user.notify_signature_events = body.signature_events
+    if body.auto_remind_signers is not None:
+        user.auto_remind_signers = body.auto_remind_signers
     session.add(user)
     session.commit()
     return _notification_settings_payload(user)
@@ -1709,6 +1715,7 @@ def list_generated(
     rows = session.exec(q.order_by(GeneratedContract.created_at.desc())).all()
     status_by_doc = _document_statuses(session, [g.id for g in rows], owner_id=user.id)
     unresolved_by_doc = _unresolved_counts(session, [g.id for g in rows], owner_id=user.id)
+    signature_by_doc = _document_signature_summaries(session, [g.id for g in rows])
     return [
         {
             "id": g.id,
@@ -1728,6 +1735,9 @@ def list_generated(
             # client response, independent of Phase 2's comment-resolve
             # state.
             "unresolved_count": unresolved_by_doc.get(g.id, 0),
+            # Where the latest signature request stands ("Waiting on Morgan
+            # \u00b7 4 days"), or null when nothing is out for signature.
+            "signature": signature_by_doc.get(g.id),
         }
         for g in rows
     ]
@@ -2760,6 +2770,9 @@ _SIGNATURE_ROLES = ("Client", "Sender")
 
 def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
     ordered, turn = _signer_turns(sr, signers)
+    now = datetime.utcnow()
+    waiting = _waiting_signers(sr, signers)
+    waiting_ids = {w.id for w in waiting}
     return {
         "id": sr.id,
         "status": sr.status,
@@ -2778,6 +2791,14 @@ def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
         # URL to configure.
         "webhook_url": f"{_canonical_base_url()}/api/webhooks/docuseal",
         "sign_in_order": bool(sr.sign_in_order),
+        "waiting_on": [
+            {
+                "name": w.name,
+                "role": w.role,
+                "days": _days_between(_signer_waiting_since(sr, w, signers), now),
+            }
+            for w in waiting
+        ],
         "signers": [
             {
                 "role": s.role,
@@ -2790,6 +2811,10 @@ def _signing_request_payload(sr: SigningRequest, signers: list) -> dict:
                 "consent_given_at": s.consent_given_at.isoformat() if s.consent_given_at else None,
                 "completed_at": s.completed_at.isoformat() if s.completed_at else None,
                 "has_photo": bool(s.photo_path),
+                "waiting_since": _signer_waiting_since(sr, s, signers).isoformat() if s.id in waiting_ids else None,
+                "days_waiting": _days_between(_signer_waiting_since(sr, s, signers), now) if s.id in waiting_ids else None,
+                "reminder_count": s.reminder_count or 0,
+                "last_reminded_at": s.last_reminded_at.isoformat() if s.last_reminded_at else None,
             }
             for s in ordered
         ],
@@ -2809,6 +2834,171 @@ def _signer_turns(sr: SigningRequest, signers: list):
         if s.status != "completed":
             blocked = True
     return ordered, turn
+
+
+# ---- reminders and "waiting on" ------------------------------------------
+# A signer is "waiting" once they've been emailed and it's their turn but they
+# haven't signed or declined. Rotely nudges them automatically on day 3, 6
+# and 9 (MAX_AUTO_REMINDERS), then stops; the owner can also send a reminder
+# by hand any time (at most one per signer every MANUAL_REMINDER_COOLDOWN).
+
+REMINDER_AFTER_DAYS = 3
+MAX_AUTO_REMINDERS = 3
+MANUAL_REMINDER_COOLDOWN = timedelta(hours=12)
+REMINDER_CHECK_SECONDS = 30 * 60
+
+
+def _days_between(start: datetime, end: datetime) -> int:
+    return max(0, (end - start).days)
+
+
+def _waiting_signers(sr: SigningRequest, signers: list) -> list:
+    """Signers who could sign right now but haven't (empty unless the
+    request itself is still pending). In sign-in-order mode that's just the
+    one whose turn it is."""
+    if sr.status != "pending":
+        return []
+    ordered, turn = _signer_turns(sr, signers)
+    return [s for s in ordered if s.status not in ("completed", "declined") and turn.get(s.id, True)]
+
+
+def _signer_waiting_since(sr: SigningRequest, signer: SigningRequestSigner, signers: list) -> datetime:
+    """When this signer was first emailed. Rows from before notified_at
+    existed fall back to when the person before them finished (ordered
+    requests) or when the request was created."""
+    if signer.notified_at:
+        return signer.notified_at
+    if sr.sign_in_order:
+        earlier = [s.completed_at for s in signers if s.position < signer.position and s.completed_at]
+        if earlier:
+            return max(earlier)
+    return sr.created_at
+
+
+def _mark_notified(session: Session, signers: list, when: Optional[datetime] = None) -> None:
+    when = when or datetime.utcnow()
+    for s in signers:
+        s.notified_at = when
+        session.add(s)
+    session.commit()
+
+
+def _send_signature_reminder_email(request: Optional[Request], user: User, gc: GeneratedContract, signer: SigningRequestSigner, days: int) -> bool:
+    """True when the email was actually handed to the mail provider."""
+    sender_name = user.name.strip() or user.email
+    base = _base_url(request) if request is not None else _canonical_base_url()
+    sign_url = f"{base}/sign/{signer.token}"
+    first_name = signer.name.split(" ")[0] if signer.name else "there"
+    when = "today" if days < 1 else ("yesterday" if days == 1 else f"{days} days ago")
+    body = (
+        f"Hi {first_name},\n\n"
+        f'A quick reminder: {sender_name} sent you "{gc.name}" to sign {when} and it is still waiting on you.\n\n'
+        f"Open it here:\n{sign_url}\n\n"
+        "- Rotely"
+    )
+    try:
+        ee.send_email(signer.email, f'Reminder: "{gc.name}" is waiting for your signature', body)
+        return True
+    except RuntimeError:
+        return False  # SENDGRID_API_KEY not configured
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        return False
+
+
+def _send_due_reminders(now: Optional[datetime] = None) -> int:
+    """One pass of the automatic reminder job. Returns how many were sent.
+    Skips owners who turned auto-reminders off, signers already reminded
+    MAX_AUTO_REMINDERS times, and anyone not due yet."""
+    now = now or datetime.utcnow()
+    sent = 0
+    with Session(engine) as session:
+        for sr in session.exec(select(SigningRequest).where(SigningRequest.status == "pending")).all():
+            gc = session.get(GeneratedContract, sr.generated_contract_id)
+            owner = session.get(User, gc.owner_id) if gc else None
+            if not gc or not owner or not owner.auto_remind_signers or getattr(owner, "is_suspended", False):
+                continue
+            signers = session.exec(
+                select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
+            ).all()
+            for s in _waiting_signers(sr, signers):
+                if (s.reminder_count or 0) >= MAX_AUTO_REMINDERS:
+                    continue
+                since = s.last_reminded_at or _signer_waiting_since(sr, s, signers)
+                if now - since < timedelta(days=REMINDER_AFTER_DAYS):
+                    continue
+                days = _days_between(_signer_waiting_since(sr, s, signers), now)
+                if _send_signature_reminder_email(None, owner, gc, s, days):
+                    s.last_reminded_at = now
+                    s.reminder_count = (s.reminder_count or 0) + 1
+                    session.add(s)
+                    session.commit()
+                    sent += 1
+    return sent
+
+
+_reminder_thread_started = False
+
+
+def _start_reminder_thread() -> None:
+    """Background loop for automatic reminders. Sleeps first so a restart
+    never sends a burst, and is skipped when DISABLE_BACKGROUND_JOBS=1."""
+    global _reminder_thread_started
+    if _reminder_thread_started or os.environ.get("DISABLE_BACKGROUND_JOBS") == "1":
+        return
+    _reminder_thread_started = True
+
+    def loop():
+        while True:
+            time.sleep(REMINDER_CHECK_SECONDS)
+            try:
+                _send_due_reminders()
+            except Exception:
+                pass  # never let one bad pass kill the loop
+
+    threading.Thread(target=loop, daemon=True, name="signature-reminders").start()
+
+
+def _document_signature_summaries(session: Session, doc_ids: list) -> dict:
+    """Per document id: where its most recent signature request stands, for
+    the Documents list. Only pending ("Waiting on Morgan, 4 days") and
+    fully signed requests get a tag; cancelled/declined ones show nothing."""
+    if not doc_ids:
+        return {}
+    srs = session.exec(
+        select(SigningRequest)
+        .where(SigningRequest.generated_contract_id.in_(doc_ids))
+        .order_by(SigningRequest.created_at, SigningRequest.id)
+    ).all()
+    latest = {sr.generated_contract_id: sr for sr in srs}
+    if not latest:
+        return {}
+    signers_by_sr: dict = {}
+    for sg in session.exec(
+        select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id.in_([sr.id for sr in latest.values()]))
+    ).all():
+        signers_by_sr.setdefault(sg.signing_request_id, []).append(sg)
+    now = datetime.utcnow()
+    out = {}
+    for doc_id, sr in latest.items():
+        if sr.status == "completed":
+            out[doc_id] = {"state": "completed", "label": "Fully signed", "tone": "final"}
+        elif sr.status == "pending":
+            signers = signers_by_sr.get(sr.id, [])
+            waiting = _waiting_signers(sr, signers)
+            if not waiting:
+                continue
+            days = max(_days_between(_signer_waiting_since(sr, w, signers), now) for w in waiting)
+            first = (waiting[0].name or "signer").split(" ")[0]
+            who = first if len(waiting) == 1 else f"{first} +{len(waiting) - 1}"
+            since = "since today" if days < 1 else ("1 day" if days == 1 else f"{days} days")
+            out[doc_id] = {
+                "state": "pending",
+                "label": f"Waiting on {who} \u00b7 {since}",
+                "tone": "pending" if days < 3 else "overdue",
+                "waiting_on": [w.name for w in waiting],
+                "days": days,
+            }
+    return out
 
 
 def _send_signature_request_email(request: Optional[Request], user: User, gc: GeneratedContract, signer: SigningRequestSigner) -> None:
@@ -3483,6 +3673,7 @@ def create_signature_request(
         to_email = signers[:1] if sign_in_order else signers
         for signer in to_email:
             _send_signature_request_email(request, user, gc, signer)
+        _mark_notified(session, to_email)
 
         return _signing_request_payload(sr, signers)
 
@@ -3558,6 +3749,69 @@ def cancel_signature_request(
     session.add(sr)
     session.commit()
     return {"ok": True}
+
+
+class RemindBody(BaseModel):
+    # Which signer to remind (their 0-based position). Omit to remind
+    # everyone who can sign right now.
+    position: Optional[int] = None
+
+
+@app.post("/api/generated/{generated_id}/signature-request/remind")
+def remind_signers(
+    generated_id: int,
+    request: Request,
+    body: Optional[RemindBody] = None,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Emails a "still waiting on your signature" nudge to the signer(s)
+    whose turn it is. One per signer every 12 hours so it can't be used to
+    spam someone."""
+    gc = _get_owned_generated(session, user, generated_id)
+    sr = session.exec(
+        select(SigningRequest)
+        .where(SigningRequest.generated_contract_id == gc.id, SigningRequest.status == "pending")
+    ).first()
+    if not sr:
+        raise HTTPException(404, "No pending signature request for this document.")
+    signers = session.exec(
+        select(SigningRequestSigner).where(SigningRequestSigner.signing_request_id == sr.id)
+    ).all()
+    waiting = _waiting_signers(sr, signers)
+    position = body.position if body else None
+    if position is not None:
+        target = next((s for s in signers if s.position == position), None)
+        if not target:
+            raise HTTPException(404, "No such signer.")
+        if target.status in ("completed", "declined"):
+            raise HTTPException(400, f"{target.name} has already responded.")
+        if target.id not in {w.id for w in waiting}:
+            raise HTTPException(400, f"It isn't {target.name}'s turn yet. They'll be emailed as soon as the person before them signs.")
+        targets = [target]
+    else:
+        targets = waiting
+    if not targets:
+        raise HTTPException(400, "Nobody is waiting to sign right now.")
+
+    now = datetime.utcnow()
+    due = [s for s in targets if not s.last_reminded_at or now - s.last_reminded_at >= MANUAL_REMINDER_COOLDOWN]
+    if not due:
+        names = ", ".join(s.name for s in targets)
+        raise HTTPException(429, f"You already reminded {names} in the last 12 hours. Give them a little time.")
+
+    reminded = []
+    for s in due:
+        days = _days_between(_signer_waiting_since(sr, s, signers), now)
+        if _send_signature_reminder_email(request, user, gc, s, days):
+            s.last_reminded_at = now
+            s.reminder_count = (s.reminder_count or 0) + 1
+            session.add(s)
+            reminded.append(s.name)
+    session.commit()
+    if not reminded:
+        raise HTTPException(502, "Couldn't send the reminder email. Try again in a moment.")
+    return {"reminded": reminded, **_signing_request_payload(sr, signers)}
 
 
 @app.get("/api/generated/{generated_id}/signature-request/download")
@@ -3756,6 +4010,7 @@ def _apply_signer_completed(session: Session, submitter_id) -> None:
             if sr.sign_in_order and owner:
                 next_up = sorted(still_pending, key=lambda s: (s.position, s.id or 0))[0]
                 _send_signature_request_email(None, owner, gc, next_up)
+                _mark_notified(session, [next_up])
 
 
 def _apply_signer_declined(session: Session, submitter_id) -> None:
