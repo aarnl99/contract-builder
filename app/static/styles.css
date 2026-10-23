@@ -889,3 +889,135 @@ a.link:hover { text-decoration: underline; }
 .esign-cov-chip { font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; background: #dcfce7; color: #166534; }
 .esign-cov-chip.empty { background: #fef3c7; color: #92400e; }
 .info-box { background: #dcfce7; color: #166534; border-radius: var(--radius-sm); padding: 10px 12px; font-size: 13px; margin: 10px 0; }
+
+/* =====================================================================
+   Redesign layer: calmer and cleaner. Soft surfaces and shadows instead of
+   hard borders, near-black primary buttons, purple only for the brand name,
+   the header links and the page you're on. Loaded last so it overrides the
+   rules above without touching them.
+   ===================================================================== */
+
+:root {
+  --ink: #0e1116;
+  --ink-soft: #232833;
+  --muted: #6b7280;
+  --muted-soft: #9aa0ac;
+  --border: #e9e9e5;
+  --border-soft: #f0f0ed;
+  --bg: #f7f7f5;
+  --surface: #eeeeeb;
+  --accent: #4338ca;
+  --accent-dark: #362da3;
+  --accent-soft: #ecebfb;
+  --accent-soft-border: #e3e2f8;
+  --radius: 18px;
+  --radius-sm: 12px;
+  --shadow-sm: 0 1px 2px rgba(14, 17, 22, 0.04), 0 8px 24px rgba(14, 17, 22, 0.03);
+  --shadow-md: 0 2px 4px rgba(14, 17, 22, 0.04), 0 12px 32px rgba(14, 17, 22, 0.07);
+  --shadow-lg: 0 30px 80px rgba(14, 17, 22, 0.28);
+}
+
+h1, h2, .auth-logo .word { letter-spacing: -0.025em; }
+h1 { font-weight: 650; }
+
+/* Header: no rule, pill links, purple for the brand and the active page */
+.topbar { height: 68px; padding: 0 40px; background: var(--bg); border-bottom: none; }
+.brand .word { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; color: var(--ink); }
+.nav-tabs { gap: 4px; }
+.nav-tabs button { padding: 8px 14px; border-radius: 999px; font-weight: 500; color: #5a5f7d; }
+.nav-tabs button:hover { color: var(--accent); background: transparent; }
+.nav-tabs button.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.usage-pill { background: transparent; border: none; padding: 6px 4px; }
+.usage-pill .bar { background: #e6e6e2; }
+.usage-pill .bar .fill { background: var(--ink); }
+.usage-pill.at-limit { background: var(--danger-soft); border: none; padding: 6px 12px; }
+.avatar { background: var(--ink); }
+.notif-bell { background: transparent; border: none; }
+.notif-bell:hover { background: var(--surface); }
+.avatar-dropdown, .notif-dropdown { border: none; border-radius: 16px; box-shadow: var(--shadow-md); }
+.avatar-dropdown .email-row, .notif-dropdown-head, .notif-item, .avatar-dropdown .logout-row { border-color: var(--border-soft); }
+.plan-option.current { background: var(--surface); color: var(--ink); }
+.notif-item.unread { background: var(--bg); }
+
+.main { padding: 40px 40px 80px; }
+
+/* Buttons: solid near-black, no glow */
+.btn { border-radius: var(--radius-sm); padding: 10px 18px; background: var(--ink); color: #fff; border: none; }
+.btn:hover { background: #2a303c; }
+.btn.secondary { background: var(--surface); color: var(--ink); border: none; }
+.btn.secondary:hover { background: #e6e6e2; }
+.btn.danger { background: var(--danger-soft); color: var(--danger); border: none; }
+.btn.danger:hover { background: #fbe4e4; }
+.btn.ghost { background: transparent; color: var(--muted); }
+.btn.ghost:hover { background: var(--surface); color: var(--ink); }
+.btn.small { padding: 7px 13px; border-radius: 10px; }
+
+/* Fields: soft filled, no outline until focus */
+input[type=text], input[type=email], input[type=password], input[type=number], input[type=date], select, textarea {
+  border: none; background: var(--surface); border-radius: var(--radius-sm); padding: 11px 14px;
+}
+input:focus, select:focus, textarea:focus { background: #fff; box-shadow: 0 0 0 2px rgba(14, 17, 22, 0.18); }
+.filter-select { border: none; background: var(--surface); border-radius: 999px; padding: 8px 14px; }
+label.field-label { color: var(--ink); font-weight: 500; }
+
+.error-box, .notice-box, .warn-box { border: none; border-radius: var(--radius-sm); padding: 12px 14px; }
+.notice-box { background: var(--surface); color: var(--ink-soft); }
+.info-box { border-radius: var(--radius-sm); }
+
+/* Cards, rows and folders: float on shadow instead of outline */
+.card, .doc-card, .output-row, .doc-folder { border: none; border-radius: var(--radius); box-shadow: var(--shadow-sm); }
+.card { padding: 24px; }
+.doc-card:hover, .output-row:hover, .doc-folder.open { box-shadow: var(--shadow-md); }
+.output-row { padding: 15px 20px; }
+.output-row:hover { background: #fcfcfb; }
+.doc-card .icon, .folder-icon { background: var(--surface); color: var(--ink); border-radius: 12px; }
+.output-row .file-icon { border-radius: 12px; }
+.type-tag, .output-row .lineage .tag, .folder-sub .tag { background: var(--surface); color: var(--ink-soft); }
+.version-count { background: var(--surface); border: none; }
+.type-group-header .line { background: var(--border-soft); }
+.chain { background: var(--bg); border-top: none; }
+.chain-item:not(:last-child)::before { background: #e6e6e2; }
+.chain-dot { border-width: 1.5px; }
+.chain-dot.applied { border-color: var(--ink); color: var(--ink); background: var(--surface); }
+.doc-folder.open .chevron { color: var(--ink); }
+.chain-actions a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.upload-card { border: 1.5px dashed #dcdcd6; border-radius: var(--radius); background: transparent; }
+.upload-card:hover { border-color: var(--ink); color: var(--ink); background: #fff; }
+
+/* Tabs: pills, no rule */
+.tabs { border-bottom: none; gap: 4px; }
+.tabs button { border-bottom: none; margin-bottom: 0; border-radius: 999px; padding: 8px 16px; font-weight: 500; }
+.tabs button:hover { background: var(--surface); }
+.tabs button.active { background: var(--ink); color: #fff; }
+.tabs button .count { background: var(--surface); }
+.tabs button.active .count { background: rgba(255, 255, 255, 0.2); color: #fff; }
+.auth-tabs button { border-bottom: none; border-radius: 999px; padding: 8px 18px; font-weight: 500; }
+.auth-tabs button.active { background: var(--accent-soft); color: var(--accent); }
+
+/* Modals */
+.modal-overlay { background: rgba(14, 17, 22, 0.45); backdrop-filter: none; }
+.modal { border-radius: 24px; padding: 32px; }
+
+/* Log in / sign up */
+.auth-shell .card { padding: 40px 40px; border-radius: 24px; box-shadow: var(--shadow-md); }
+.auth-logo .word { font-size: 24px; letter-spacing: -0.02em; }
+.auth-divider::before, .auth-divider::after { background: transparent; }
+.auth-divider { text-transform: none; letter-spacing: 0; font-size: 12.5px; justify-content: center; }
+
+/* Send for signature: signer rows are one uniform grid */
+.signer-row { background: var(--bg); border: none; border-radius: 16px; padding: 12px; align-items: center; }
+.signer-num { background: #fff; color: var(--ink); }
+.signer-actions { margin-top: 0; }
+.esign-cov-chip { background: #ddf1e7; color: #17704a; }
+.esign-cov-chip.empty { background: #fbefd6; color: #8a5300; }
+
+/* Status chips: soft tints */
+.badge.ready, .status-tag.final { background: #ddf1e7; color: #17704a; }
+.badge.draft, .status-tag.pending { background: #fbefd6; color: #8a5300; }
+.status-tag.draft { background: var(--surface); color: var(--muted); }
+.auth-logo .word .dot { color: var(--accent); }
+.signer-num { margin-top: 0; }
+.signer-fields { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.5fr) minmax(0, 0.8fr); }
+.modal-actions { align-items: center; }
+.modal-actions .btn { margin-top: 0 !important; }
+@media (max-width: 720px) { .signer-fields { grid-template-columns: 1fr; } }
