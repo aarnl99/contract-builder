@@ -62,6 +62,26 @@ def test_high_stakes_topics_are_flagged(label, orig, prop, topic):
     assert "lawyer" in got["message"] and "legal risk" in got["message"]
 
 
+@pytest.mark.parametrize("orig,prop", [
+    ("limited liability company", "S Corp"),
+    ("Limited Liability Company", "C corporation"),
+    ("Delaware limited-liability company", "Delaware corporation"),
+    ("limited liability partnership", "general partnership"),
+    ("limited liability limited partnership", "sole proprietor"),
+    ("S Corp", "limited liability company"),
+])
+def test_a_business_type_is_not_a_liability_clause(orig, prop):
+    assert risk(label="Entity type", original=orig, proposed=prop) is None
+    assert risk(label="Entity type", original=orig, proposed=prop, comment="we changed our structure") is None
+
+
+def test_real_liability_is_still_flagged_next_to_an_entity_name():
+    got = risk(label="Section 9", original="Acme, a limited liability company, has capped liability",
+               proposed="Acme, a limited liability company, has unlimited liability", free_text=True)
+    assert got and "liability" in got["topics"]
+    assert risk(label="Limitation of liability", original="limited liability company", proposed="S Corp") is not None
+
+
 def test_topic_in_the_clients_note_counts():
     assert risk(comment="we need unlimited liability here") is not None
 
@@ -368,3 +388,11 @@ def test_summarize_changes_without_a_key_raises(monkeypatch):
     monkeypatch.setattr(adv.ee, "ANTHROPIC_API_KEY", "")
     with pytest.raises(RuntimeError):
         adv.summarize_changes(packet_for(SPECS[:1]))
+
+
+def test_changing_the_business_type_gets_an_ai_counter_not_a_lawyer_note(ai):
+    eid, _ = make_edit(ai, label="Entity type", original="limited liability company", proposed="S Corp")
+    got = ai.post(f"/api/redline-edits/{eid}/suggest-counter").json()
+    assert got["suggestion"]["counter_value"] == "Net 45" and "lawyer_flag" not in got
+    assert len(ai.counter_calls) == 1 and used(ai) == 1
+    assert edits_in_payload(ai)[eid]["risk"] is None
