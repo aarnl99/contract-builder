@@ -33,6 +33,8 @@ from . import redline_engine as rl
 from . import email_engine as ee
 from . import docuseal_engine as ds
 from . import renewals as rn
+from . import advisor as adv
+from . import ai_usage
 from . import rate_limit as ratelimit
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -5718,6 +5720,92 @@ def _get_client_edit(session: Session, link: ShareLink, edit_id: int) -> Redline
     if not edit or not submission or submission.share_link_id != link.id:
         raise HTTPException(404, "That redline no longer exists.")
     return edit
+
+
+@app.get("/api/ai-usage")
+def get_ai_usage(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """This month's AI suggestion allowance for the signed-in account."""
+    return ai_usage.status(session, user.id)
+
+
+def _negotiation_history(session: Session, gc: GeneratedContract, edit: RedlineEdit) -> list:
+    """Every earlier redline on the same term (same field, or same label for
+    free-text edits) anywhere in this document's lineage, oldest first."""
+    link_ids = [
+        l.id for l in session.exec(
+            select(ShareLink).where(ShareLink.generated_contract_id.in_(_lineage_doc_ids(gc, session)))
+        ).all()
+    ]
+    if not link_ids:
+        return []
+    subs = {
+        s.id: s for s in session.exec(
+            select(RedlineSubmission).where(RedlineSubmission.share_link_id.in_(link_ids), RedlineSubmission.status != "draft")
+        ).all()
+    }
+    if not subs:
+        return []
+    rows = session.exec(
+        select(RedlineEdit).where(RedlineEdit.submission_id.in_(list(subs)), RedlineEdit.id < edit.id).order_by(RedlineEdit.id)
+    ).all()
+    out = []
+    for e in rows:
+        same = (edit.field_key and e.field_key == edit.field_key) or (not edit.field_key and e.label == edit.label)
+        if not same:
+            continue
+        origin = subs[e.submission_id].origin
+        out.append({
+            "proposed_value": e.proposed_value, "decision": e.decision, "counter_value": e.counter_value,
+            "from_owner": origin in ("owner_edit", "owner_reconsideration"),
+        })
+    return out
+
+
+@app.post("/api/redline-edits/{edit_id}/suggest-counter")
+def suggest_redline_counter(edit_id: int, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """AI suggestion for how to counter one redline. Facts are worked out in
+    code (advisor.build_packet); the model only proposes a value and a short
+    reason. Nothing is sent or saved on the redline: the owner edits the
+    suggestion and decides. Counts against the account's monthly allowance
+    (ai_usage), returned in `usage`; a failed model call is refunded."""
+    edit = _get_owned_edit(session, user, edit_id)
+    submission = session.get(RedlineSubmission, edit.submission_id)
+    if submission.origin == "owner_edit":
+        raise HTTPException(400, "That change is your own proposal, so there's nothing to counter.")
+    if not ee.ANTHROPIC_API_KEY:
+        raise HTTPException(503, "AI suggestions aren't switched on for this site yet.")
+    link = session.get(ShareLink, submission.share_link_id)
+    gc = session.get(GeneratedContract, link.generated_contract_id)
+    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    ph = next((p for p in tpl.placeholders if p.field_key == edit.field_key), None) if tpl and edit.field_key else None
+    threshold_desc = rl.describe_threshold(ph.threshold_type, ph.threshold_config) if ph else None
+    inside = None
+    if ph and ph.threshold_type in ("numeric_range", "approved_list"):
+        inside = edit.evaluation == "auto_approved"
+    comments = session.exec(select(RedlineComment).where(RedlineComment.edit_id == edit.id).order_by(RedlineComment.created_at)).all()
+    packet = adv.build_packet(
+        document_name=gc.name, document_type=gc.document_type, label=edit.label,
+        original=edit.original_value, proposed=edit.proposed_value, client_comment=edit.comment,
+        threshold_desc=threshold_desc, inside_threshold=inside,
+        history=_negotiation_history(session, gc, edit),
+        thread=[_comment_payload(c) for c in comments],
+    )
+    if not ai_usage.reserve(session, user.id):
+        raise HTTPException(429, ai_usage.LIMIT_MESSAGE.format(limit=ai_usage.MONTHLY_LIMIT))
+    try:
+        result = adv.suggest_counter(packet)
+    except Exception:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't come up with a suggestion just now. Please try again in a minute.")
+    if not result:
+        ai_usage.refund(session, user.id)
+        raise HTTPException(502, "The AI couldn't come up with a suggestion just now. Please try again in a minute.")
+    return {
+        "suggestion": result,
+        "facts": packet["arithmetic"],
+        "usage": ai_usage.status(session, user.id),
+        "disclaimer": "AI suggestion, not legal advice.",
+    }
 
 
 class ReconsiderBody(BaseModel):

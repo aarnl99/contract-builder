@@ -2313,9 +2313,50 @@ async function openRedlinesModal(generatedId) {
             rejectBtn.addEventListener("click", () => setStage("rejected"));
             counterBtn.addEventListener("click", () => setStage("countered"));
             acceptBtn.addEventListener("click", () => setStage("accepted"));
-            actions = el("div", { class: "decision-row" }, [
-              el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn]),
-              counterInput,
+            // AI counter advisor: facts are computed server-side and the
+            // model only proposes a value plus a short reason. The result is
+            // an editable draft; nothing is sent until "Send response".
+            const adviceBox = el("div", { class: "advisor-box", style: "display:none;" });
+            const adviceBtn = el("button", { class: "btn secondary small advisor-btn" }, "Suggest a counter");
+            adviceBtn.addEventListener("click", async () => {
+              adviceBtn.disabled = true;
+              adviceBtn.textContent = "Thinking...";
+              adviceBox.style.display = "none";
+              try {
+                const res = await api(`/api/redline-edits/${edit.id}/suggest-counter`, { method: "POST" });
+                const sug = res.suggestion;
+                const input = el("input", { type: "text", value: sug.counter_value, "aria-label": "Suggested counter" });
+                const useBtn = el("button", { class: "btn small" }, "Use as my counter");
+                useBtn.addEventListener("click", () => {
+                  if (stage.decision !== "countered") setStage("countered");
+                  counterInput.value = input.value;
+                  stage.counter_value = input.value;
+                  counterInput.focus();
+                });
+                adviceBox.innerHTML = "";
+                adviceBox.appendChild(el("div", { class: "advisor-tag" }, "AI suggestion, not legal advice"));
+                adviceBox.appendChild(input);
+                if (sug.reasoning) adviceBox.appendChild(el("div", { class: "advisor-why" }, sug.reasoning));
+                adviceBox.appendChild(el("div", { class: "advisor-foot" }, [
+                  useBtn,
+                  el("span", { class: "advisor-left" }, `${res.usage.remaining} of ${res.usage.limit} AI suggestions left this month`),
+                ]));
+                adviceBox.style.display = "";
+              } catch (e) {
+                adviceBox.innerHTML = "";
+                adviceBox.appendChild(el("div", { class: "advisor-why" }, e.message));
+                adviceBox.style.display = "";
+              }
+              adviceBtn.disabled = false;
+              adviceBtn.textContent = "Suggest a counter";
+            });
+            actions = el("div", { class: "decision-col" }, [
+              el("div", { class: "decision-row" }, [
+                el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn]),
+                counterInput,
+              ]),
+              adviceBtn,
+              adviceBox,
             ]);
           }
 
