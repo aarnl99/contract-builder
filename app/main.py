@@ -212,7 +212,7 @@ def _send_verification_email(request: Request, user: User) -> None:
     )
     try:
         ee.send_email(user.email, "Confirm your email for Rotely", body)
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass  # SENDGRID_API_KEY not configured yet -- account still exists, just no email goes out
 
 
@@ -379,7 +379,7 @@ def _send_reset_email(request: Request, user: User) -> None:
     )
     try:
         ee.send_email(user.email, "Reset your Rotely password", body)
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass  # SENDGRID_API_KEY not configured yet -- the token still works if they already have the link some other way
 
 
@@ -2534,7 +2534,7 @@ def _send_share_created_email(request: Request, user: User, gc: GeneratedContrac
             link.client_email, f'{sender_name} shared "{gc.name}" with you for review', body,
             reply_to=(link.sender_email.strip() or user.email),
         )
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass  # SENDGRID_API_KEY not configured yet -- the link still works, just wasn't emailed
 
 
@@ -6612,7 +6612,7 @@ def _send_missing_info_reply(req: EmailDraftRequest, alias: Optional[EmailAlias]
         )
     try:
         ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body, reply_to=reply_to)
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass  # SENDGRID_API_KEY not configured yet -- request is still recorded, just no email goes out
 
 
@@ -6625,7 +6625,7 @@ def _send_no_such_template_email(req: EmailDraftRequest):
     )
     try:
         ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body)
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass
 
 
@@ -6638,7 +6638,7 @@ def _send_plan_limit_email(user: User, req: EmailDraftRequest):
     )
     try:
         ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body)
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass
 
 
@@ -6664,7 +6664,7 @@ def _send_redlines_submitted_notification(owner: User, gc: GeneratedContract, li
             owner.email, f'New redlines on "{gc.name}"', body,
             reply_to=(link.client_email.strip() or None),
         )
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass  # SENDGRID_API_KEY not configured yet -- the submission is still recorded, just no email goes out
 
 
@@ -6708,7 +6708,7 @@ def _send_ready_notification(user: User, gc: GeneratedContract, file_path: str):
         attachments = None
     try:
         ee.send_email(user.email, f"Your draft is ready: {gc.name}", body, attachments=attachments)
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass
 
 
@@ -7055,7 +7055,7 @@ def admin_reset_password(
     try:
         ee.send_email(target.email, "Your Rotely password was reset", body)
         emailed = True
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError):
         pass  # SENDGRID_API_KEY not configured -- admin still gets the password below to relay manually
 
     return {"ok": True, "emailed": emailed, "temporary_password": new_password}
