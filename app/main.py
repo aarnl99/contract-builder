@@ -2511,7 +2511,7 @@ def _source_summaries_by_id(session: Session, source_ids: list) -> dict:
     }
 
 
-def _send_share_created_email(request: Request, user: User, gc: GeneratedContract, link: ShareLink) -> None:
+def _send_share_created_email(request: Request, user: User, gc: GeneratedContract, link: ShareLink) -> bool:
     """Lets the client know a document is waiting for them the moment a
     NEW share link is created (never re-sent on later visits to the Share
     modal -- see create_share_link, this only runs on the branch that
@@ -2535,8 +2535,9 @@ def _send_share_created_email(request: Request, user: User, gc: GeneratedContrac
             link.client_email, f'{sender_name} shared "{gc.name}" with you for review', body,
             reply_to=(link.sender_email.strip() or user.email),
         )
+        return True
     except (RuntimeError, httpx.HTTPError):
-        pass  # SENDGRID_API_KEY not configured yet -- the link still works, just wasn't emailed
+        return False  # no provider key, or the provider refused -- the link still works, just wasn't emailed
 
 
 def _send_reconsideration_email(
@@ -6593,14 +6594,38 @@ def regenerate_email_alias(user: User = Depends(get_current_user), session: Sess
     return {"address": ee.alias_address(alias.company_slug, alias.number)}
 
 
-def _send_missing_info_reply(req: EmailDraftRequest, alias: Optional[EmailAlias], missing_labels: list, no_template: bool):
-    reply_to = ee.continuation_address(alias.company_slug, alias.number, req.id) if alias else None
+def _send_reply(to_address: str, subject: str, body: str, reply_to: Optional[str] = None, attachments=None) -> bool:
+    """Sends one of the drafting-by-email replies. A failure is logged (so it
+    shows up in the server logs) instead of vanishing; the request itself is
+    already recorded either way."""
+    try:
+        ee.send_email(to_address, subject, body, reply_to=reply_to, attachments=attachments)
+        return True
+    except (RuntimeError, httpx.HTTPError) as exc:
+        logging.getLogger("rotely.inbound").warning("could not send reply to %s (%s): %s", to_address, subject, exc)
+        return False
+
+
+def _reply_subject(req: EmailDraftRequest) -> str:
+    return f"Re: {req.subject or 'Your draft request'}"
+
+
+def _continuation_for(alias: Optional[EmailAlias], req: EmailDraftRequest) -> Optional[str]:
+    return ee.continuation_address(alias.company_slug, alias.number, req.id) if alias else None
+
+
+def _send_missing_info_reply(req: EmailDraftRequest, alias: Optional[EmailAlias], missing_labels: list, no_template: bool, template_names: Optional[list] = None):
+    reply_to = _continuation_for(alias, req)
     if no_template:
+        options = ""
+        if template_names:
+            options = "Your ready master documents are:\n\n" + "\n".join(f"- {n}" for n in template_names) + "\n\n"
         body = (
             "Hi,\n\n"
             "I couldn't tell which master document you want drafted. Reply to this email with the document "
             "name or type somewhere in the subject line (for example, Subject: \"Draft: Freelance Services "
             "Agreement\") and I'll pick it up from there.\n\n"
+            + options +
             "- Rotely"
         )
     else:
@@ -6611,10 +6636,7 @@ def _send_missing_info_reply(req: EmailDraftRequest, alias: Optional[EmailAlias]
             "Just reply to this email with those details and I'll generate it right away.\n\n"
             "- Rotely"
         )
-    try:
-        ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body, reply_to=reply_to)
-    except (RuntimeError, httpx.HTTPError):
-        pass  # SENDGRID_API_KEY not configured yet -- request is still recorded, just no email goes out
+    _send_reply(req.from_address, _reply_subject(req), body, reply_to=reply_to)
 
 
 def _send_no_such_template_email(req: EmailDraftRequest):
@@ -6624,10 +6646,7 @@ def _send_no_such_template_email(req: EmailDraftRequest):
         "Reply with the exact document name or document type and I'll try again.\n\n"
         "- Rotely"
     )
-    try:
-        ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body)
-    except (RuntimeError, httpx.HTTPError):
-        pass
+    _send_reply(req.from_address, _reply_subject(req), body)
 
 
 def _send_plan_limit_email(user: User, req: EmailDraftRequest):
@@ -6637,10 +6656,7 @@ def _send_plan_limit_email(user: User, req: EmailDraftRequest):
         "Upgrade your plan from your account menu in Rotely and reply to this email to try again.\n\n"
         "- Rotely"
     )
-    try:
-        ee.send_email(req.from_address, f"Re: {req.subject or 'Your draft request'}", body)
-    except (RuntimeError, httpx.HTTPError):
-        pass
+    _send_reply(req.from_address, _reply_subject(req), body)
 
 
 def _send_redlines_submitted_notification(owner: User, gc: GeneratedContract, link: ShareLink, edit_count: int, note: str):
@@ -6692,10 +6708,16 @@ def _notify(session: Session, user_id: int, type_: str, title: str, body: str = 
     session.commit()
 
 
-def _send_ready_notification(user: User, gc: GeneratedContract, file_path: str):
+def _send_ready_notification(user: User, gc: GeneratedContract, file_path: str, alias: Optional[EmailAlias] = None, req: Optional[EmailDraftRequest] = None):
+    """The finished first draft goes to the account owner (never straight to
+    a client). Replying with the client's name and email is how the owner
+    approves sending it: see _process_recipient_reply."""
     body = (
-        f'Hi,\n\nYour draft "{gc.name}" is ready and saved in your Rotely documents library. '
-        "It's attached here as well.\n\n- Rotely"
+        f'Hi,\n\nHere is your first draft: "{gc.name}". It is attached, and it is saved in your Rotely documents library.\n\n'
+        "If you're ready to send it to your client, just reply to this email with their first and last name "
+        "and their email address (for example: Tiffany Xia, tiffany@example.com). We'll email them a secure "
+        "link to review it, along with the access code.\n\n"
+        "Nothing is sent to anyone until you reply.\n\n- Rotely"
     )
     attachments = None
     try:
@@ -6707,10 +6729,8 @@ def _send_ready_notification(user: User, gc: GeneratedContract, file_path: str):
             }]
     except OSError:
         attachments = None
-    try:
-        ee.send_email(user.email, f"Your draft is ready: {gc.name}", body, attachments=attachments)
-    except (RuntimeError, httpx.HTTPError):
-        pass
+    _send_reply(user.email, f"Your draft is ready: {gc.name}", body,
+                reply_to=_continuation_for(alias, req) if req is not None else None, attachments=attachments)
 
 
 def _process_draft_request(session: Session, user: User, req: EmailDraftRequest, subject: str, body_text: str):
@@ -6724,7 +6744,7 @@ def _process_draft_request(session: Session, user: User, req: EmailDraftRequest,
             req.status = "awaiting_template"
             session.add(req)
             session.commit()
-            _send_missing_info_reply(req, alias, [], no_template=True)
+            _send_missing_info_reply(req, alias, [], no_template=True, template_names=sorted(c["name"] for c in candidates if c["name"]))
             return
         req.template_id = match["id"]
 
@@ -6798,7 +6818,7 @@ def _process_draft_request(session: Session, user: User, req: EmailDraftRequest,
         session.add(gc)
         session.flush()
         _log_generation_event(session, user.id, gc.id)
-        req.status = "done"
+        req.status = "awaiting_recipient"
         session.add(req)
         session.commit()
         session.refresh(gc)
@@ -6806,7 +6826,7 @@ def _process_draft_request(session: Session, user: User, req: EmailDraftRequest,
         session.add(req)
         session.commit()
 
-    _send_ready_notification(user, gc, out_path)
+    _send_ready_notification(user, gc, out_path, alias, req)
 
 
 @app.post("/api/email/inbound/{webhook_secret}")
@@ -6848,17 +6868,21 @@ async def inbound_email(webhook_secret: str, request: Request, session: Session 
             logging.getLogger("rotely.inbound").warning("could not read received email: %s", exc)
             raise HTTPException(502, "Could not read the received email yet.")
         body_text = (full.get("text") or "") or ee.html_to_text(full.get("html") or "")
-        return _handle_inbound_email(session, ", ".join(recipients), from_header, subject, body_text)
+        return _handle_inbound_email(session, request, ", ".join(recipients), from_header, subject, body_text,
+                                     full.get("authentication"))
 
     form = await request.form()
     to_header = str(form.get("to", "") or form.get("envelope", ""))
     from_header = str(form.get("from", ""))
     subject = str(form.get("subject", ""))
     body_text = str(form.get("text", "") or "")
-    return _handle_inbound_email(session, to_header, from_header, subject, body_text)
+    # SendGrid reports DKIM as text like "{@example.com : pass}".
+    authentication = {"dkim": "pass" if "pass" in str(form.get("dkim", "")).lower() else "fail"}
+    return _handle_inbound_email(session, request, to_header, from_header, subject, body_text, authentication)
 
 
-def _handle_inbound_email(session: Session, to_header: str, from_header: str, subject: str, body_text: str) -> dict:
+def _handle_inbound_email(session: Session, request: Request, to_header: str, from_header: str, subject: str,
+                          body_text: str, authentication=None) -> dict:
     parsed = ee.parse_alias(to_header)
     if not parsed:
         return {"ok": False, "reason": "no matching drafting alias in the To: address"}
@@ -6875,12 +6899,48 @@ def _handle_inbound_email(session: Session, to_header: str, from_header: str, su
         return {"ok": False, "reason": "account not found"}
 
     from_address = _extract_email_address(from_header)
+    authenticated = ee.sender_is_authenticated(authentication)
+    log = logging.getLogger("rotely.inbound")
+
+    # Drafting by email belongs to the account owner alone: a colleague with
+    # a forwarded copy of the address needs their own account (and plan).
+    if from_address.strip().lower() != (user.email or "").strip().lower():
+        log.warning("inbound email from %s to account %s refused: not the account owner", from_address, user.id)
+        if authenticated and from_address:
+            # Only answer senders the mail server vouches for, so a forged
+            # From line can't make us write to a stranger.
+            _send_reply(
+                from_address, f"Re: {subject or 'Your request'}",
+                "Hi,\n\nThis address only accepts email from the person who owns the Rotely account it belongs to, "
+                "so I couldn't act on your message.\n\nTo draft contracts by email yourself, create your own account "
+                "at " + _base_url(request) + " and use the drafting address shown there.\n\n- Rotely",
+            )
+        return {"ok": False, "reason": "sender is not the account owner"}
+    if not authenticated:
+        log.warning("inbound email to account %s refused: sender could not be verified", user.id)
+        _send_reply(
+            user.email, f"Re: {subject or 'Your request'}",
+            "Hi,\n\nI couldn't verify that this email really came from you, so I didn't act on it. "
+            "Please send it again from your usual email account.\n\n- Rotely",
+        )
+        return {"ok": False, "reason": "sender could not be verified"}
 
     req = None
     if parsed["continue_request_id"]:
         candidate = session.get(EmailDraftRequest, parsed["continue_request_id"])
-        if candidate and candidate.user_id == user.id and candidate.status in ("awaiting_template", "awaiting_info"):
-            req = candidate
+        if candidate and candidate.user_id == user.id:
+            if candidate.status in ("awaiting_template", "awaiting_info"):
+                req = candidate
+            elif candidate.status == "awaiting_recipient":
+                _process_recipient_reply(session, request, user, alias, candidate, body_text)
+                return {"ok": True}
+            elif candidate.status == "sent":
+                _send_reply(
+                    user.email, _reply_subject(candidate),
+                    "Hi,\n\nThis draft was already sent for review, so I didn't send it again. To send it to someone "
+                    "else, open the document in Rotely and use Share for review.\n\n- Rotely",
+                )
+                return {"ok": True}
     if req is None:
         req = EmailDraftRequest(user_id=user.id, from_address=from_address, subject=subject, status="awaiting_template")
         session.add(req)
@@ -6889,6 +6949,68 @@ def _handle_inbound_email(session: Session, to_header: str, from_header: str, su
 
     _process_draft_request(session, user, req, subject, body_text)
     return {"ok": True}
+
+
+def _process_recipient_reply(session: Session, request: Request, user: User, alias: Optional[EmailAlias],
+                             req: EmailDraftRequest, body_text: str) -> None:
+    """The owner's answer to "your first draft is ready": the client's name
+    and email. That reply is the approval to send, so, once all three are
+    clearly there, the client gets the secure review link and access code."""
+    reply_to = _continuation_for(alias, req)
+    subject = _reply_subject(req)
+    gc = session.get(GeneratedContract, req.generated_contract_id) if req.generated_contract_id else None
+    if not gc:
+        _send_reply(user.email, subject, "Hi,\n\nI couldn't find that draft any more, so nothing was sent.\n\n- Rotely")
+        return
+
+    found = ee.parse_recipient(ee.strip_quoted_reply(body_text), exclude=[user.email])
+    missing = [label for label, key in (("their first name", "first_name"), ("their last name", "last_name"),
+                                         ("their email address", "email")) if not found[key]]
+    if found["email"] and not _EMAIL_ADDR_RE.fullmatch(found["email"]):
+        missing = [m for m in missing if m != "their email address"] + ["a valid email address"]
+    if missing:
+        lines = "\n".join(f"- {m}" for m in missing)
+        _send_reply(
+            user.email, subject,
+            f"Hi,\n\nBefore I send this to your client I still need:\n\n{lines}\n\n"
+            "Reply with their first and last name and their email, for example: Tiffany Xia, tiffany@example.com\n\n- Rotely",
+            reply_to=reply_to,
+        )
+        return
+
+    who = f"{found['first_name']} {found['last_name']}"
+    existing = _find_open_share_link(session, gc)
+    if existing:
+        req.status = "sent"
+        req.updated_at = datetime.utcnow()
+        session.add(req)
+        session.commit()
+        _send_reply(
+            user.email, subject,
+            f"Hi,\n\nThis document already has an open review link (for {existing.client_email}), so I didn't "
+            "send another. To resend it or change who it goes to, open it in Rotely and use Share for review.\n\n- Rotely",
+        )
+        return
+
+    link = ShareLink(
+        generated_contract_id=gc.id, token=secrets.token_urlsafe(16), access_code=_generate_access_code(),
+        client_email=found["email"][:200], client_first_name=found["first_name"][:100],
+        client_last_name=found["last_name"][:100], sender_email="",
+    )
+    session.add(link)
+    req.status = "sent"
+    req.updated_at = datetime.utcnow()
+    session.add(req)
+    session.commit()
+    session.refresh(link)
+    if _send_share_created_email(request, user, gc, link):
+        text = (f"Hi,\n\nSent. {who} ({found['email']}) now has an email with a secure link to review "
+                f'"{gc.name}" and the access code.\n\nIf that isn\'t the right person, open the document in Rotely and '
+                "use Share for review to change it.\n\n- Rotely")
+    else:
+        text = (f"Hi,\n\nThe review link for {who} ({found['email']}) is ready, but I couldn't email it just now. "
+                f'Open "{gc.name}" in Rotely and use Share for review to resend it or copy the link and access code.\n\n- Rotely')
+    _send_reply(user.email, subject, text)
 
 
 # ---------------------------------------------------------------------------
