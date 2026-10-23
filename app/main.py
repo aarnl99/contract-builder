@@ -6561,8 +6561,15 @@ _EMAIL_ADDR_RE = re.compile(r"[\w\.\+\-]+@[\w\-]+\.[\w\.\-]+")
 
 
 def _extract_email_address(header_value: str) -> str:
-    m = _EMAIL_ADDR_RE.search(header_value or "")
-    return m.group(0) if m else (header_value or "").strip()
+    """The real address in a From/To header. The address inside <...> wins:
+    a display name can contain any text, including someone else's email
+    ("aaron@gmail.com" <attacker@evil.test> is attacker@evil.test)."""
+    value = header_value or ""
+    for candidate in reversed(re.findall(r"<([^<>]+)>", value)):
+        if _EMAIL_ADDR_RE.fullmatch(candidate.strip()):
+            return candidate.strip()
+    m = _EMAIL_ADDR_RE.search(value)
+    return m.group(0) if m else value.strip()
 
 
 def _get_or_create_alias(session: Session, user: User) -> EmailAlias:
@@ -7004,6 +7011,10 @@ def _process_recipient_reply(session: Session, request: Request, user: User, ali
     session.commit()
     session.refresh(link)
     if _send_share_created_email(request, user, gc, link):
+        if hasattr(link, "emailed_at"):  # recorded so the Share screen can say the client was emailed
+            link.emailed_at = datetime.utcnow()
+            session.add(link)
+            session.commit()
         text = (f"Hi,\n\nSent. {who} ({found['email']}) now has an email with a secure link to review "
                 f'"{gc.name}" and the access code.\n\nIf that isn\'t the right person, open the document in Rotely and '
                 "use Share for review to change it.\n\n- Rotely")
