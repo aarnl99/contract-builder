@@ -137,13 +137,15 @@ def propose_draft(text: str, catalog: list) -> dict:
         max_tokens=1200,
         system=SYSTEM,
         tools=[tool],
-        tool_choice={"type": "tool", "name": "record_draft"},
+        # Newer models reject a forced tool choice, so ask for the tool in the prompt.
+        tool_choice={"type": "auto"},
         messages=[
             {
                 "role": "user",
                 "content": (
                     "<master_documents>\n" + json.dumps(catalog, ensure_ascii=False, indent=1) + "\n</master_documents>\n\n"
-                    "<pasted_text>\n" + text + "\n</pasted_text>"
+                    "<pasted_text>\n" + text + "\n</pasted_text>\n\n"
+                    "Answer only by calling the record_draft tool."
                 ),
             }
         ],
