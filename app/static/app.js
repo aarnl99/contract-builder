@@ -1401,10 +1401,9 @@ function openUploadForSignatureModal(onDone) {
 // ---------------------------------------------------------------------------
 // E-signature: send a finished document out through DocuSeal for signing.
 // Mirrors openShareModal's shape (intake form -> created-state view) but for
-// /api/generated/{id}/signature-request instead of /share. See the
-// e-signature design notes for why this is scoped to exactly two roles
-// ("Client", always, and "Sender", the account owner's own business,
-// optional) rather than an arbitrary signer list.
+// /api/generated/{id}/signature-request instead of /share. Any number of
+// signers (up to 10), each with a role label the owner types (Client, CEO,
+// CFO...), optionally signing in order.
 // ---------------------------------------------------------------------------
 
 async function openSignatureModal(generatedId) {
@@ -1421,7 +1420,7 @@ async function openSignatureModal(generatedId) {
 
   function renderStatusView(sr) {
     body.innerHTML = "";
-    body.appendChild(el("p", { class: "subtitle" }, "Sent through DocuSeal. Each signer first agrees to a quick photo step on Rotely's own page before reaching the actual signing form."));
+    body.appendChild(el("p", { class: "subtitle" }, "Sent through DocuSeal. Each signer first agrees to a quick photo step on Rotely's own page before reaching the actual signing form." + (sr.sign_in_order ? " Signers sign in the order listed -- each one is emailed when the person before them has signed." : "")));
     // Bug tracker #55: nothing told the owner that a signature request only
     // ever updates itself automatically if DocuSeal's webhook is actually
     // configured -- without it, this modal could sit on "Pending" forever
@@ -1439,16 +1438,33 @@ async function openSignatureModal(generatedId) {
         ])
       );
     }
+    // The request's own state, front and centre -- a cancelled, declined or
+    // expired request used to look just like a live one (signers still
+    // "Awaiting consent" with links), with no way to start over.
+    const ended = ["cancelled", "declined", "expired"].includes(sr.status);
+    const banner = {
+      cancelled: "This request was cancelled. Nobody can sign it anymore.",
+      declined: "A signer declined, so this request was stopped. Nobody can sign it anymore.",
+      expired: "This request expired. Nobody can sign it anymore.",
+      completed: "Everyone has signed.",
+    }[sr.status];
+    if (banner) body.appendChild(el("div", { class: ended ? "warn-box" : "info-box" }, banner));
     const list = el("div", { class: "share-info-box" });
     sr.signers.forEach((s) => {
       const linkUrl = `${location.origin}${s.sign_url}`;
+      const live = sr.status === "pending";
+      const notSigned = ended && s.status !== "completed" && s.status !== "declined";
       list.appendChild(
         el("div", { class: "row" }, [
           el("div", { style: "min-width:0;" }, [
-            el("div", { class: "k" }, `${s.name} (${s.role})`),
-            el("div", { class: "v" }, `${statusLabel(s.status)}${s.status === "awaiting_consent" || s.status === "ready_to_sign" ? " -- " + linkUrl : ""}`),
+            el("div", { class: "k" }, `${sr.sign_in_order ? (s.position + 1) + ". " : ""}${s.name} (${s.role})`),
+            el("div", { class: "v" }, notSigned
+              ? "Didn't sign"
+              : live && s.status !== "completed" && s.status !== "declined" && sr.sign_in_order && s.your_turn === false
+                ? "Waiting for the signer(s) before them"
+                : `${statusLabel(s.status)}${live && (s.status === "awaiting_consent" || s.status === "ready_to_sign") ? " -- " + linkUrl : ""}`),
           ]),
-          s.status !== "completed" ? el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(linkUrl, e.currentTarget) }, "Copy link") : null,
+          live && s.status !== "completed" ? el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(linkUrl, e.currentTarget) }, "Copy link") : null,
         ])
       );
     });
@@ -1494,7 +1510,9 @@ async function openSignatureModal(generatedId) {
               btn.disabled = true;
               try {
                 await api(`/api/generated/${generatedId}/signature-request/cancel`, { method: "POST" });
-                overlay.remove();
+                // Stay in the modal on the cancelled state, where "Send again"
+                // is one click away.
+                renderStatusView(await api(`/api/generated/${generatedId}/signature-request`));
               } catch (err) {
                 btn.disabled = false;
                 alert(err.message);
@@ -1510,6 +1528,20 @@ async function openSignatureModal(generatedId) {
         el("a", { class: "btn", href: `/api/generated/${generatedId}/signature-request/download` }, "Download signed document")
       );
     }
+    if (ended) {
+      // Start over on the same document: the people and roles come back
+      // prefilled (change anyone's name/email), and any signature fields
+      // already placed are kept.
+      actions.push(
+        el("button", {
+          class: "btn",
+          onclick: () => renderIntakeForm({
+            signers: sr.signers.map((s) => ({ name: s.name, email: s.email, role: s.role })),
+            sign_in_order: !!sr.sign_in_order,
+          }),
+        }, "Send again")
+      );
+    }
     actions.push(el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Close"));
     body.appendChild(el("div", { class: "modal-actions" }, actions));
   }
@@ -1522,7 +1554,7 @@ async function openSignatureModal(generatedId) {
   // GeneratedContract (see main.py's place_signature_field); the DocuSeal
   // text tags are only spliced into a throwaway copy at send time.
 
-  // identities: { client_name, client_email, include_sender, sender_name, sender_email }
+  // identities: { signers: [{name, email, role}], sign_in_order }
   // collected by renderIntakeForm below, passed through unchanged once the
   // owner clicks "Continue to send" here -- this step only ever places
   // fields, it doesn't re-collect who's signing.
@@ -1561,6 +1593,13 @@ async function openSignatureModal(generatedId) {
 
     function renderFieldList() {
       fieldListWrap.innerHTML = "";
+      // Per-signer coverage, so it's obvious who still has nowhere to sign.
+      fieldListWrap.appendChild(
+        el("div", { class: "esign-coverage" }, identities.signers.map((s) => {
+          const n = currentFields.filter((f) => f.role === s.role).length;
+          return el("span", { class: "esign-cov-chip" + (n ? "" : " empty"), title: s.name }, `${s.role}: ${n ? n + " field" + (n > 1 ? "s" : "") : "no field yet"}`);
+        }))
+      );
       if (!currentFields.length) {
         fieldListWrap.appendChild(el("p", { class: "subtitle" }, "No fields placed yet."));
         return;
@@ -1633,10 +1672,7 @@ async function openSignatureModal(generatedId) {
       const overlay2 = el("div", { class: "modal-overlay" });
       const inner = el("div", { class: "modal", style: "width:440px;" });
       const errBox2 = el("div", {});
-      const roleSelect = el("select", {}, [
-        el("option", { value: "Client" }, `Client (${identities.client_name})`),
-        identities.include_sender ? el("option", { value: "Sender" }, `Sender (${identities.sender_name || "you"})`) : null,
-      ]);
+      const roleSelect = el("select", {}, identities.signers.map((s) => el("option", { value: s.role }, `${s.role} (${s.name})`)));
       const typeSelect = el("select", {}, [
         el("option", { value: "signature" }, "Signature"),
         el("option", { value: "initials" }, "Initials"),
@@ -1687,15 +1723,7 @@ async function openSignatureModal(generatedId) {
       continueBtn.disabled = true;
       continueBtn.textContent = "Sending...";
       try {
-        const reqBody = {
-          client_name: identities.client_name,
-          client_email: identities.client_email,
-          include_sender: identities.include_sender,
-        };
-        if (identities.include_sender) {
-          reqBody.sender_name = identities.sender_name;
-          reqBody.sender_email = identities.sender_email;
-        }
+        const reqBody = { signers: identities.signers, sign_in_order: identities.sign_in_order };
         const sr = await api(`/api/generated/${generatedId}/signature-request`, { method: "POST", body: reqBody });
         renderStatusView(sr);
       } catch (err) {
@@ -1706,7 +1734,7 @@ async function openSignatureModal(generatedId) {
     });
     body.appendChild(
       el("div", { class: "modal-actions" }, [
-        el("button", { class: "btn secondary", onclick: () => { toolbar.remove(); renderIntakeForm(); } }, "Back"),
+        el("button", { class: "btn secondary", onclick: () => { toolbar.remove(); renderIntakeForm(identities); } }, "Back"),
         continueBtn,
       ])
     );
@@ -1714,7 +1742,7 @@ async function openSignatureModal(generatedId) {
     await reloadPreview();
   }
 
-  async function renderIntakeForm() {
+  async function renderIntakeForm(prev) {
     body.innerHTML = "";
     const errBox = el("div", {});
 
@@ -1722,8 +1750,7 @@ async function openSignatureModal(generatedId) {
     // client's name and email were already collected at that step -- just
     // in a different shape (first/last split there vs. one combined name
     // field here). Prefill from it instead of asking again from scratch.
-    // Best-effort: any failure here just leaves the fields blank, exactly
-    // like before this existed.
+    // Best-effort: any failure here just leaves the fields blank.
     let shareInfo = { exists: false };
     try {
       shareInfo = await api(`/api/generated/${generatedId}/share-link`);
@@ -1734,57 +1761,145 @@ async function openSignatureModal(generatedId) {
       ? [shareInfo.client_first_name, shareInfo.client_last_name].filter(Boolean).join(" ")
       : "";
 
-    const nameInput = el("input", { type: "text", placeholder: "Jamie Rivera" });
-    nameInput.value = prefillName;
-    const emailInput = el("input", { type: "email", placeholder: "client@company.com" });
-    emailInput.value = (shareInfo.exists && shareInfo.client_email) || "";
-    const includeSender = el("input", { type: "checkbox" });
-    const senderNameInput = el("input", { type: "text", placeholder: "Your name or business", style: "display:none;margin-top:8px;" });
-    // Defaults to the account's own identity (or this document's share-link
-    // sender override, if one was set) instead of a blank field every time
-    // -- the owner's own name/email is never actually new information, so
-    // there's nothing to type unless they want to show something different.
-    senderNameInput.value = (shareInfo.exists && shareInfo.sender_email ? "" : state.user.name) || "";
-    const senderEmailInput = el("input", { type: "email", placeholder: "you@company.com", style: "display:none;margin-top:8px;" });
-    senderEmailInput.value = (shareInfo.exists && shareInfo.sender_email) || state.user.email || "";
-    includeSender.addEventListener("change", () => {
-      senderNameInput.style.display = includeSender.checked ? "block" : "none";
-      senderEmailInput.style.display = includeSender.checked ? "block" : "none";
+    // Fields already placed on this document (from an earlier pass through
+    // the next step). A signer who has fields can't be removed or have
+    // their role renamed -- those fields would point at nobody -- so we
+    // load them up front to lock those rows. Best-effort like the above.
+    let placedFields = [];
+    try {
+      placedFields = (await api(`/api/generated/${generatedId}/esign-preview`)).fields || [];
+    } catch (e) {
+      // no fields known -> nothing locked; the server still checks at send
+    }
+    const fieldCount = (role) => placedFields.filter((f) => f.role === role).length;
+
+    const MAX_SIGNERS = 10;
+    const ROLE_RE = /^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,39}$/;
+    const rows = []; // { nameInput, emailInput, roleInput, lockedRole }
+    const listWrap = el("div", { class: "signer-list" });
+    const addRowBtn = el("button", { class: "btn secondary small", type: "button" }, "+ Add signer");
+    const addMeBtn = el("button", { class: "btn secondary small", type: "button" }, "+ Add me");
+    const orderInput = el("input", { type: "checkbox" });
+    const orderWrap = el("div", { class: "form-row", style: "margin-top:12px;display:none;" }, [
+      el("label", { style: "display:flex;gap:8px;align-items:center;cursor:pointer;" }, [orderInput, "Signers must sign in this order (top to bottom)"]),
+      el("p", { class: "subtitle", style: "margin:2px 0 0;" }, "Each person is emailed only after the one above them has signed. Leave unchecked to email everyone at once."),
+    ]);
+
+    function uniqueRole(base) {
+      const taken = new Set(rows.map((r) => r.roleInput.value.trim().toLowerCase()));
+      if (!taken.has(base.toLowerCase())) return base;
+      let n = 2;
+      while (taken.has(`${base} ${n}`.toLowerCase())) n++;
+      return `${base} ${n}`;
+    }
+
+    function addRow(data = {}) {
+      const nameInput = el("input", { type: "text", placeholder: "Full name" });
+      nameInput.value = data.name || "";
+      const emailInput = el("input", { type: "email", placeholder: "email@company.com" });
+      emailInput.value = data.email || "";
+      const roleInput = el("input", { type: "text", placeholder: "Role (CEO, CFO, Client...)", maxlength: "40" });
+      roleInput.value = data.role || "";
+      const n = fieldCount(data.role || "");
+      const row = { nameInput, emailInput, roleInput, lockedRole: n > 0 ? data.role : null };
+      if (row.lockedRole) {
+        roleInput.readOnly = true;
+        roleInput.title = `${n} signature field${n > 1 ? "s are" : " is"} placed for this role, so it can't be renamed. Remove those fields first.`;
+      }
+      rows.push(row);
+      renderRows();
+    }
+
+    function renderRows() {
+      listWrap.innerHTML = "";
+      rows.forEach((row, i) => {
+        const up = el("button", { class: "btn secondary small", type: "button", title: "Move up" }, "▲");
+        const down = el("button", { class: "btn secondary small", type: "button", title: "Move down" }, "▼");
+        const rm = el("button", { class: "btn secondary small", type: "button", title: "Remove this signer" }, "Remove");
+        up.disabled = i === 0;
+        down.disabled = i === rows.length - 1;
+        up.addEventListener("click", () => { [rows[i - 1], rows[i]] = [rows[i], rows[i - 1]]; renderRows(); });
+        down.addEventListener("click", () => { [rows[i + 1], rows[i]] = [rows[i], rows[i + 1]]; renderRows(); });
+        rm.addEventListener("click", () => {
+          errBox.innerHTML = "";
+          if (row.lockedRole) {
+            const c = fieldCount(row.lockedRole);
+            errBox.appendChild(el("div", { class: "error-box" },
+              `${row.lockedRole} still has ${c} signature field${c > 1 ? "s" : ""} placed. Remove ${c > 1 ? "those fields" : "that field"} in the next step (Next → Remove) before taking this signer off the list.`));
+            return;
+          }
+          rows.splice(i, 1);
+          renderRows();
+        });
+        listWrap.appendChild(
+          el("div", { class: "signer-row" }, [
+            el("div", { class: "signer-num" }, String(i + 1)),
+            el("div", { class: "signer-fields" }, [row.nameInput, row.emailInput, row.roleInput]),
+            el("div", { class: "signer-actions" }, [up, down, rows.length > 1 ? rm : null]),
+          ])
+        );
+      });
+      addRowBtn.style.display = rows.length >= MAX_SIGNERS ? "none" : "";
+      const meTaken = rows.some((r) => r.emailInput.value.trim().toLowerCase() === (state.user.email || "").toLowerCase());
+      addMeBtn.style.display = rows.length >= MAX_SIGNERS || meTaken ? "none" : "";
+      orderWrap.style.display = rows.length >= 2 ? "block" : "none";
+    }
+
+    addRowBtn.addEventListener("click", () => addRow({}));
+    addMeBtn.addEventListener("click", () => addRow({ name: state.user.name || "", email: state.user.email || "", role: uniqueRole("Sender") }));
+
+    // Initial rows: what was entered before if we came back from the next
+    // step; otherwise the client (prefilled from a share link if any).
+    // Roles that already have fields placed always get a row, so those
+    // fields can't be left pointing at nobody.
+    if (prev && prev.signers && prev.signers.length) {
+      prev.signers.forEach((s) => addRow(s));
+      orderInput.checked = !!prev.sign_in_order;
+    } else {
+      addRow({ name: prefillName, email: (shareInfo.exists && shareInfo.client_email) || "", role: "Client" });
+    }
+    const have = new Set(rows.map((r) => r.roleInput.value.trim()));
+    [...new Set(placedFields.map((f) => f.role))].forEach((role) => {
+      if (!have.has(role)) addRow({ name: "", email: "", role });
     });
 
     body.appendChild(
       el("div", { class: "form-row" }, [
-        el("label", { class: "field-label" }, "Client's name and email"),
-        shareInfo.exists
-          ? el("p", { class: "subtitle", style: "margin:2px 0 6px;" }, "Filled in from this document's share link -- change it if a different person is signing.")
-          : null,
-        nameInput,
-        emailInput,
+        el("label", { class: "field-label" }, "Who needs to sign?"),
+        el("p", { class: "subtitle", style: "margin:2px 0 8px;" }, shareInfo.exists
+          ? "The first signer is filled in from this document's share link. Add everyone else who needs to sign (your CEO, CFO, a co-signer...) with a role label for each."
+          : "Add everyone who needs to sign, with a role label for each (Client, CEO, CFO...). You'll choose where each person signs on the next step."),
+        listWrap,
+        el("div", { style: "display:flex;gap:8px;margin-top:8px;" }, [addRowBtn, addMeBtn]),
       ])
     );
-    body.appendChild(
-      el("div", { class: "form-row", style: "margin-top:14px;" }, [
-        el("label", { style: "display:flex;gap:8px;align-items:center;cursor:pointer;" }, [includeSender, "Also require a signature from your side"]),
-        el("p", { class: "subtitle", style: "margin:2px 0 6px;" }, "Defaults to your own account's name and email -- edit below only if you want to show something else."),
-        senderNameInput,
-        senderEmailInput,
-      ])
-    );
+    body.appendChild(orderWrap);
+    renderRows();
     body.appendChild(errBox);
+
     const nextBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Next: place signature fields");
     nextBtn.addEventListener("click", () => {
       errBox.innerHTML = "";
-      const name = nameInput.value.trim(), email = emailInput.value.trim();
-      if (!name || !email) {
-        errBox.appendChild(el("div", { class: "error-box" }, "Enter the client's name and email."));
-        return;
+      const fail = (msg) => errBox.appendChild(el("div", { class: "error-box" }, msg));
+      const signers = rows.map((r) => ({
+        name: r.nameInput.value.trim(),
+        email: r.emailInput.value.trim(),
+        role: r.roleInput.value.trim().replace(/\s+/g, " "),
+      }));
+      if (!signers.length) return fail("Add at least one signer.");
+      for (let i = 0; i < signers.length; i++) {
+        const s = signers[i];
+        if (!s.name || !s.email || !s.role) return fail(`Signer ${i + 1} needs a name, an email and a role.`);
+        if (!ROLE_RE.test(s.role)) return fail(`Signer ${i + 1}'s role can use letters, numbers, spaces, hyphens, underscores and periods (up to 40 characters).`);
       }
-      const identities = { client_name: name, client_email: email, include_sender: includeSender.checked };
-      if (includeSender.checked) {
-        identities.sender_name = senderNameInput.value.trim();
-        identities.sender_email = senderEmailInput.value.trim();
+      const emails = new Set(), roles = new Set();
+      for (const s of signers) {
+        if (emails.has(s.email.toLowerCase())) return fail(`${s.email} is on the list twice -- each signer needs their own email address.`);
+        if (roles.has(s.role.toLowerCase())) return fail(`Two signers have the role "${s.role}" -- give each one their own label (for example Client 1 and Client 2).`);
+        emails.add(s.email.toLowerCase());
+        roles.add(s.role.toLowerCase());
       }
-      renderFieldPlacer(identities);
+      renderFieldPlacer({ signers, sign_in_order: orderInput.checked && signers.length > 1 });
     });
     body.appendChild(
       el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), nextBtn])
