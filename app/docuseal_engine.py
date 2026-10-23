@@ -74,18 +74,20 @@ def _headers() -> dict:
 
 def create_submission_from_docx(
     *, name: str, file_bytes: bytes, file_name: str, submitters: List[Dict],
-    variables: Optional[Dict] = None,
+    variables: Optional[Dict] = None, order: str = "preserved",
 ) -> dict:
     """submitters: list of {"role", "email", "name", "external_id"}.
-    `order` is left at DocuSeal's default ("preserved"), so a second signer
-    only gets access once the first has completed -- the normal shape for a
-    two-party contract. Returns the parsed JSON submission response: a
+    `order` is "preserved" (each signer only gets access once the one
+    before them in `submitters` has completed) or "random" (everyone can
+    sign at once) -- always sent explicitly now that the owner chooses.
+    Returns the parsed JSON submission response: a
     single object with top-level "id" (the submission id) plus a nested
     "submitters" list, each entry its own record with "id"/"email"/
     "slug"/"embed_src" etc. -- NOT a bare list of submitter records."""
     payload = {
         "name": name,
         "send_email": False,
+        "order": "preserved" if order == "preserved" else "random",
         "documents": [{"name": file_name, "file": base64.b64encode(file_bytes).decode("ascii")}],
         "submitters": [
             {
@@ -140,7 +142,7 @@ def mint_builder_token(*, template_id: int, name: str) -> str:
     return _pyjwt.encode(payload, DOCUSEAL_API_KEY, algorithm="HS256")
 
 
-def create_submission_from_template(*, template_id: int, submitters: List[Dict]) -> list:
+def create_submission_from_template(*, template_id: int, submitters: List[Dict], order: str = "preserved") -> list:
     """POST /submissions against a template whose fields were already
     placed through the builder (see create_template_from_docx) -- NOT
     /submissions/docx. submitters: list of {"role", "email", "name",
@@ -157,6 +159,7 @@ def create_submission_from_template(*, template_id: int, submitters: List[Dict])
     payload = {
         "template_id": template_id,
         "send_email": False,
+        "order": "preserved" if order == "preserved" else "random",
         "submitters": [
             {
                 "role": s["role"],
