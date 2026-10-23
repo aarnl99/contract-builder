@@ -27,6 +27,7 @@ def _log_ai_failure(what: str, exc: Exception) -> None:
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 from sqlmodel import Session, select
 from pydantic import BaseModel
@@ -6810,20 +6811,54 @@ def _process_draft_request(session: Session, user: User, req: EmailDraftRequest,
 
 @app.post("/api/email/inbound/{webhook_secret}")
 async def inbound_email(webhook_secret: str, request: Request, session: Session = Depends(get_session)):
-    """Target for SendGrid's Inbound Parse webhook (configured to POST
-    parsed fields, not raw MIME). The path secret stands in for signature
-    verification -- keep it out of source control in real deployments (set
-    it via the INBOUND_WEBHOOK_SECRET env var and use that exact value when
-    configuring the SendGrid route)."""
+    """Target for inbound mail to a drafting address. Accepts either Resend's
+    "email.received" webhook (JSON, metadata only -- the body is fetched
+    from Resend's API) or SendGrid's Inbound Parse (parsed form fields). The
+    path secret stands in for verification of the sender -- keep it out of
+    source control: set it via the INBOUND_WEBHOOK_SECRET env var and use
+    that exact value in the webhook URL. Resend requests are also checked
+    against their signature whenever RESEND_WEBHOOK_SECRET is set."""
     if not INBOUND_WEBHOOK_SECRET or not secrets.compare_digest(webhook_secret, INBOUND_WEBHOOK_SECRET):
         raise HTTPException(404)
+
+    if (request.headers.get("content-type") or "").lower().startswith("application/json"):
+        raw = await request.body()
+        if ee.RESEND_WEBHOOK_SECRET and not ee.verify_resend_signature(
+            ee.RESEND_WEBHOOK_SECRET,
+            request.headers.get("svix-id", ""),
+            request.headers.get("svix-timestamp", ""),
+            request.headers.get("svix-signature", ""),
+            raw,
+        ):
+            raise HTTPException(401, "Bad webhook signature.")
+        try:
+            payload = json.loads(raw or b"{}")
+        except ValueError:
+            raise HTTPException(400, "Body isn't valid JSON.")
+        if payload.get("type") != "email.received":
+            return {"ok": True, "ignored": payload.get("type", "unknown event")}
+        data = payload.get("data") or {}
+        recipients = list(data.get("to") or []) + list(data.get("received_for") or [])
+        from_header = str(data.get("from", ""))
+        subject = str(data.get("subject", ""))
+        try:
+            full = await run_in_threadpool(ee.fetch_received_email, str(data.get("email_id", "")))
+        except (RuntimeError, httpx.HTTPError) as exc:
+            # A non-2xx tells Resend to retry later instead of losing the email.
+            logging.getLogger("rotely.inbound").warning("could not read received email: %s", exc)
+            raise HTTPException(502, "Could not read the received email yet.")
+        body_text = (full.get("text") or "") or ee.html_to_text(full.get("html") or "")
+        return _handle_inbound_email(session, ", ".join(recipients), from_header, subject, body_text)
 
     form = await request.form()
     to_header = str(form.get("to", "") or form.get("envelope", ""))
     from_header = str(form.get("from", ""))
     subject = str(form.get("subject", ""))
     body_text = str(form.get("text", "") or "")
+    return _handle_inbound_email(session, to_header, from_header, subject, body_text)
 
+
+def _handle_inbound_email(session: Session, to_header: str, from_header: str, subject: str, body_text: str) -> dict:
     parsed = ee.parse_alias(to_header)
     if not parsed:
         return {"ok": False, "reason": "no matching drafting alias in the To: address"}
