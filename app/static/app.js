@@ -2209,6 +2209,57 @@ async function openRedlinesModal(generatedId) {
         if (awaitingResponse && !staged[sub.id]) staged[sub.id] = {};
         const subStage = staged[sub.id] || {};
 
+        // A round with several undecided changes gets a plain-English
+        // summary: which are routine, which need a look, and which are worth
+        // a lawyer's eye (that last part is decided in code, not by the AI).
+        if (awaitingResponse && sub.origin !== "owner_reconsideration" && sub.origin !== "owner_edit" && undecidedCount >= 3) {
+          const sumBox = el("div", { class: "summary-box", style: "display:none;" });
+          const sumBtn = el("button", { class: "btn secondary small advisor-btn" }, `Summarize these ${undecidedCount} changes`);
+          sumBtn.addEventListener("click", async () => {
+            sumBtn.disabled = true;
+            sumBtn.textContent = "Reading...";
+            sumBox.style.display = "none";
+            try {
+              const res = await api(`/api/redline-submissions/${sub.id}/summary`, { method: "POST" });
+              const sm = res.summary;
+              const bits = [];
+              if (sm.counts.routine) bits.push(`${sm.counts.routine} routine`);
+              if (sm.counts.review) bits.push(`${sm.counts.review} to review`);
+              if (sm.counts.lawyer) bits.push(`${sm.counts.lawyer} worth a lawyer's eye`);
+              const labels = { routine: "Routine", review: "Review", lawyer: "Lawyer's eye" };
+              sumBox.innerHTML = "";
+              sumBox.appendChild(el("div", { class: "advisor-tag" }, "AI summary"));
+              sumBox.appendChild(el("div", { class: "summary-counts" }, bits.join(" · ")));
+              if (sm.overview) sumBox.appendChild(el("div", { class: "advisor-why" }, sm.overview));
+              sm.items.forEach((it) => {
+                sumBox.appendChild(
+                  el("div", { class: "summary-row" }, [
+                    el("span", { class: "level-badge level-" + it.level }, labels[it.level] || it.level),
+                    el("div", {}, [
+                      el("div", { class: "summary-term" }, it.term),
+                      el("div", { class: "advisor-why" }, it.meaning),
+                    ]),
+                  ])
+                );
+              });
+              if (sm.left_out) sumBox.appendChild(el("div", { class: "advisor-left" }, `${sm.left_out} more change${sm.left_out === 1 ? "" : "s"} not shown here. Review them below.`));
+              sumBox.appendChild(el("div", { class: "advisor-foot" }, [
+                el("span", { class: "advisor-left" }, res.disclaimer),
+                el("span", { class: "advisor-left" }, `${res.usage.remaining} of ${res.usage.limit} AI suggestions left this month`),
+              ]));
+              sumBox.style.display = "";
+            } catch (e) {
+              sumBox.innerHTML = "";
+              sumBox.appendChild(el("div", { class: "advisor-why" }, e.message));
+              sumBox.style.display = "";
+            }
+            sumBtn.disabled = false;
+            sumBtn.textContent = `Summarize these ${undecidedCount} changes`;
+          });
+          subBox.appendChild(el("div", { style: "margin:0 0 10px;" }, [sumBtn]));
+          subBox.appendChild(sumBox);
+        }
+
         sub.edits.forEach((edit) => {
           const already = edit.decision !== "pending"; // already decided server-side (from a prior response)
           const thresholdLines = [];
@@ -2382,9 +2433,10 @@ async function openRedlinesModal(generatedId) {
                   counterInput.focus();
                 });
                 adviceBox.innerHTML = "";
-                adviceBox.appendChild(el("div", { class: "advisor-tag" }, "AI suggestion, not legal advice"));
+                adviceBox.appendChild(el("div", { class: "advisor-tag" }, "AI suggestion"));
                 adviceBox.appendChild(input);
                 if (sug.reasoning) adviceBox.appendChild(el("div", { class: "advisor-why" }, sug.reasoning));
+                adviceBox.appendChild(el("div", { class: "advisor-left" }, res.disclaimer || "AI suggestion. Not legal advice."));
                 adviceBox.appendChild(el("div", { class: "advisor-foot" }, [
                   useBtn,
                   el("span", { class: "advisor-left" }, `${res.usage.remaining} of ${res.usage.limit} AI suggestions left this month`),
@@ -2398,13 +2450,22 @@ async function openRedlinesModal(generatedId) {
               adviceBtn.disabled = false;
               adviceBtn.textContent = "Suggest a counter";
             });
+            // A change that touches liability, ownership, termination and the
+            // like gets a plain note instead of an AI counter (decided in
+            // code on the server, see advisor.clause_risk).
+            const lawyerNote = edit.risk
+              ? el("div", { class: "lawyer-note" }, [
+                  el("div", { class: "advisor-tag lawyer-tag" }, "Worth a lawyer's eye"),
+                  el("div", { class: "advisor-why" }, edit.risk.message),
+                ])
+              : null;
             actions = el("div", { class: "decision-col" }, [
               el("div", { class: "decision-row" }, [
                 el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn]),
                 counterInput,
               ]),
-              adviceBtn,
-              adviceBox,
+              lawyerNote || adviceBtn,
+              lawyerNote ? null : adviceBox,
             ]);
           }
 
