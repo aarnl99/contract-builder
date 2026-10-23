@@ -204,3 +204,40 @@ def test_a_forged_owner_address_cannot_send_anything_to_a_client(flow):
 def test_unknown_subject_reply_lists_the_available_documents(flow):
     send_in(flow, flow.owner_email, "something unrelated", "hello")
     assert "- NDA" in flow.mail[0]["body"]
+
+
+# --- found in QA ------------------------------------------------------------
+
+def test_display_name_cannot_pose_as_the_owner(flow):
+    # the part inside <...> is the real sender, whatever the display name says
+    spoof = f'"{flow.owner_email}" <attacker@evil.test>'
+    r = send_in(flow, spoof, "Please draft an NDA", "Client Acme, term 12 months")
+    assert r.json()["ok"] is False and pending_request(flow) is None
+    assert m._extract_email_address(spoof) == "attacker@evil.test"
+    assert m._extract_email_address("Boss <boss@acme.test>") == "boss@acme.test"
+    assert m._extract_email_address("boss@acme.test") == "boss@acme.test"
+
+
+def test_the_example_address_in_our_own_email_is_never_used_as_the_client(flow):
+    req = make_draft(flow)
+    flow.mail.clear()
+    quoted = ("Tiffany Xia\n\nFrom: Rotely <notifications@userotely.com>\nSent: today\n"
+              "reply with ... (for example: Tiffany Xia, tiffany@example.com)")
+    send_in(flow, flow.owner_email, "Re: x", quoted, to=continuation(flow, req.id))
+    assert "tiffany@example.com" not in [x["to"] for x in flow.mail]
+    assert [x["to"] for x in flow.mail] == [flow.owner_email] and "email address" in flow.mail[0]["body"]
+    assert ee.parse_recipient("Tiffany Xia tiffany@example.com")["email"] == ""
+
+
+def test_quoted_html_replies_are_not_read_as_the_new_message():
+    html = "<p>Tiffany Xia, tiffany@virio.ai</p><blockquote>reply with (for example: Jo Bo, jo@other.io)</blockquote>"
+    assert "jo@other.io" not in ee.html_to_text(html)
+
+
+def test_share_screen_knows_the_reply_flow_emailed_the_client(flow):
+    if not hasattr(ShareLink, "emailed_at"):
+        pytest.skip("emailed_at arrives with the Share screen update")
+    req = make_draft(flow)
+    send_in(flow, flow.owner_email, "Re: x", "Tiffany Xia, tiffany@virio.ai", to=continuation(flow, req.id))
+    info = flow.post(f"/api/generated/{req.generated_contract_id}/share").json()
+    assert info["emailed_at"]

@@ -221,6 +221,9 @@ _FILLER = re.compile(
     r"\b(send|it|this|to|the|client|is|name|email|e-mail|address|contact|please|their|his|her|and|with|for|"
     r"full|first|last|you|can|go|ahead|share|draft|contract|they|are|his|hers)\b", re.IGNORECASE)
 _ANY_EMAIL = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
+# Addresses that are examples or placeholders, never a real client (our own
+# emails use tiffany@example.com as the sample to follow).
+_PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net", ".test", ".invalid", ".example")
 
 
 def strip_quoted_reply(text: str) -> str:
@@ -236,6 +239,8 @@ def strip_quoted_reply(text: str) -> str:
         if re.match(r"(?i)^on .+", s) and ("wrote:" in s.lower() or "wrote:" in nxt.lower()):
             break
         if re.match(r"(?i)^-{2,}\s*(original|forwarded) message", s) or re.match(r"^_{5,}$", s):
+            break
+        if re.match(r"(?i)^from:\s.*[@<]", s):  # Outlook-style quoted header block
             break
         out.append(line)
     return "\n".join(out).strip()
@@ -270,7 +275,8 @@ def parse_recipient(text: str, exclude=()) -> dict:
         body.append(line)
     text = "\n".join(body)
     emails = [e for e in _ANY_EMAIL.findall(text)
-              if e.lower() not in skip and not e.lower().endswith("@" + EMAIL_DOMAIN.lower())]
+              if e.lower() not in skip and not e.lower().endswith("@" + EMAIL_DOMAIN.lower())
+              and not any(e.lower().endswith(d) or e.lower().endswith("@" + d) for d in _PLACEHOLDER_DOMAINS)]
     email = emails[0] if emails else ""
     first = last = ""
     fm = re.search(r"first\s*name\s*[:=\-]\s*([^\n,;]+)", text, re.IGNORECASE)
@@ -291,7 +297,7 @@ def parse_recipient(text: str, exclude=()) -> dict:
 def html_to_text(html: str) -> str:
     """Plain text from an HTML-only email, good enough to read field values from."""
     import html as htmllib
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", html or "")
+    text = re.sub(r"(?is)<(script|style|blockquote).*?</\1>", " ", html or "")  # quoted replies are not the new message
     text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n", text)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     text = htmllib.unescape(text)
