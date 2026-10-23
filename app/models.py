@@ -85,6 +85,10 @@ class User(SQLModel, table=True):
     # to email-only with no bell and no way to opt out, and a decline
     # notified no one at all; see bug tracker entries on both.
     notify_signature_events: bool = True
+    # Automatic "still waiting on your signature" emails to signers who
+    # haven't signed (day 3, 6 and 9 after they were emailed). The owner can
+    # always send one by hand regardless of this setting.
+    auto_remind_signers: bool = True
 
     templates: List["Template"] = Relationship(back_populates="owner")
     generated_contracts: List["GeneratedContract"] = Relationship(back_populates="owner")
@@ -554,6 +558,15 @@ class SigningRequestSigner(SQLModel, table=True):
     photo_path: str = ""  # relative-to-UPLOADS_DIR path to the captured consent photo
     photo_captured_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    # When this signer was first emailed their link (in sign-in-order mode
+    # that's when the person before them signed, not when the request was
+    # created). Drives "Waiting on Morgan, 4 days" and the reminder clock.
+    # Null on rows from before this existed; main.py falls back sensibly.
+    notified_at: Optional[datetime] = None
+    # Reminders sent to this signer, automatic and manual combined, and when
+    # the latest one went out.
+    reminder_count: int = 0
+    last_reminded_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 

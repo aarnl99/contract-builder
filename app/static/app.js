@@ -298,6 +298,7 @@ function toggleAvatarMenu() {
     { key: "redline_submitted", label: "Someone sends redlines" },
     { key: "redline_comment", label: "Client comments on a redline" },
     { key: "signature_events", label: "Someone signs (or finishes signing) a document" },
+    { key: "auto_remind_signers", label: "Remind signers who haven't signed yet (day 3, 6, 9)" },
   ];
   const notifList = el("div", { style: "display:flex;flex-direction:column;gap:8px;margin-top:2px;" }, [
     el("span", { style: "font-size:11.5px;color:var(--muted);" }, "Loading..."),
@@ -1418,6 +1419,31 @@ async function openSignatureModal(generatedId) {
     return { awaiting_consent: "Awaiting consent", ready_to_sign: "Ready to sign", completed: "Signed", declined: "Declined" }[s] || s;
   }
 
+  function waitDaysText(days) {
+    return days < 1 ? "since today" : days === 1 ? "1 day" : `${days} days`;
+  }
+
+  // Sends a "still waiting on you" email to one signer (position given) or
+  // to everyone who can sign right now (position omitted).
+  async function sendReminder(btn, position) {
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Sending...";
+    try {
+      const res = await api(`/api/generated/${generatedId}/signature-request/remind`, {
+        method: "POST",
+        body: position === undefined ? {} : { position },
+      });
+      renderStatusView(res);
+      const note = el("div", { class: "info-box" }, `Reminder sent to ${res.reminded.join(", ")}.`);
+      body.insertBefore(note, body.firstChild);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = label;
+      alert(err.message);
+    }
+  }
+
   function renderStatusView(sr) {
     body.innerHTML = "";
     body.appendChild(el("p", { class: "subtitle" }, "Sent through DocuSeal. Each signer first agrees to a quick photo step on Rotely's own page before reaching the actual signing form." + (sr.sign_in_order ? " Signers sign in the order listed -- each one is emailed when the person before them has signed." : "")));
@@ -1454,6 +1480,10 @@ async function openSignatureModal(generatedId) {
       const linkUrl = `${location.origin}${s.sign_url}`;
       const live = sr.status === "pending";
       const notSigned = ended && s.status !== "completed" && s.status !== "declined";
+      const isWaiting = !!s.waiting_since;
+      const waitingNote = isWaiting
+        ? `Waiting ${waitDaysText(s.days_waiting)}${s.reminder_count ? ` \u00b7 reminded ${s.reminder_count} time${s.reminder_count === 1 ? "" : "s"}` : ""}`
+        : "";
       list.appendChild(
         el("div", { class: "row" }, [
           el("div", { style: "min-width:0;" }, [
@@ -1463,14 +1493,21 @@ async function openSignatureModal(generatedId) {
               : live && s.status !== "completed" && s.status !== "declined" && sr.sign_in_order && s.your_turn === false
                 ? "Waiting for the signer(s) before them"
                 : `${statusLabel(s.status)}${live && (s.status === "awaiting_consent" || s.status === "ready_to_sign") ? " -- " + linkUrl : ""}`),
+            waitingNote ? el("div", { class: "v waiting-note" + (s.days_waiting >= 3 ? " overdue" : "") }, waitingNote) : null,
           ]),
-          live && s.status !== "completed" ? el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(linkUrl, e.currentTarget) }, "Copy link") : null,
+          el("div", { class: "row-actions" }, [
+            isWaiting ? el("button", { class: "btn secondary small", onclick: (e) => sendReminder(e.currentTarget, s.position) }, "Remind") : null,
+            live && s.status !== "completed" ? el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(linkUrl, e.currentTarget) }, "Copy link") : null,
+          ]),
         ])
       );
     });
     body.appendChild(list);
 
     const actions = [];
+    if (sr.status === "pending" && (sr.waiting_on || []).length > 1) {
+      actions.push(el("button", { class: "btn secondary", onclick: (e) => sendReminder(e.currentTarget) }, "Remind everyone waiting"));
+    }
     if (sr.status === "pending") {
       // Bug tracker #55: the only way "pending" ever moved before was
       // DocuSeal's webhook firing -- never configured, or a delivery lost,
@@ -2874,6 +2911,17 @@ function DocumentsView() {
     return el("span", { class: "status-tag " + (status.tone || "draft") }, status.label);
   }
 
+  // "Waiting on Morgan \u00b7 4 days" / "Fully signed" -- where the latest
+  // signature request stands. Click to open the request.
+  function signatureTagEl(sig, docId) {
+    if (!sig) return null;
+    return el("span", {
+      class: "status-tag signature-tag " + (sig.tone || "pending"),
+      title: "Open signature request",
+      onclick: (e) => { e.stopPropagation(); openSignatureModal(docId); },
+    }, sig.label);
+  }
+
   function partiesLineEl(parties) {
     if (!parties || !parties.length) return null;
     return el("div", { class: "lineage" }, [el("span", { style: "font-weight:600;" }, "Parties: "), parties.join("  ·  ")]);
@@ -2884,7 +2932,7 @@ function DocumentsView() {
       el("div", { class: "left" }, [
         el("div", { class: "file-icon" }, "✓"),
         el("div", {}, [
-          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status), unresolvedBadgeEl(d.unresolved_count)]),
+          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status), signatureTagEl(d.signature, d.id), unresolvedBadgeEl(d.unresolved_count)]),
           el("div", { class: "lineage" }, ["Originated from ", el("span", { class: "tag" }, d.template_name)]),
           partiesLineEl(d.parties),
         ]),
@@ -2994,6 +3042,7 @@ function DocumentsView() {
             el("span", { class: "folder-name" }, latest.name),
             el("span", { class: "version-count" }, `${familyDocs.length} versions`),
             statusTagEl(latest.status),
+            signatureTagEl(latest.signature, latest.id),
             unresolvedBadgeEl(latest.unresolved_count),
           ]),
           el("div", { class: "folder-sub" }, ["Originated from ", el("span", { class: "tag" }, latest.template_name)]),
