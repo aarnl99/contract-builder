@@ -588,7 +588,7 @@ function AuthView(mode) {
   function draw() {
     card.innerHTML = "";
     card.appendChild(
-      el("div", { class: "auth-logo" }, [el("div", { class: "word" }, "Rotely.ai")])
+      el("div", { class: "auth-logo" }, [el("div", { class: "word" }, ["Rotely", el("span", { class: "dot" }, ".ai")])])
     );
 
     if (registeredEmail) {
@@ -811,7 +811,7 @@ function ResetPasswordView() {
   const hashQuery = new URLSearchParams(location.hash.split("?")[1] || "");
   const token = hashQuery.get("token") || "";
 
-  card.appendChild(el("div", { class: "auth-logo" }, [el("div", { class: "word" }, "Rotely.ai")]));
+  card.appendChild(el("div", { class: "auth-logo" }, [el("div", { class: "word" }, ["Rotely", el("span", { class: "dot" }, ".ai")])]));
 
   if (!token) {
     card.appendChild(el("h1", {}, "Invalid link"));
