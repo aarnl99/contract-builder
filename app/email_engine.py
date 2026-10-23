@@ -156,6 +156,67 @@ def _send_via_resend(to_address, subject, text_body, reply_to, attachments) -> N
     resp.raise_for_status()
 
 
+# ---------------------------------------------------------------------------
+# Inbound mail from Resend ("email.received" webhooks)
+# ---------------------------------------------------------------------------
+
+# The signing secret Resend shows on the webhook's page (starts "whsec_").
+# When set, every inbound Resend webhook must carry a valid signature.
+RESEND_WEBHOOK_SECRET = os.environ.get("RESEND_WEBHOOK_SECRET", "")
+
+
+def verify_resend_signature(secret: str, svix_id: str, svix_timestamp: str, svix_signature: str,
+                            body: bytes, tolerance_seconds: int = 300, now: Optional[float] = None) -> bool:
+    """Resend signs webhooks with Svix: HMAC-SHA256 over "{id}.{timestamp}.{body}"
+    keyed by the base64 part of the signing secret, sent base64-encoded as
+    "v1,<sig>" (several, space-separated, while a secret is being rotated).
+    Rejects stale timestamps so a captured request can't be replayed later."""
+    import hashlib
+    import hmac
+    import time
+    if not (secret and svix_id and svix_timestamp and svix_signature):
+        return False
+    try:
+        ts = int(svix_timestamp)
+        key = base64.b64decode(secret.split("_", 1)[1] if secret.startswith("whsec_") else secret)
+    except (ValueError, TypeError):
+        return False
+    if abs((now if now is not None else time.time()) - ts) > tolerance_seconds:
+        return False
+    signed = f"{svix_id}.{svix_timestamp}.".encode() + body
+    expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+    for part in svix_signature.split():
+        version, _, sig = part.partition(",")
+        if version == "v1" and hmac.compare_digest(sig, expected):
+            return True
+    return False
+
+
+def fetch_received_email(email_id: str) -> dict:
+    """The webhook only carries metadata; the body has to be fetched. Needs
+    an API key with full access (a send-only key can't read received mail)."""
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY is not set, so received email can't be read.")
+    resp = httpx.get(
+        f"https://api.resend.com/emails/receiving/{email_id}",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def html_to_text(html: str) -> str:
+    """Plain text from an HTML-only email, good enough to read field values from."""
+    import html as htmllib
+    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", html or "")
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = htmllib.unescape(text)
+    text = re.sub(r"[ \t\xa0]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+
 def _send_via_sendgrid(to_address, subject, text_body, reply_to, attachments) -> None:
     payload = {
         "personalizations": [{"to": [{"email": to_address}]}],
