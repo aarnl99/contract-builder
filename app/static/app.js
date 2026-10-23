@@ -1207,136 +1207,188 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
 
 async function openShareModal(generatedId) {
   // .panel-overlay outranks .modal-overlay in z-index, so a leftover detail
-  // panel (from openDetail, or from a notification-bell click landing here
-  // while a panel is still open) would render on top of this modal and
-  // physically block its Close button. Belt-and-suspenders on top of
-  // openDetail's own callers already closing it -- this covers every path
-  // that can reach here, not just the ones that remember to.
+  // panel would render on top of this modal and block its Close button.
   document.querySelectorAll(".panel-overlay").forEach((o) => o.remove());
   const overlay = el("div", { class: "modal-overlay" });
   const body = el("div", {}, el("p", { class: "subtitle" }, "Loading..."));
-  const modal = el("div", { class: "modal" }, [el("h2", {}, "Share for review"), body]);
+  const modal = el("div", { class: "modal share-modal" }, [el("h2", {}, "Share for review"), body]);
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
-  // A share link is now only ever created with a real client attached --
-  // first name, last name, and a valid email are required (see
-  // main.create_share_link's docstring: comments need an attributed
-  // person, and so will e-signature down the line). An EXISTING link
-  // (created before this requirement, or just already set up) never gets
-  // blocked by this -- only the moment of creating a brand-new one does.
-  // So: try the plain lookup first; if the server says there's no link yet
-  // and it needs the client's info, show that intake form instead of a
-  // raw error.
+  // A brand-new share link needs a real client attached (first name, last
+  // name, valid email -- see main.create_share_link). An EXISTING link never
+  // gets blocked by that. So: try the plain lookup first; if the server says
+  // it needs the client's info, show the intake form instead of a raw error.
   const NEEDS_INTAKE = "Enter the client's first name, last name, and email";
+
+  // People this account has shared with before -- suggestions while typing.
+  // Best-effort: no suggestions if it fails.
+  let recents = [];
+  try { recents = await api("/api/recipients"); } catch (e) { /* suggestions are optional */ }
+
+  function recipientList() {
+    return el("datalist", { id: "recipient-suggestions" },
+      recents.map((r) => el("option", { value: r.email }, [r.first_name, r.last_name].filter(Boolean).join(" "))));
+  }
+
+  // Picking a remembered email fills in the name boxes (only if still empty).
+  function wireSuggestions(emailInput, firstInput, lastInput) {
+    emailInput.setAttribute("list", "recipient-suggestions");
+    emailInput.addEventListener("input", () => {
+      const hit = recents.find((r) => r.email.toLowerCase() === emailInput.value.trim().toLowerCase());
+      if (!hit) return;
+      if (!firstInput.value.trim()) firstInput.value = hit.first_name || "";
+      if (!lastInput.value.trim()) lastInput.value = hit.last_name || "";
+      firstInput.dispatchEvent(new Event("change"));
+    });
+  }
+
+  function initials(first, last, email) {
+    const f = (first || "").trim(), l = (last || "").trim();
+    return ((f[0] || "") + (l[0] || "")).toUpperCase() || (email || "?")[0].toUpperCase();
+  }
+
+  function fmtSent(iso) {
+    const d = new Date(iso);
+    return d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  }
+
+  function copyRow(label, value) {
+    return el("div", { class: "share-row" }, [
+      el("div", { class: "share-row-text" }, [el("div", { class: "k" }, label), el("div", { class: "v", title: value }, value)]),
+      el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(value, e.currentTarget) }, "Copy"),
+    ]);
+  }
 
   function renderShareInfo(share) {
     const linkUrl = `${location.origin}${share.url}`;
     body.innerHTML = "";
-    body.appendChild(el("p", { class: "subtitle" }, "Send the link and the access code to your client separately, a text or a call works well, the same way you'd share anything sensitive."));
-    body.appendChild(
-      el("div", { class: "share-info-box" }, [
-        el("div", { class: "row" }, [
-          el("div", { style: "min-width:0;" }, [el("div", { class: "k" }, "Review link"), el("div", { class: "v" }, linkUrl)]),
-          el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(linkUrl, e.currentTarget) }, "Copy"),
-        ]),
-        el("div", { class: "row" }, [
-          el("div", {}, [el("div", { class: "k" }, "Access code"), el("div", { class: "v" }, share.access_code)]),
-          el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(share.access_code, e.currentTarget) }, "Copy"),
-        ]),
-      ])
-    );
-    const firstNameInput = el("input", { type: "text", placeholder: "Jamie", value: share.client_first_name || "" });
-    const lastNameInput = el("input", { type: "text", placeholder: "Rivera", value: share.client_last_name || "" });
-    const emailInput = el("input", { type: "email", placeholder: "client@company.com", value: share.client_email || "" });
-    const clientSavedNote = el("span", { style: "font-size:12px;color:var(--success);margin-left:8px;display:none;" }, "Saved");
-    const senderInput = el("input", { type: "email", placeholder: "you@company.com (defaults to your login email)", value: share.sender_email || "" });
-    const senderSavedNote = el("span", { style: "font-size:12px;color:var(--success);margin-left:8px;display:none;" }, "Saved");
-    async function saveShareFields(noteEl) {
+    let editingRecipient = false, editingReply = false;
+
+    async function save(fields) {
+      return api(`/api/generated/${generatedId}/share`, { method: "POST", body: fields });
+    }
+
+    function draw() {
+      body.innerHTML = "";
+      const clientName = [share.client_first_name, share.client_last_name].filter(Boolean).join(" ");
+
+      // ---- who it's for (asked once; edit in place) ----
+      if (!editingRecipient) {
+        body.appendChild(el("div", { class: "recipient-card" }, [
+          el("div", { class: "avatar" }, initials(share.client_first_name, share.client_last_name, share.client_email)),
+          el("div", { class: "recipient-text" }, [
+            el("div", { class: "recipient-name" }, clientName || share.client_email || "No recipient"),
+            clientName ? el("div", { class: "recipient-email" }, share.client_email) : null,
+          ]),
+          el("button", { class: "link-btn", onclick: () => { editingRecipient = true; draw(); } }, "Change"),
+        ]));
+      } else {
+        const f = el("input", { type: "text", placeholder: "First name", value: share.client_first_name || "" });
+        const l = el("input", { type: "text", placeholder: "Last name", value: share.client_last_name || "" });
+        const em = el("input", { type: "email", placeholder: "Email", value: share.client_email || "" });
+        wireSuggestions(em, f, l);
+        const err = el("div", {});
+        body.appendChild(el("div", { class: "recipient-edit" }, [
+          recipientList(),
+          el("div", { class: "field-grid" }, [f, l]), em, err,
+          el("div", { class: "inline-actions" }, [
+            el("button", { class: "btn secondary small", onclick: () => { editingRecipient = false; draw(); } }, "Cancel"),
+            el("button", { class: "btn small", onclick: async (e) => {
+              err.innerHTML = "";
+              const btn = e.currentTarget; btn.disabled = true;
+              try {
+                share = await save({ client_first_name: f.value.trim(), client_last_name: l.value.trim(), client_email: em.value.trim(), sender_email: share.sender_email || "" });
+                editingRecipient = false; draw();
+              } catch (ex) { btn.disabled = false; err.appendChild(el("div", { class: "error-box" }, ex.message)); }
+            } }, "Save"),
+          ]),
+        ]));
+      }
+
+      // ---- did the email actually go out? ----
+      const status = el("div", { class: "share-status " + (share.emailed_at ? "ok" : "warn") });
+      if (share.emailed_at) {
+        status.appendChild(el("span", { class: "share-status-icon" }, "✓"));
+        status.appendChild(el("span", { class: "share-status-text" }, `Emailed to ${share.client_email} · ${fmtSent(share.emailed_at)}`));
+        status.appendChild(el("button", { class: "link-btn", onclick: (e) => resend(e.currentTarget, status) }, "Send again"));
+      } else {
+        status.appendChild(el("span", { class: "share-status-icon" }, "!"));
+        status.appendChild(el("span", { class: "share-status-text" }, `${share.client_first_name ? share.client_first_name + " hasn't" : "They haven't"} been emailed yet. Send it now, or copy the link and code below.`));
+        status.appendChild(el("button", { class: "link-btn", onclick: (e) => resend(e.currentTarget, status) }, "Send email"));
+      }
+      body.appendChild(status);
+
+      // ---- link + code ----
+      body.appendChild(el("div", { class: "share-links" }, [copyRow("Review link", linkUrl), copyRow("Access code", share.access_code)]));
+      body.appendChild(el("p", { class: "share-note" }, "Anyone with the link and the code can open this document."));
+
+      // ---- reply-to (collapsed) ----
+      const replyTo = share.sender_email || (state.user && state.user.email) || "your login email";
+      if (!editingReply) {
+        body.appendChild(el("div", { class: "share-note" }, [
+          `Replies go to ${replyTo} · `,
+          el("button", { class: "link-btn", onclick: () => { editingReply = true; draw(); } }, "Change"),
+        ]));
+      } else {
+        const s = el("input", { type: "email", placeholder: "you@company.com (blank = your login email)", value: share.sender_email || "" });
+        const err = el("div", {});
+        body.appendChild(el("div", { class: "recipient-edit" }, [
+          el("label", { class: "field-label" }, "Reply-to email (shown to the client)"), s, err,
+          el("div", { class: "inline-actions" }, [
+            el("button", { class: "btn secondary small", onclick: () => { editingReply = false; draw(); } }, "Cancel"),
+            el("button", { class: "btn small", onclick: async (e) => {
+              err.innerHTML = ""; const btn = e.currentTarget; btn.disabled = true;
+              try { share = await save({ sender_email: s.value.trim() }); editingReply = false; draw(); }
+              catch (ex) { btn.disabled = false; err.appendChild(el("div", { class: "error-box" }, ex.message)); }
+            } }, "Save"),
+          ]),
+        ]));
+      }
+
+      // ---- actions ----
+      body.appendChild(el("div", { class: "modal-actions share-actions" }, [
+        el("button", { class: "link-btn danger", onclick: async (e) => {
+          if (!confirm("Close this review link? The client won't be able to open it or submit further redlines. You can share a fresh link afterward if needed.")) return;
+          const btn = e.currentTarget; btn.disabled = true;
+          try { await api(`/api/generated/${generatedId}/share/close`, { method: "POST" }); overlay.remove(); }
+          catch (err) { btn.disabled = false; alert(err.message); }
+        } }, "Close review link"),
+        el("button", { class: "btn", onclick: () => overlay.remove() }, "Done"),
+      ]));
+    }
+
+    async function resend(btn, statusEl) {
+      btn.disabled = true; btn.textContent = "Sending...";
       try {
-        await api(`/api/generated/${generatedId}/share`, {
-          method: "POST",
-          body: {
-            client_first_name: firstNameInput.value.trim(), client_last_name: lastNameInput.value.trim(),
-            client_email: emailInput.value.trim(), sender_email: senderInput.value.trim(),
-          },
-        });
-        noteEl.style.display = "inline";
-        setTimeout(() => (noteEl.style.display = "none"), 1500);
-      } catch (e) {
-        // Without this, an edit here (e.g. correcting the client's email)
-        // that failed to save left "Saved" simply never appearing, with no
-        // error to explain why -- easy to miss and go on to share the link
-        // still pointed at the old, unsaved value.
-        alert(e.message || "Couldn't save that change. Please try again.");
+        share = await api(`/api/generated/${generatedId}/share/email`, { method: "POST" });
+        draw();
+      } catch (ex) {
+        btn.disabled = false; btn.textContent = "Try again";
+        statusEl.querySelector(".share-status-text").textContent = ex.message;
       }
     }
-    [firstNameInput, lastNameInput, emailInput].forEach((inp) => inp.addEventListener("change", () => saveShareFields(clientSavedNote)));
-    senderInput.addEventListener("change", () => saveShareFields(senderSavedNote));
-    body.appendChild(
-      el("div", { class: "form-row", style: "margin-top:14px;" }, [
-        el("label", { class: "field-label" }, ["Your email (shown to the client)", senderSavedNote]),
-        senderInput,
-        el("div", { style: "font-size:12px;color:var(--muted);margin-top:4px;" }, "Shown to them as the document sender's contact. Leave blank to use your account login email."),
-      ])
-    );
-    body.appendChild(
-      el("div", { class: "form-row", style: "margin-top:14px;" }, [
-        el("label", { class: "field-label" }, ["Client name and email", clientSavedNote]),
-        el("div", { style: "display:flex;gap:8px;" }, [firstNameInput, lastNameInput]),
-        emailInput,
-        el("div", { style: "font-size:12px;color:var(--muted);margin-top:4px;" }, "Who you're sharing this with -- shown on the review page, and used to send them the link and to attribute their comments."),
-      ])
-    );
-    body.appendChild(
-      el("div", { class: "modal-actions" }, [
-        el(
-          "button",
-          {
-            class: "btn danger",
-            onclick: async (e) => {
-              if (!confirm("Close this review link? The client won't be able to open it or submit further redlines. You can share a fresh link afterward if needed.")) return;
-              const btn = e.currentTarget;
-              btn.disabled = true;
-              try {
-                await api(`/api/generated/${generatedId}/share/close`, { method: "POST" });
-                overlay.remove();
-              } catch (err) {
-                btn.disabled = false;
-                alert(err.message);
-              }
-            },
-          },
-          "Close review link"
-        ),
-        el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Close"),
-      ])
-    );
+
+    draw();
   }
 
   function renderIntakeForm(errMsg) {
     body.innerHTML = "";
-    body.appendChild(el("p", { class: "subtitle" }, "Who are you sharing this document with? We'll use this to send them the link and to attribute their comments when they redline it."));
+    body.appendChild(el("p", { class: "subtitle share-sub" }, "Who is reviewing this? We'll email them the link and access code, and use their name on their comments."));
     const errBox = el("div", {});
     if (errMsg) errBox.appendChild(el("div", { class: "error-box" }, errMsg));
+    const emailInput = el("input", { type: "email", placeholder: "client@company.com", autocomplete: "off" });
     const firstNameInput = el("input", { type: "text", placeholder: "Jamie" });
     const lastNameInput = el("input", { type: "text", placeholder: "Rivera" });
-    const emailInput = el("input", { type: "email", placeholder: "client@company.com" });
-    body.appendChild(
-      el("div", { class: "form-row" }, [
-        el("label", { class: "field-label" }, "Client's name"),
-        el("div", { style: "display:flex;gap:8px;" }, [firstNameInput, lastNameInput]),
-      ])
-    );
-    body.appendChild(
-      el("div", { class: "form-row", style: "margin-top:14px;" }, [
-        el("label", { class: "field-label" }, "Client's email"),
-        emailInput,
-        el("div", { style: "font-size:12px;color:var(--muted);margin-top:4px;" }, "We'll email them the review link and access code."),
-      ])
-    );
+    wireSuggestions(emailInput, firstNameInput, lastNameInput);
+    body.appendChild(recipientList());
+    body.appendChild(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Email"), emailInput]));
+    body.appendChild(el("div", { class: "field-grid" }, [
+      el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "First name"), firstNameInput]),
+      el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Last name"), lastNameInput]),
+    ]));
     body.appendChild(errBox);
-    const createBtn = el("button", { class: "btn", style: "margin-top:14px;" }, "Create share link");
+    const createBtn = el("button", { class: "btn" }, "Share for review");
     createBtn.addEventListener("click", async () => {
       errBox.innerHTML = "";
       const first = firstNameInput.value.trim(), last = lastNameInput.value.trim(), email = emailInput.value.trim();
@@ -1345,7 +1397,7 @@ async function openShareModal(generatedId) {
         return;
       }
       createBtn.disabled = true;
-      createBtn.textContent = "Creating...";
+      createBtn.textContent = "Sharing...";
       try {
         const share = await api(`/api/generated/${generatedId}/share`, {
           method: "POST",
@@ -1355,12 +1407,10 @@ async function openShareModal(generatedId) {
       } catch (err) {
         errBox.appendChild(el("div", { class: "error-box" }, err.message));
         createBtn.disabled = false;
-        createBtn.textContent = "Create share link";
+        createBtn.textContent = "Share for review";
       }
     });
-    body.appendChild(
-      el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), createBtn])
-    );
+    body.appendChild(el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), createBtn]));
   }
 
   try {
@@ -1512,13 +1562,19 @@ async function openSignatureModal(generatedId) {
       return;
     }
     const sr = currentSr;
+    // Only mention photos when the sender asked for them (or one exists from
+    // before) -- a "no photo" send shouldn't show Selfie / Photo ID rows or
+    // the photo disclaimer at all.
+    const wantsSelfie = sr.photo_check === "selfie" || sr.photo_check === "selfie_id" || s.has_photo;
+    const wantsId = sr.photo_check === "selfie_id" || s.has_id_photo;
+    const rotelyRows = [
+      el("div", { class: "evidence-title" }, "Rotely check"),
+      evidenceRow("Agreed to sign", fmtWhen(s.consent_given_at)),
+    ];
+    if (wantsSelfie) rotelyRows.push(evidenceRow("Selfie", evidencePhoto(sr, s, "selfie", s.has_photo, s.photo_captured_at)));
+    if (wantsId) rotelyRows.push(evidenceRow("Photo ID", evidencePhoto(sr, s, "id", s.has_id_photo, s.id_photo_captured_at)));
     const panel = el("div", { class: "evidence-panel" }, [
-      el("div", { class: "evidence-col" }, [
-        el("div", { class: "evidence-title" }, "Rotely check"),
-        evidenceRow("Agreed to sign", fmtWhen(s.consent_given_at)),
-        evidenceRow("Selfie", evidencePhoto(sr, s, "selfie", s.has_photo, s.photo_captured_at)),
-        evidenceRow("Photo ID", evidencePhoto(sr, s, "id", s.has_id_photo, s.id_photo_captured_at)),
-      ]),
+      el("div", { class: "evidence-col" }, rotelyRows),
       el("div", { class: "evidence-col" }, [
         el("div", { class: "evidence-title" }, "DocuSeal check"),
         evidenceRow("Opened", fmtWhen(s.ds_opened_at)),
@@ -1526,7 +1582,9 @@ async function openSignatureModal(generatedId) {
         evidenceRow("IP address", s.ds_ip || "\u2014"),
         evidenceRow("Device", el("span", { title: s.ds_user_agent || "" }, deviceLabel(s.ds_user_agent))),
       ]),
-      el("div", { class: "evidence-note" }, "Photos show who was in front of the camera when this was signed. Rotely doesn't compare the selfie to the ID, so look at them side by side yourself. Stored encrypted; only you can open them."),
+      (wantsSelfie || wantsId)
+        ? el("div", { class: "evidence-note" }, "Photos show who was in front of the camera when this was signed. Rotely doesn't compare the selfie to the ID, so look at them side by side yourself. Stored encrypted; only you can open them.")
+        : null,
     ]);
     rowEl.after(panel);
     btn.textContent = "Hide evidence";
