@@ -234,6 +234,9 @@ function ConsentView(status) {
       captureBtn.style.display = "block";
       retakeBtn.style.display = "none";
       confirmBtn.style.display = "none";
+      // On a phone the camera frame can push the button off the bottom of
+      // the screen; bring it into view so the next step is obvious.
+      try { captureBtn.scrollIntoView({ block: "nearest", behavior: "smooth" }); } catch (e) {}
       return true;
     } catch (e) {
       showError("Camera access was blocked. You'll need to allow camera access in your browser to continue.");
