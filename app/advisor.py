@@ -151,8 +151,9 @@ def suggest_counter(packet: dict) -> Optional[dict]:
         max_tokens=500,
         system=SYSTEM,
         tools=[tool],
-        tool_choice={"type": "tool", "name": "record_counter"},
-        messages=[{"role": "user", "content": "<packet>\n" + json.dumps(packet, ensure_ascii=False, indent=1) + "\n</packet>"}],
+        # Newer models reject a forced tool choice, so ask for the tool in the prompt.
+        tool_choice={"type": "auto"},
+        messages=[{"role": "user", "content": "<packet>\n" + json.dumps(packet, ensure_ascii=False, indent=1) + "\n</packet>\n\nAnswer only by calling the record_counter tool."}],
     )
     for block in message.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "record_counter":
