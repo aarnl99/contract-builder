@@ -1468,6 +1468,70 @@ async function openSignatureModal(generatedId) {
     return { awaiting_consent: "Awaiting consent", ready_to_sign: "Ready to sign", completed: "Signed", declined: "Declined" }[s] || s;
   }
 
+  // ---- evidence: our photo check next to DocuSeal's own record ----------
+  function hasEvidence(s) {
+    return !!(s.consent_given_at || s.has_photo || s.has_id_photo || s.ds_completed_at);
+  }
+
+  function fmtWhen(iso) {
+    if (!iso) return "\u2014";
+    const d = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + "Z");
+    return d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  }
+
+  function deviceLabel(ua) {
+    if (!ua) return "\u2014";
+    const browser = /Edg\//.test(ua) ? "Edge" : /OPR\/|Opera/.test(ua) ? "Opera" : /Firefox\//.test(ua) ? "Firefox"
+      : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+    const os = /iPhone|iPad|iPod/.test(ua) ? "iOS" : /Android/.test(ua) ? "Android" : /Mac OS X|Macintosh/.test(ua) ? "macOS"
+      : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "";
+    return os ? `${browser} on ${os}` : browser;
+  }
+
+  function evidenceRow(label, value) {
+    return el("div", { class: "evidence-row" }, [el("div", { class: "evidence-k" }, label), el("div", { class: "evidence-v" }, value)]);
+  }
+
+  function evidencePhoto(sr, s, kind, has, captured) {
+    const requested = kind === "selfie" ? sr.photo_check !== "none" : sr.photo_check === "selfie_id";
+    if (!has) return el("span", { class: "evidence-muted" }, requested ? "Not captured yet" : "Not requested");
+    const url = `/api/generated/${generatedId}/signature-request/signers/${s.signer_id}/photo/${kind}`;
+    const img = el("img", { class: "evidence-photo", src: url, alt: kind === "selfie" ? "Selfie" : "Photo ID" });
+    img.addEventListener("error", () => img.replaceWith(el("span", { class: "evidence-muted" }, "Photo unavailable")));
+    return el("div", {}, [
+      el("a", { href: url, target: "_blank", rel: "noopener" }, [img]),
+      el("div", { class: "evidence-muted" }, `Taken ${fmtWhen(captured)}`),
+    ]);
+  }
+
+  function toggleEvidence(btn, s, rowEl) {
+    const existing = rowEl.nextElementSibling;
+    if (existing && existing.classList.contains("evidence-panel")) {
+      existing.remove();
+      btn.textContent = "Evidence";
+      return;
+    }
+    const sr = currentSr;
+    const panel = el("div", { class: "evidence-panel" }, [
+      el("div", { class: "evidence-col" }, [
+        el("div", { class: "evidence-title" }, "Rotely check"),
+        evidenceRow("Agreed to sign", fmtWhen(s.consent_given_at)),
+        evidenceRow("Selfie", evidencePhoto(sr, s, "selfie", s.has_photo, s.photo_captured_at)),
+        evidenceRow("Photo ID", evidencePhoto(sr, s, "id", s.has_id_photo, s.id_photo_captured_at)),
+      ]),
+      el("div", { class: "evidence-col" }, [
+        el("div", { class: "evidence-title" }, "DocuSeal check"),
+        evidenceRow("Opened", fmtWhen(s.ds_opened_at)),
+        evidenceRow("Signed", fmtWhen(s.ds_completed_at)),
+        evidenceRow("IP address", s.ds_ip || "\u2014"),
+        evidenceRow("Device", el("span", { title: s.ds_user_agent || "" }, deviceLabel(s.ds_user_agent))),
+      ]),
+      el("div", { class: "evidence-note" }, "Photos show who was in front of the camera when this was signed. Rotely doesn't compare the selfie to the ID, so look at them side by side yourself. Stored encrypted; only you can open them."),
+    ]);
+    rowEl.after(panel);
+    btn.textContent = "Hide evidence";
+  }
+
   function waitDaysText(days) {
     return days < 1 ? "since today" : days === 1 ? "1 day" : `${days} days`;
   }
@@ -1493,9 +1557,11 @@ async function openSignatureModal(generatedId) {
     }
   }
 
+  let currentSr = null;
   function renderStatusView(sr) {
+    currentSr = sr;
     body.innerHTML = "";
-    body.appendChild(el("p", { class: "subtitle" }, "Sent through DocuSeal. Each signer first agrees to a quick photo step on Rotely's own page before reaching the actual signing form." + (sr.sign_in_order ? " Signers sign in the order listed -- each one is emailed when the person before them has signed." : "")));
+    body.appendChild(el("p", { class: "subtitle" }, "Sent through DocuSeal. Each signer first " + ({ none: "agrees to sign electronically", selfie: "agrees and takes a selfie", selfie_id: "agrees and takes a selfie and a photo of their ID" }[sr.photo_check || "none"]) + " on Rotely's own page before reaching the actual signing form." + (sr.sign_in_order ? " Signers sign in the order listed -- each one is emailed when the person before them has signed." : "")));
     // Bug tracker #55: nothing told the owner that a signature request only
     // ever updates itself automatically if DocuSeal's webhook is actually
     // configured -- without it, this modal could sit on "Pending" forever
@@ -1533,7 +1599,7 @@ async function openSignatureModal(generatedId) {
       const waitingNote = isWaiting
         ? `Waiting ${waitDaysText(s.days_waiting)}${s.reminder_count ? ` \u00b7 reminded ${s.reminder_count} time${s.reminder_count === 1 ? "" : "s"}` : ""}`
         : "";
-      list.appendChild(
+      const rowEl =
         el("div", { class: "row" }, [
           el("div", { style: "min-width:0;" }, [
             el("div", { class: "k" }, `${sr.sign_in_order ? (s.position + 1) + ". " : ""}${s.name} (${s.role})`),
@@ -1545,11 +1611,12 @@ async function openSignatureModal(generatedId) {
             waitingNote ? el("div", { class: "v waiting-note" + (s.days_waiting >= 3 ? " overdue" : "") }, waitingNote) : null,
           ]),
           el("div", { class: "row-actions" }, [
+            hasEvidence(s) ? el("button", { class: "btn secondary small", onclick: (e) => toggleEvidence(e.currentTarget, s, rowEl) }, "Evidence") : null,
             isWaiting ? el("button", { class: "btn secondary small", onclick: (e) => sendReminder(e.currentTarget, s.position) }, "Remind") : null,
             live && s.status !== "completed" ? el("button", { class: "btn secondary small copy-btn", onclick: (e) => copyToClipboard(linkUrl, e.currentTarget) }, "Copy link") : null,
           ]),
-        ])
-      );
+        ]);
+      list.appendChild(rowEl);
     });
     body.appendChild(list);
 
@@ -1624,6 +1691,7 @@ async function openSignatureModal(generatedId) {
           onclick: () => renderIntakeForm({
             signers: sr.signers.map((s) => ({ name: s.name, email: s.email, role: s.role })),
             sign_in_order: !!sr.sign_in_order,
+            photo_check: sr.photo_check || "none",
           }),
         }, "Send again")
       );
@@ -1809,7 +1877,7 @@ async function openSignatureModal(generatedId) {
       continueBtn.disabled = true;
       continueBtn.textContent = "Sending...";
       try {
-        const reqBody = { signers: identities.signers, sign_in_order: identities.sign_in_order };
+        const reqBody = { signers: identities.signers, sign_in_order: identities.sign_in_order, photo_check: identities.photo_check || "none" };
         const sr = await api(`/api/generated/${generatedId}/signature-request`, { method: "POST", body: reqBody });
         renderStatusView(sr);
       } catch (err) {
@@ -1870,6 +1938,36 @@ async function openSignatureModal(generatedId) {
       el("label", { style: "display:flex;gap:8px;align-items:center;cursor:pointer;" }, [orderInput, "Signers must sign in this order (top to bottom)"]),
       el("p", { class: "subtitle", style: "margin:2px 0 0;" }, "Each person is emailed only after the one above them has signed. Leave unchecked to email everyone at once."),
     ]);
+
+    // What each signer is asked for before DocuSeal's form opens. Off by
+    // default: the sender opts in per contract.
+    const PHOTO_CHOICES = [
+      ["none", "No photo check", "The signer just agrees to sign electronically."],
+      ["selfie", "Selfie", "The signer takes a quick selfie before signing."],
+      ["selfie_id", "Selfie + photo ID", "The signer takes a selfie and a photo of their ID."],
+    ];
+    let photoCheck = (prev && prev.photo_check) || "none";
+    const photoWrap = el("div", { class: "form-row", style: "margin-top:14px;" }, [
+      el("label", { class: "field-label" }, "Photo check before signing"),
+      el("p", { class: "subtitle", style: "margin:2px 0 8px;" }, "Photos are stored encrypted with the signing record and only you can view them. They show who was in front of the camera; Rotely doesn't match them against each other automatically."),
+    ]);
+    const photoGrid = el("div", { class: "photo-choice-grid" });
+    function renderPhotoChoices() {
+      photoGrid.innerHTML = "";
+      PHOTO_CHOICES.forEach(([value, title, desc]) => {
+        const radio = el("input", { type: "radio", name: "photo-check", value });
+        radio.checked = photoCheck === value;
+        radio.addEventListener("change", () => { photoCheck = value; renderPhotoChoices(); });
+        photoGrid.appendChild(
+          el("label", { class: "photo-choice" + (photoCheck === value ? " selected" : "") }, [
+            el("div", { class: "photo-choice-head" }, [radio, el("span", { class: "photo-choice-title" }, title)]),
+            el("div", { class: "photo-choice-desc" }, desc),
+          ])
+        );
+      });
+    }
+    renderPhotoChoices();
+    photoWrap.appendChild(photoGrid);
 
     function uniqueRole(base) {
       const taken = new Set(rows.map((r) => r.roleInput.value.trim().toLowerCase()));
@@ -1960,6 +2058,7 @@ async function openSignatureModal(generatedId) {
       ])
     );
     body.appendChild(orderWrap);
+    body.appendChild(photoWrap);
     renderRows();
     body.appendChild(errBox);
 
@@ -1985,7 +2084,7 @@ async function openSignatureModal(generatedId) {
         emails.add(s.email.toLowerCase());
         roles.add(s.role.toLowerCase());
       }
-      renderFieldPlacer({ signers, sign_in_order: orderInput.checked && signers.length > 1 });
+      renderFieldPlacer({ signers, sign_in_order: orderInput.checked && signers.length > 1, photo_check: photoCheck });
     });
     body.appendChild(
       el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), nextBtn])
