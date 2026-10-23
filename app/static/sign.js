@@ -44,9 +44,44 @@ const app = document.getElementById("app");
 function render(view) {
   app.innerHTML = "";
   app.appendChild(view);
+  if (BRAND) app.appendChild(poweredBy());
+}
+
+
+// ---- owner's branding (logo or name) in place of the Rotely wordmark, plus
+// a small "Powered by Rotely.ai" footer. Loaded once, in the background, so
+// the page never waits on it; if it can't be loaded the page just keeps the
+// default Rotely look.
+let BRAND = null;
+
+function poweredBy() {
+  return el("div", { class: "powered-by" }, [
+    "Powered by ",
+    el("a", { href: "https://rotely.ai", target: "_blank", rel: "noopener" }, ["Rotely", el("span", { class: "dot" }, ".ai")]),
+  ]);
+}
+
+async function loadBrand() {
+  try {
+    const res = await fetch(`/api/sign/${TOKEN}/brand`);
+    if (!res.ok) return;
+    BRAND = await res.json();
+    if (!BRAND || !BRAND.name) { BRAND = null; return; }
+    document.querySelectorAll(".share-topbar").forEach((n) => n.replaceWith(topbar()));
+    if (!document.querySelector(".powered-by")) app.appendChild(poweredBy());
+  } catch (e) { /* keep the default look */ }
 }
 
 function topbar() {
+  if (BRAND && BRAND.name) {
+    return el("div", { class: "share-topbar" }, [
+      el("div", { class: "brand brand-custom" }, [
+        BRAND.logo_url
+          ? el("img", { class: "brand-logo", src: BRAND.logo_url, alt: BRAND.name })
+          : el("div", { class: "brand-name" }, BRAND.name),
+      ]),
+    ]);
+  }
   return el("div", { class: "share-topbar" }, [
     el("a", { class: "brand", href: "https://rotely.ai", style: "text-decoration:none;color:inherit;" }, [
       el("div", { class: "word" }, ["Rotely", el("span", { class: "dot" }, ".ai")]),
@@ -278,3 +313,4 @@ async function main() {
 }
 
 main();
+loadBrand();
