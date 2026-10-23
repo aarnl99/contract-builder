@@ -1041,3 +1041,13 @@ label.field-label { color: var(--ink); font-weight: 500; }
 .draft-search:focus { outline: none; background: #fff; box-shadow: 0 0 0 2px rgba(67, 56, 202, 0.35); }
 .doc-card .actions { gap: 6px; }
 .doc-card .actions .btn.small { padding: 7px 11px; }
+
+/* Signature reminders: "Waiting on Morgan \u00b7 4 days" tag and per-signer note. */
+.status-tag.signature-tag { cursor: pointer; white-space: nowrap; }
+.status-tag.signature-tag.overdue { background: #fde8e4; color: #b3361f; }
+.status-tag.signature-tag:hover { filter: brightness(0.97); }
+.waiting-note { color: var(--muted); }
+.waiting-note.overdue { color: #b3361f; font-weight: 600; }
+.share-info-box .row-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.share-info-box .v.waiting-note { font-family: inherit; font-weight: 500; font-size: 12.5px; word-break: normal; }
+.share-info-box .v.waiting-note.overdue { font-weight: 600; }
