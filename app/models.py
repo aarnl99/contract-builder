@@ -504,7 +504,9 @@ class EmailDraftRequest(SQLModel, table=True):
     template_id: Optional[int] = Field(default=None, foreign_key="template.id")
     from_address: str
     subject: str = ""
-    status: str = "awaiting_template"  # awaiting_template | awaiting_info | generating | done | failed
+    # awaiting_template | awaiting_info | generating | awaiting_recipient (draft made and emailed to the
+    # owner, waiting for the client's name + email) | sent (review link emailed) | done (older rows) | failed
+    status: str = "awaiting_template"
     values_json: str = "{}"  # best-known field_key -> value extracted so far
     missing_fields_json: str = "[]"  # field_keys still needed
     generated_contract_id: Optional[int] = Field(default=None, foreign_key="generatedcontract.id")
