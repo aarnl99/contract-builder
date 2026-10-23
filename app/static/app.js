@@ -2598,6 +2598,13 @@ function openFillModal(tpl, prefill, onDone) {
     el("h2", {}, tpl.name),
     el("p", { class: "subtitle", style: "margin:2px 0 16px;" }, `${tpl.document_type} · fill in the blanks below`),
     errBox,
+    prefill && prefill.ai
+      ? el("div", { class: "advisor-box ai-banner" }, [
+          el("div", { class: "advisor-tag" }, "AI suggestion. Check every field."),
+          el("div", { class: "advisor-why" }, prefill.ai.summary),
+          prefill.ai.notes ? el("div", { class: "advisor-why" }, prefill.ai.notes) : null,
+        ])
+      : null,
     el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Party A"), partyAInput]),
     el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Party B"), partyBInput]),
     ...fieldRows,
@@ -2648,6 +2655,11 @@ function DraftView(preselectId) {
   const wrap = el("div", {});
   wrap.appendChild(el("h1", {}, "Draft a document"));
   wrap.appendChild(el("p", { class: "subtitle" }, "Pick a master document below, fill in the blanks, and get a finished .docx."));
+  wrap.appendChild(
+    el("div", { style: "margin:2px 0 16px;" }, [
+      el("button", { class: "btn secondary", onclick: () => startDraftFromText() }, "Draft from an email or notes"),
+    ])
+  );
 
   const body = el("div");
   wrap.appendChild(body);
@@ -2760,6 +2772,59 @@ function DraftView(preselectId) {
       });
   }
   loadTemplates();
+
+  // Paste an email or notes: Claude picks the master document and fills in
+  // what it can, then it opens in the normal fill-in form. Nothing is created
+  // until the owner presses Generate there.
+  function startDraftFromText() {
+    const overlay = el("div", { class: "modal-overlay" });
+    const errBox = el("div");
+    const ta = el("textarea", { rows: "10", maxlength: "12000", placeholder: "Paste the client's email or your notes here...", "aria-label": "Email or notes" });
+    const goBtn = el("button", { class: "btn" }, "Suggest a draft");
+    const modal = el("div", { class: "modal" }, [
+      el("h2", {}, "Draft from an email or notes"),
+      el("p", { class: "subtitle", style: "margin:2px 0 16px;" }, "Rotely picks the master document and fills in what the text says. You review every field before anything is created."),
+      errBox,
+      el("div", { class: "form-row" }, [ta]),
+      el("div", { style: "font-size:11.5px;color:var(--muted);line-height:1.4;" }, "AI suggestion. Each one uses 1 of your 50 monthly AI suggestions."),
+      el("div", { class: "modal-actions" }, [el("button", { class: "btn secondary", onclick: () => overlay.remove() }, "Cancel"), goBtn]),
+    ]);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    ta.focus();
+    goBtn.addEventListener("click", async () => {
+      if (goBtn.disabled) return;
+      errBox.innerHTML = "";
+      if (!ta.value.trim()) { errBox.appendChild(el("div", { class: "error-box" }, "Paste an email or some notes first.")); return; }
+      goBtn.disabled = true;
+      goBtn.textContent = "Reading...";
+      try {
+        const res = await api("/api/draft-from-text", { method: "POST", body: { text: ta.value } });
+        if (!res.template_id) {
+          errBox.appendChild(el("div", { class: "error-box" }, "That didn't match any of your master documents. " + (res.notes || "")));
+          goBtn.disabled = false;
+          goBtn.textContent = "Suggest a draft";
+          return;
+        }
+        const tpl = await api(`/api/templates/${res.template_id}`);
+        overlay.remove();
+        const left = `${res.usage.remaining} of ${res.usage.limit} AI suggestions left this month`;
+        openFillModal(
+          tpl,
+          {
+            values: res.values,
+            party_b: res.other_party,
+            ai: { summary: `Suggested ${res.template_name}, filled ${res.filled} of ${res.total} fields. ${left}.`, notes: res.notes },
+          },
+          (result, prefill) => showResult(tpl, result, prefill)
+        );
+      } catch (e) {
+        errBox.appendChild(el("div", { class: "error-box" }, e.message));
+        goBtn.disabled = false;
+        goBtn.textContent = "Suggest a draft";
+      }
+    });
+  }
 
   function startDraft(templateId) {
     api(`/api/templates/${templateId}`)
