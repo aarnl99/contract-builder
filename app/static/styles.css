@@ -875,3 +875,17 @@ a.link:hover { text-decoration: underline; }
   font-size: 13px; font-weight: 500; z-index: 300; box-shadow: var(--shadow-md);
 }
 .version-banner .btn { padding: 5px 12px; font-size: 12.5px; }
+
+/* ---------- Signer list (send for signature) ---------- */
+.signer-list { display: flex; flex-direction: column; gap: 10px; }
+.signer-row { display: flex; gap: 10px; align-items: flex-start; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; }
+.signer-num { flex: 0 0 22px; height: 22px; border-radius: 50%; background: var(--accent); color: white; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; margin-top: 8px; }
+.signer-fields { flex: 1; min-width: 0; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.signer-fields input { width: 100%; min-width: 0; }
+.signer-fields input[readonly] { opacity: 0.75; cursor: not-allowed; }
+.signer-actions { display: flex; gap: 4px; align-items: center; margin-top: 4px; }
+@media (max-width: 720px) { .signer-fields { grid-template-columns: 1fr; } .signer-row { flex-wrap: wrap; } }
+.esign-coverage { display: flex; flex-wrap: wrap; gap: 6px; }
+.esign-cov-chip { font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; background: #dcfce7; color: #166534; }
+.esign-cov-chip.empty { background: #fef3c7; color: #92400e; }
+.info-box { background: #dcfce7; color: #166534; border-radius: var(--radius-sm); padding: 10px 12px; font-size: 13px; margin: 10px 0; }
