@@ -293,6 +293,10 @@ class ShareLink(SQLModel, table=True):
     sender_email: str = ""
     status: str = "open"  # open | closed
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # Set only when the "shared with you" email was actually accepted by the
+    # mail provider -- so the Share screen can say honestly whether the client
+    # was emailed instead of assuming it worked.
+    emailed_at: Optional[datetime] = None
     last_viewed_at: Optional[datetime] = None
     # Set whenever the owner directly edits (see main.edit_generated_document)
     # the exact document this link points the client at, while the link is
