@@ -352,11 +352,35 @@ function toggleAvatarMenu() {
   logoRow.appendChild(logoBody);
   const logoHint = el("div", { style: "font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.4;" }, "Shown to clients on review and signing pages. PNG or JPG, up to 1 MB. Without one, they see your name.");
   logoRow.appendChild(logoHint);
+  // Where the logo links to on clients' pages. Blank = not clickable.
+  const linkInput = el("input", { type: "text", placeholder: "yourcompany.com", autocomplete: "off", "aria-label": "Website your logo links to", style: "flex:1;min-width:0;" });
+  const linkSave = el("button", { class: "btn secondary small" }, "Save");
+  const linkMsg = el("div", { style: "font-size:11.5px;margin-top:4px;min-height:15px;color:var(--muted);" });
+  logoRow.appendChild(el("div", { class: "label", style: "margin-top:12px;" }, "Logo links to"));
+  logoRow.appendChild(el("div", { style: "display:flex;gap:6px;align-items:center;margin-top:4px;" }, [linkInput, linkSave]));
+  logoRow.appendChild(linkMsg);
+  logoRow.appendChild(el("div", { style: "font-size:11.5px;color:var(--muted);line-height:1.4;" }, "Optional. Clients who click your logo go to this website. Leave it blank and the logo isn't clickable."));
+  async function saveLink() {
+    linkSave.disabled = true;
+    linkMsg.style.color = "var(--muted)";
+    linkMsg.textContent = "";
+    try {
+      const b = await api("/api/account/branding", { method: "PATCH", body: { link: linkInput.value } });
+      linkInput.value = b.link || "";
+      linkMsg.textContent = b.link ? "Saved. Your logo now links there." : "Saved. Your logo isn't clickable.";
+    } catch (e) {
+      linkMsg.style.color = "var(--danger)";
+      linkMsg.textContent = e.message;
+    } finally { linkSave.disabled = false; }
+  }
+  linkSave.addEventListener("click", saveLink);
+  linkInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); saveLink(); } });
   const logoFile = el("input", { type: "file", accept: "image/png,image/jpeg", style: "display:none;" });
   logoRow.appendChild(logoFile);
   dd.appendChild(logoRow);
 
   function paintLogo(b) {
+    if (document.activeElement !== linkInput) linkInput.value = b.link || "";
     logoBody.innerHTML = "";
     const preview = el("div", { class: "logo-preview" });
     if (b.has_logo) preview.appendChild(el("img", { src: b.logo_url, alt: "Your logo" }));
