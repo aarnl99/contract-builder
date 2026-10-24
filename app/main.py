@@ -1000,6 +1000,7 @@ def list_templates(user: User = Depends(get_current_user), session: Session = De
             "name": t.name,
             "document_type": t.document_type,
             "created_at": t.created_at.isoformat(),
+            "is_sample": t.is_sample,
             "placeholder_count": len(t.placeholders),
             "status": "ready" if len(t.placeholders) > 0 else "draft",
             "generated_count": _generated_count(session, t.id),
@@ -1566,7 +1567,9 @@ def generate_contract(
             }
 
         plan = _plan_info(session, user)
-        if plan["limit"] is not None and plan["used"] >= plan["limit"]:
+        # The sample document is free to play with: it neither needs a free
+        # slot nor uses one up (see the matching skip of the log below).
+        if not tpl.is_sample and plan["limit"] is not None and plan["used"] >= plan["limit"]:
             raise HTTPException(
                 402,
                 f"You have used all {plan['limit']} contracts included in your {user.plan} plan this month. "
@@ -1597,7 +1600,8 @@ def generate_contract(
         )
         session.add(gc)
         session.flush()
-        _log_generation_event(session, user.id, gc.id)
+        if not tpl.is_sample:
+            _log_generation_event(session, user.id, gc.id)
         session.commit()
         session.refresh(gc)
 
@@ -1609,6 +1613,181 @@ def generate_contract(
         "html": de.render_paragraphs_html(preview_doc),
         "plan": _plan_info(session, user),
     }
+
+
+# ---------------------------------------------------------------------------
+# Sample document: a safe place to learn the product
+# ---------------------------------------------------------------------------
+
+#: ".invalid" can never receive mail, and email_engine.send_email skips it, so
+#: nothing the sample's fake client triggers can reach a real inbox.
+SAMPLE_CLIENT_EMAIL = "sample-client@sample.invalid"
+SAMPLE_ACCESS_CODE = "SAMPLE24"
+SAMPLE_TEMPLATE_NAME = "Sample: Services Agreement"
+
+_SAMPLE_PARAGRAPHS = [
+    ("heading", "Sample Services Agreement"),
+    ("p", "This agreement is between {{provider_name}} (the \u201cProvider\u201d) and {{client_name}} (the \u201cClient\u201d) and starts on {{start_date}}."),
+    ("p", "1. Services. The Provider will deliver the services described in each statement of work signed by both parties."),
+    ("p", "2. Fees. The Client will pay the Provider {{monthly_fee}} per month."),
+    ("p", "3. Payment terms. The Client shall pay each invoice within thirty (30) days of receipt. Late amounts accrue interest at 1.5% per month."),
+    ("p", "4. Confidentiality. Each party will keep the other\u2019s confidential information private for three (3) years after this agreement ends."),
+    ("p", "5. Termination. Either party may end this agreement with thirty (30) days\u2019 written notice."),
+    ("p", "6. Governing law. This agreement is governed by the laws of the State of Delaware."),
+    ("p", "This is a sample document made up for practice. It is not a real contract."),
+]
+_SAMPLE_FIELDS = [
+    ("provider_name", "Provider name"),
+    ("client_name", "Client name"),
+    ("start_date", "Start date"),
+    ("monthly_fee", "Monthly fee"),
+]
+
+
+def _is_sample_doc(session: Session, gc: GeneratedContract) -> bool:
+    tpl = session.get(Template, gc.template_id) if gc.template_id else None
+    return bool(tpl and tpl.is_sample)
+
+
+def _sample_templates(session: Session, user: User) -> list:
+    return session.exec(select(Template).where(Template.owner_id == user.id, Template.is_sample == True).order_by(Template.id)).all()  # noqa: E712
+
+
+def _remove_sample(session: Session, user: User) -> None:
+    """Deletes the sample master document and every document drafted from it
+    (with their share links, redline rounds and bell notifications), through
+    the same code paths as deleting them by hand."""
+    for tpl in _sample_templates(session, user):
+        docs = session.exec(select(GeneratedContract).where(GeneratedContract.template_id == tpl.id).order_by(GeneratedContract.id.desc())).all()
+        doc_ids = [g.id for g in docs]
+        for gc in docs:
+            delete_generated_forever(gc.id, user, session)
+        if doc_ids:
+            for n in session.exec(select(Notification).where(Notification.user_id == user.id, Notification.generated_contract_id.in_(doc_ids))).all():
+                session.delete(n)
+            session.commit()
+        delete_template(tpl.id, user, session)
+
+
+def _locate_text(doc, needle: str):
+    for pi, para in enumerate(doc.paragraphs):
+        for ri, run in enumerate(para.runs):
+            i = run.text.find(needle)
+            if i >= 0:
+                return pi, ri, i
+    raise RuntimeError(f"sample text not found: {needle}")
+
+
+def _create_sample(session: Session, user: User) -> GeneratedContract:
+    from docx import Document as _NewDoc
+
+    _remove_sample(session, user)
+    tpl = Template(
+        owner_id=user.id, name=SAMPLE_TEMPLATE_NAME, document_type="Sample",
+        original_filename="sample-services-agreement.docx", working_path="", finalized=True, is_sample=True,
+    )
+    session.add(tpl)
+    session.flush()
+    tpl_dir = _template_dir(user.id, tpl.id)
+    os.makedirs(tpl_dir, exist_ok=True)
+    nd = _NewDoc()
+    for kind, text in _SAMPLE_PARAGRAPHS:
+        if kind == "heading":
+            nd.add_heading(text, 1)
+        else:
+            nd.add_paragraph(text)
+    tpl.working_path = os.path.join(tpl_dir, "working.docx")
+    nd.save(tpl.working_path)
+
+    provider = (user.name or "").strip() or "Your company"
+    client = "Sample Client Co."
+    values = {"provider_name": provider, "client_name": client, "start_date": datetime.utcnow().strftime("%B %d, %Y").replace(" 0", " "), "monthly_fee": "$4,000"}
+    for order, (key, label) in enumerate(_SAMPLE_FIELDS):
+        session.add(Placeholder(template_id=tpl.id, field_key=key, label=label, field_type="text", required=True, order=order, original_text=values[key]))
+
+    doc = de.load(tpl.working_path)
+    positions = de.fill_template_tracked(doc, values)
+    gen_dir = os.path.join(tpl_dir, "generated")
+    os.makedirs(gen_dir, exist_ok=True)
+    out_path = os.path.join(gen_dir, f"{secrets.token_hex(8)}.docx")
+    de.save(doc, out_path)
+    gc = GeneratedContract(
+        owner_id=user.id, template_id=tpl.id, template_name=tpl.name, document_type="Sample",
+        name=f"Sample: Services Agreement - {client}", file_path=out_path,
+        values_json=json.dumps([{"label": label, "field_key": key, "value": values[key]} for key, label in _SAMPLE_FIELDS]),
+        field_positions_json=json.dumps(positions), parties_json=json.dumps([provider, client]),
+    )
+    session.add(gc)
+    session.flush()
+
+    link = ShareLink(
+        generated_contract_id=gc.id, token=secrets.token_urlsafe(16), access_code=SAMPLE_ACCESS_CODE,
+        client_email=SAMPLE_CLIENT_EMAIL, client_first_name="Sample", client_last_name="Client",
+    )
+    session.add(link)
+    session.flush()
+    sub = RedlineSubmission(share_link_id=link.id, note="A few changes from our side. Thanks!", status="pending")
+    session.add(sub)
+    session.flush()
+
+    saved = de.load(out_path)
+
+    def add_edit(needle: str, proposed: str, comment: str, label: str):
+        pi, ri, start = _locate_text(saved, needle)
+        segs = [{"r": ri, "start": start, "end": start + len(needle)}]
+        original = de.extract_text_at(saved, [], pi, segs)
+        session.add(RedlineEdit(
+            submission_id=sub.id, field_key="", label=label, original_value=original, proposed_value=proposed,
+            comment=comment, location_json=json.dumps({"container_path": [], "paragraph_index": pi, "segments": segs}),
+        ))
+
+    add_edit("thirty (30) days of receipt", "sixty (60) days of receipt", "Our accounting team needs 60 days to process invoices.", "Payment terms")
+    add_edit("three (3) years", "one (1) year", "Three years feels long for this kind of work.", "Confidentiality period")
+    add_edit("Delaware", "Delaware", "Could we use New York law instead? Happy to talk it through.", "Governing law")
+    session.add(Notification(
+        user_id=user.id, type="redline_submitted", title=f'Sample Client sent redlines on "{gc.name}"',
+        body="3 changes proposed.", generated_contract_id=gc.id,
+    ))
+    session.commit()
+    session.refresh(gc)
+    return gc
+
+
+def _sample_payload(session: Session, user: User, request: Request) -> dict:
+    tpls = _sample_templates(session, user)
+    if not tpls:
+        return {"exists": False}
+    tpl = tpls[0]
+    docs = session.exec(select(GeneratedContract).where(GeneratedContract.template_id == tpl.id).order_by(GeneratedContract.id.desc())).all()
+    out = {"exists": True, "template_id": tpl.id, "generated_id": docs[0].id if docs else None}
+    if docs:
+        link = session.exec(
+            select(ShareLink).where(ShareLink.generated_contract_id.in_([g.id for g in docs])).order_by(ShareLink.created_at.desc())
+        ).first()
+        if link:
+            out["share_url"] = f"{_base_url(request)}/share/{link.token}"
+            out["access_code"] = link.access_code
+    return out
+
+
+@app.get("/api/sample")
+def get_sample(request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    return _sample_payload(session, user, request)
+
+
+@app.post("/api/sample")
+def create_sample(request: Request, user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    """Creates (or resets) the sample: a master document, a drafted contract
+    already shared with a made-up client, and a round of three changes that
+    client "sent", ready to accept, counter or reject."""
+    _create_sample(session, user)
+    return _sample_payload(session, user, request)
+
+
+@app.delete("/api/sample")
+def delete_sample(user: User = Depends(get_current_user), session: Session = Depends(get_session)):
+    _remove_sample(session, user)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1813,6 +1992,7 @@ def list_generated(
     status_by_doc = _document_statuses(session, [g.id for g in rows], owner_id=user.id)
     unresolved_by_doc = _unresolved_counts(session, [g.id for g in rows], owner_id=user.id)
     signature_by_doc = _document_signature_summaries(session, [g.id for g in rows])
+    sample_template_ids = {t.id for t in session.exec(select(Template).where(Template.owner_id == user.id, Template.is_sample == True)).all()}  # noqa: E712
     return [
         {
             "id": g.id,
@@ -1825,6 +2005,7 @@ def list_generated(
             "values": json.loads(g.values_json),
             "lineage_root_id": lineage_roots.get(g.id, g.id),
             "is_redline_result": g.source_submission_id is not None,
+            "is_sample": g.template_id in sample_template_ids,
             "parties": json.loads(g.parties_json or "[]"),
             "status": status_by_doc.get(g.id, {"key": "draft", "label": "Draft", "tone": "draft"}),
             # See _unresolved_counts -- #21 / phase 4. How many of the
@@ -2047,6 +2228,7 @@ def get_generated(generated_id: int, user: User = Depends(get_current_user), ses
         "html": html,
         "parties": json.loads(gc.parties_json or "[]"),
         "status": status,
+        "is_sample": _is_sample_doc(session, gc),
         # See _unresolved_counts -- #21 / phase 4.
         "unresolved_count": unresolved_count,
     }
@@ -3786,6 +3968,8 @@ def create_signature_request(
     before rather than erroring out."""
     with _signature_request_lock_for(generated_id):
         gc = _get_owned_generated(session, user, generated_id)
+        if _is_sample_doc(session, gc):
+            raise HTTPException(400, "This is the sample document, so sending it for signature is turned off. Draft a real document to try signing.")
 
         existing = session.exec(
             select(SigningRequest)
