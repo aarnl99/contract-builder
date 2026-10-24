@@ -2479,6 +2479,23 @@ function longTextBox(attrs, value) {
   return ta;
 }
 
+// The line above a counter box that says, in plain words, that what is in the
+// box IS the counter (so nobody thinks they still have to "do" the counter).
+// call .refresh(value, fromAI) whenever the box shows or its text changes.
+function counterStatusNote() {
+  const n = el("div", { class: "counter-status" });
+  n.refresh = (value, fromAI) => {
+    const has = !!(value || "").trim();
+    n.classList.toggle("ok", has);
+    n.textContent = !has
+      ? "Write your counter below."
+      : fromAI
+        ? "✓ The AI suggestion is now your counter. Edit it if you like — it is sent when you press Send response."
+        : "✓ This is your counter. It is sent when you press Send response.";
+  };
+  return n;
+}
+
 async function openRedlinesModal(generatedId) {
   // See the matching comment in openShareModal -- a leftover detail panel
   // would otherwise render on top of this modal (panel-overlay's z-index
@@ -2710,7 +2727,9 @@ async function openRedlinesModal(generatedId) {
             function buildReconsiderForm() {
               const rstage = { decision: "pending", counter_value: "" };
               const counterInput = longTextBox({ placeholder: "Your counter value...", style: "display:none;margin-top:8px;" });
-              counterInput.addEventListener("input", () => { rstage.counter_value = counterInput.value; });
+              const rNote = counterStatusNote();
+              rNote.style.display = "none";
+              counterInput.addEventListener("input", () => { rstage.counter_value = counterInput.value; rNote.refresh(counterInput.value); });
               const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
               const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
               const acceptBtn = el("button", { class: "btn small" }, "Accept");
@@ -2722,6 +2741,11 @@ async function openRedlinesModal(generatedId) {
               function paintRStage() {
                 const picked = rstage.decision !== "pending";
                 counterInput.style.display = rstage.decision === "countered" ? "" : "none";
+                rNote.style.display = rstage.decision === "countered" ? "" : "none";
+                rNote.refresh(counterInput.value);
+                rejectBtn.textContent = picked && rstage.decision === "rejected" ? "✓ Rejecting" : "Reject";
+                counterBtn.textContent = picked && rstage.decision === "countered" ? "✓ Your counter" : "Counter";
+                acceptBtn.textContent = picked && rstage.decision === "accepted" ? "✓ Accepting" : "Accept";
                 [rejectBtn, counterBtn, acceptBtn].forEach((b) => b.classList.remove("staged-active", "stage-accepted", "stage-rejected", "stage-countered"));
                 if (rstage.decision === "rejected") rejectBtn.classList.add("staged-active", "stage-rejected");
                 if (rstage.decision === "countered") counterBtn.classList.add("staged-active", "stage-countered");
@@ -2762,6 +2786,7 @@ async function openRedlinesModal(generatedId) {
                 el("div", {}, [
                   el("div", { style: "font-size:12px;color:var(--muted);margin-bottom:6px;" }, "Change your decision -- sent to the client as its own update, by email, right away."),
                   el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn, rChange]),
+                  rNote,
                   counterInput,
                   el("div", { style: "margin-top:8px;" }, [sendBtn]),
                 ])
@@ -2774,7 +2799,9 @@ async function openRedlinesModal(generatedId) {
             const stage = subStage[edit.id] || { decision: "pending", counter_value: "" };
             subStage[edit.id] = stage;
             const counterInput = longTextBox({ placeholder: "Your counter value...", style: stage.decision === "countered" ? "" : "display:none;" }, stage.counter_value);
-            counterInput.addEventListener("input", () => { stage.counter_value = counterInput.value; });
+            const cNote = counterStatusNote();
+            let fromAI = false;
+            counterInput.addEventListener("input", () => { stage.counter_value = counterInput.value; cNote.refresh(counterInput.value, fromAI); });
             const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
             const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
             const acceptBtn = el("button", { class: "btn small" }, "Accept");
@@ -2789,6 +2816,13 @@ async function openRedlinesModal(generatedId) {
             function paintStage() {
               const picked = stage.decision !== "pending";
               counterInput.style.display = stage.decision === "countered" ? "" : "none";
+              cNote.style.display = stage.decision === "countered" ? "" : "none";
+              cNote.refresh(counterInput.value, fromAI);
+              // The picked action reads as a status ("✓ Your counter"), not as
+              // a button still waiting to be pressed.
+              rejectBtn.textContent = picked && stage.decision === "rejected" ? "✓ Rejecting" : "Reject";
+              counterBtn.textContent = picked && stage.decision === "countered" ? "✓ Your counter" : "Counter";
+              acceptBtn.textContent = picked && stage.decision === "accepted" ? "✓ Accepting" : "Accept";
               [rejectBtn, counterBtn, acceptBtn].forEach((b) => b.classList.remove("staged-active", "stage-accepted", "stage-rejected", "stage-countered"));
               if (stage.decision === "rejected") rejectBtn.classList.add("staged-active", "stage-rejected");
               if (stage.decision === "countered") counterBtn.classList.add("staged-active", "stage-countered");
@@ -2830,6 +2864,8 @@ async function openRedlinesModal(generatedId) {
                   if (stage.decision !== "countered") setStage("countered");
                   counterInput.value = input.value;
                   stage.counter_value = input.value;
+                  fromAI = true;
+                  cNote.refresh(counterInput.value, fromAI);
                   counterInput.fit();
                   counterInput.focus();
                 });
@@ -2866,6 +2902,7 @@ async function openRedlinesModal(generatedId) {
             actions = el("div", { class: "decision-col" }, [
               el("div", { class: "decision-row" }, [
                 el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn, changeLink]),
+                cNote,
                 counterInput,
               ]),
               extras,
