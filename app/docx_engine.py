@@ -41,6 +41,7 @@ from typing import Dict, List, Optional
 
 from docx import Document
 from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Pt
 from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
@@ -343,6 +344,17 @@ def extract_text_at(doc: Document, container_path: Optional[List[List[int]]], pa
     return "".join(parts)
 
 
+def paragraph_anchor(doc: Document, container_path: Optional[List[List[int]]], paragraph_index: int) -> str:
+    """The first stretch of a paragraph's text, used to recognise the same
+    paragraph later. A new-paragraph edit has no selected text to compare, so
+    this is what tells apply time that the paragraph it was meant to follow is
+    still the one at that position. Raises MarkError for a bad position."""
+    paragraphs = _resolve_container(doc, container_path or []).paragraphs
+    if paragraph_index < 0 or paragraph_index >= len(paragraphs):
+        raise MarkError("Invalid paragraph index")
+    return paragraphs[paragraph_index].text[:120]
+
+
 def _tag_and_check_overlaps(original_runs: List, group: List[dict]) -> List[tuple]:
     """Shared by _apply_paragraph_group and validate_no_overlaps (bug
     tracker #44): normalizes every edit's segments in `group` against
@@ -375,6 +387,29 @@ def _tag_and_check_overlaps(original_runs: List, group: List[dict]) -> List[tupl
     return tagged
 
 
+_FORMAT_FLAGS = ("b", "i", "u")
+
+
+def clean_format(raw) -> str:
+    """Normalizes a formatting request to a string of unique flags from
+    b (bold), i (italic), u (underline), in that order. Anything else is
+    dropped, so a stored value can never carry more than those three."""
+    value = str(raw or "").lower()
+    return "".join(f for f in _FORMAT_FLAGS if f in value)
+
+
+def _apply_format(run, fmt) -> None:
+    """Turns on bold/italic/underline for a run. Only ever adds: leaving a
+    flag off means "look like the text around it", not "remove it"."""
+    fmt = clean_format(fmt)
+    if "b" in fmt:
+        run.bold = True
+    if "i" in fmt:
+        run.italic = True
+    if "u" in fmt:
+        run.underline = True
+
+
 def _apply_paragraph_group(paragraph: Paragraph, group: List[dict]) -> None:
     """Rebuild one paragraph's runs, applying every edit in `group` (each
     {"segments": [...], "new_text": str}) in a single pass over the
@@ -396,29 +431,39 @@ def _apply_paragraph_group(paragraph: Paragraph, group: List[dict]) -> None:
             continue
         segs.sort(key=lambda x: x[0])
         text = run.text or ""
+        # (text, format) pieces in reading order; format is only ever set on
+        # a piece that is newly typed text, never on the surrounding original.
         pieces = []
         cursor = 0
         for s, e, g_idx in segs:
             if s > cursor:
-                pieces.append(text[cursor:s])
+                pieces.append((text[cursor:s], None))
             if g_idx not in emitted:
-                pieces.append(group[g_idx]["new_text"])
+                pieces.append((group[g_idx]["new_text"], clean_format(group[g_idx].get("format"))))
                 emitted.add(g_idx)
             cursor = e
         if cursor < len(text):
-            pieces.append(text[cursor:])
+            pieces.append((text[cursor:], None))
 
         r_element = run._r
-        first = pieces[0] if pieces else ""
-        run.text = first
+        first_text, first_fmt = pieces[0] if pieces else ("", None)
+        if first_fmt:
+            # The newly typed text leads this run but has its own look, so it
+            # can't reuse the original run: give every piece its own run.
+            run.text = ""
+            rest = pieces
+        else:
+            run.text = first_text
+            rest = pieces[1:]
         anchor = r_element
-        for piece in pieces[1:]:
-            if not piece:
+        for piece_text, piece_fmt in rest:
+            if not piece_text:
                 continue
-            new_run = _clone_run_with_text(run, piece)
+            new_run = _clone_run_with_text(run, piece_text)
+            _apply_format(new_run, piece_fmt)
             anchor.addnext(new_run._r)
             anchor = new_run._r
-        if not first:
+        if not run.text:
             parent_el = r_element.getparent()
             parent_el.remove(r_element)
 
@@ -440,25 +485,101 @@ def _group_edits_by_paragraph(edits: List[dict]) -> Dict[tuple, List[dict]]:
     return groups, path_by_key
 
 
+def _body_run(paragraph: Paragraph):
+    """The run that best stands for how a paragraph's text looks: the one
+    with the most characters, so a short bold label ("a.") doesn't decide
+    the look of a whole new paragraph. None for a paragraph with no runs."""
+    runs = list(paragraph.runs)
+    if not runs:
+        return None
+    return max(runs, key=lambda r: len(r.text or ""))
+
+
+def _new_paragraph_like(paragraph: Paragraph, text: str, fmt) -> Paragraph:
+    """A new paragraph that looks like `paragraph`: same style, indent,
+    spacing and (for Word's automatic lists) the same list, so the next
+    letter or number appears by itself. Holds only `text`, in the look of the
+    original's body text plus any requested bold/italic/underline. Not yet
+    attached to the document."""
+    new_p = copy.deepcopy(paragraph._p)
+    ppr = new_p.pPr
+    for child in list(new_p):
+        if child is not ppr:
+            new_p.remove(child)
+    if ppr is not None:
+        # A section break lives in a paragraph's properties; copying it would
+        # start a second section.
+        for sect in ppr.findall(qn("w:sectPr")):
+            ppr.remove(sect)
+    new_par = Paragraph(new_p, paragraph._parent)
+    model = _body_run(paragraph)
+    if model is not None:
+        new_r = copy.deepcopy(model._r)
+        for child in list(new_r):
+            if child.tag != qn("w:rPr"):
+                new_r.remove(child)
+        new_p.append(new_r)
+        run = DocxRun(new_r, new_par)
+        run.text = text
+        _apply_format(run, fmt)
+    else:
+        run = new_par.add_run(text)
+        _apply_format(run, fmt)
+    return new_par
+
+
 def apply_text_edits(doc: Document, edits: List[dict]) -> None:
     """Apply a batch of redline text replacements directly onto an
     already-generated document -- unlike mark_placeholder, which inserts a
     {{token}} into a *template*, this writes literal replacement text in
     place. Each edit is {"container_path", "paragraph_index",
-    "segments": [{"r","start","end"}, ...], "new_text"}. Edits are grouped
-    by paragraph so multiple edits landing in the same paragraph are applied
-    together in one pass (see _apply_paragraph_group) instead of
-    invalidating each other's recorded run indices."""
-    groups, path_by_key = _group_edits_by_paragraph(edits)
+    "segments": [{"r","start","end"}, ...], "new_text"} and may carry
+    "format" (bold/italic/underline flags, see clean_format) for the new
+    text. Edits are grouped by paragraph so multiple edits landing in the
+    same paragraph are applied together in one pass (see
+    _apply_paragraph_group) instead of invalidating each other's recorded run
+    indices.
 
+    An edit with "new_paragraph" true adds a whole new paragraph right after
+    paragraph_index (segments are ignored). Every target paragraph is looked
+    up before anything changes, so inserting one paragraph never shifts where
+    another edit lands, and several new paragraphs after the same one come
+    out in the order given."""
+    text_edits = [e for e in edits if not e.get("new_paragraph")]
+    para_edits = [e for e in edits if e.get("new_paragraph")]
+
+    # Resolve everything against the untouched document first.
+    para_targets = []
+    for e in para_edits:
+        container = _resolve_container(doc, e.get("container_path") or [])
+        paragraphs = container.paragraphs
+        p_idx = e["paragraph_index"]
+        if p_idx < 0 or p_idx >= len(paragraphs):
+            raise MarkError("Invalid paragraph index")
+        para_targets.append((e, paragraphs[p_idx]))
+
+    groups, path_by_key = _group_edits_by_paragraph(text_edits)
+    resolved_groups = []
     for key, group in groups.items():
-        container_path = path_by_key[key]
-        container = _resolve_container(doc, container_path)
+        container = _resolve_container(doc, path_by_key[key])
         paragraphs = container.paragraphs
         p_idx = key[1]
         if p_idx < 0 or p_idx >= len(paragraphs):
             raise MarkError("Invalid paragraph index")
-        _apply_paragraph_group(paragraphs[p_idx], group)
+        resolved_groups.append((paragraphs[p_idx], group))
+
+    for paragraph, group in resolved_groups:
+        _apply_paragraph_group(paragraph, group)
+
+    last_inserted = {}  # id of the target paragraph's XML element -> where the next one goes
+    for e, target in para_targets:
+        text = e.get("new_text") or ""
+        if not text.strip():
+            raise MarkError("A new paragraph needs some text")
+        new_par = _new_paragraph_like(target, text, e.get("format"))
+        anchor = last_inserted.get(id(target._p), target._p)
+        anchor.addnext(new_par._p)
+        last_inserted[id(target._p)] = new_par._p
 
 
 def validate_no_overlaps(doc: Document, edits: List[dict]) -> None:
@@ -479,8 +600,16 @@ def validate_no_overlaps(doc: Document, edits: List[dict]) -> None:
     used to validate each edit individually, closes that gap for good --
     the batch is refused before a single RedlineSubmission/RedlineEdit row
     ever gets created for it, exactly matching the instant-apply path's
-    existing fail-closed behavior."""
-    groups, path_by_key = _group_edits_by_paragraph(edits)
+    existing fail-closed behavior.
+
+    New-paragraph edits can't overlap anything, but their target paragraph
+    must exist."""
+    for e in edits:
+        if e.get("new_paragraph"):
+            paragraphs = _resolve_container(doc, e.get("container_path") or []).paragraphs
+            if e["paragraph_index"] < 0 or e["paragraph_index"] >= len(paragraphs):
+                raise MarkError("Invalid paragraph index")
+    groups, path_by_key = _group_edits_by_paragraph([e for e in edits if not e.get("new_paragraph")])
 
     for key, group in groups.items():
         container_path = path_by_key[key]

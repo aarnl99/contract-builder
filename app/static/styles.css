@@ -765,7 +765,7 @@ a.link:hover { text-decoration: underline; }
    highlight matching exactly what was dragged over, including selections
    that wrap across lines. */
 .text-selection-highlight {
-  position: fixed; z-index: 40; pointer-events: none;
+  position: fixed; z-index: 65; pointer-events: none;
   /* Translucent + multiply so the selected words stay readable underneath;
      the old opaque fill painted over them and the text looked blank. */
   background: rgba(67, 56, 202, 0.2); mix-blend-mode: multiply; border-radius: 2px;
@@ -1229,3 +1229,119 @@ a.brand-custom:focus-visible { outline: 2px solid var(--accent); outline-offset:
 }
 .auth-bg .row:nth-child(even) { margin-left: -1.4em; }
 .auth-bg .row i { font-style: normal; color: var(--accent); }
+
+/* ---------- Redline tools: key, pill, card, marks (see redline_ui.js) ---------- */
+
+/* The key stays pinned above the document while reading and editing. */
+.rl-key {
+  position: sticky; top: 8px; z-index: 30; margin: 0 0 16px;
+  background: rgba(255, 255, 255, .96); backdrop-filter: blur(6px);
+  border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-md); padding: 8px 12px;
+}
+.rl-key-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.rl-key-title { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.rl-sw { font: 600 12.5px Georgia, serif; font-style: normal; padding: 1px 7px; border-radius: 4px; }
+.rl-sw.add { color: var(--success); background: var(--success-soft); text-decoration: underline; text-underline-offset: 2px; }
+.rl-sw.del { color: var(--danger); text-decoration: line-through; }
+.rl-sw.cmt { background: var(--accent-soft); box-shadow: inset 0 -2px 0 var(--accent); }
+.rl-key-toggle {
+  margin-left: auto; font: 600 12.5px inherit; font-family: inherit; color: var(--accent); background: var(--accent-soft);
+  border: 0; border-radius: 999px; padding: 5px 12px; cursor: pointer;
+}
+.rl-key-help {
+  display: none; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 8px; padding-top: 8px;
+  border-top: 1px solid #eef1f6; font-size: 12.5px; color: var(--muted); line-height: 1.4;
+}
+.rl-key-help b { color: var(--ink); }
+.rl-key.open .rl-key-help { display: grid; }
+@media (max-width: 640px) {
+  .rl-key { top: 6px; padding: 7px 10px; }
+  .rl-key-row { gap: 8px; }
+  .rl-key-help { grid-template-columns: 1fr; gap: 6px; }
+}
+
+/* The dark pill that appears after highlighting or clicking. */
+.rl-pill {
+  position: fixed; z-index: 70; display: flex; gap: 2px; background: var(--ink); border-radius: 999px; padding: 4px;
+  box-shadow: var(--shadow-md);
+}
+.rl-pill-btn {
+  font: inherit; font-size: 12.5px; font-weight: 700; color: #fff; background: none; border: 0; border-radius: 999px;
+  padding: 8px 13px; cursor: pointer; white-space: nowrap;
+}
+.rl-pill-btn:hover, .rl-pill-btn:focus-visible { background: var(--ink-soft); outline: none; }
+.rl-pill-btn.warn { color: #fecaca; }
+.rl-pill-sep { width: 1px; background: rgba(255, 255, 255, .18); margin: 6px 2px; }
+
+/* The card: comment / replace / insert / new paragraph. */
+.redline-popover.rl-card { width: 320px; border-radius: 16px; padding: 16px; z-index: 70; }
+.rl-card .rl-label-row { display: flex; justify-content: space-between; align-items: center; margin: 10px 0 6px; }
+.rl-card .rl-quote {
+  font: 13px/1.45 Georgia, serif; color: var(--muted); background: var(--bg); border-radius: 10px;
+  padding: 8px 10px; margin: 0 0 4px; max-height: 64px; overflow: auto;
+}
+.rl-card .rl-hint { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.4; }
+.rl-card textarea.rl-main-input { min-height: 64px; resize: vertical; }
+.rl-fmt { display: flex; gap: 4px; }
+.rl-fmt-btn {
+  width: 30px; height: 28px; border: 1px solid var(--border); background: #fff; border-radius: 8px;
+  font: 700 13px Georgia, serif; color: var(--ink); cursor: pointer;
+}
+.rl-fmt-btn.rl-fmt-i { font-style: italic; }
+.rl-fmt-btn.rl-fmt-u { text-decoration: underline; }
+.rl-fmt-btn.on { background: var(--accent-soft); border-color: var(--accent-soft-border); color: var(--accent); }
+@media (max-width: 640px) {
+  .redline-popover.rl-card {
+    left: 0 !important; right: 0; top: auto !important; bottom: 0; width: 100%;
+    border-radius: 20px 20px 0 0; padding: 18px 16px 22px; max-height: 70vh; overflow: auto;
+  }
+  .rl-pill-btn { padding: 10px 12px; }
+}
+
+/* Marks painted into the document. */
+.contract-view .run .fv-ins.fmt-b, .contract-view .fv-ghost.fmt-b, .contract-view .newp-mark.fmt-b { font-weight: 800; }
+.contract-view .run .fv-ins.fmt-i, .contract-view .fv-ghost.fmt-i, .contract-view .newp-mark.fmt-i { font-style: italic; }
+.contract-view .run .fv-ins.fmt-u, .contract-view .fv-ghost.fmt-u, .contract-view .newp-mark.fmt-u { text-decoration-thickness: 2px; }
+.contract-view .run .fv-ghost, .contract-view .newp-mark .np-text {
+  color: var(--success); text-decoration: underline; text-underline-offset: 2px;
+}
+.contract-view .run .fv-ghost {
+  background: var(--success-soft); border-radius: 3px; padding: 0 2px; font-weight: 600; white-space: pre-wrap;
+}
+.contract-view .run .fv-ghost:empty::after {
+  content: ""; display: inline-block; width: 1px; height: 1em; margin: 0 1px; background: var(--success);
+  vertical-align: text-bottom; animation: insert-caret-blink 1s step-end infinite;
+}
+.contract-view .run .fv-ins { cursor: pointer; white-space: pre-wrap; }
+.contract-view .run .fv-del { cursor: pointer; }
+.contract-view .run .rl-cmt { background: var(--accent-soft); box-shadow: inset 0 -2px 0 var(--accent); border-radius: 2px; cursor: pointer; }
+.contract-view .rl-cmt.selected, .contract-view .newp-mark.selected { box-shadow: 0 0 0 2px var(--accent) inset; }
+.rl-badge {
+  display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--accent); color: #fff; font: 700 11px/1 Inter, sans-serif; vertical-align: middle; margin: 0 2px 0 4px;
+  cursor: pointer; position: relative; top: -1px;
+}
+.contract-view .newp-mark {
+  position: relative; margin: 0 0 14px -14px; padding: 2px 10px 2px 11px; border-left: 3px solid var(--success);
+  background: var(--success-soft); border-radius: 0 8px 8px 0; white-space: pre-wrap; cursor: pointer;
+}
+.contract-view .newp-mark.ghost { border-left-style: dashed; cursor: text; }
+.contract-view .newp-mark.ghost .np-text:empty::after {
+  content: ""; display: inline-block; width: 1px; height: 1em; background: var(--success); vertical-align: text-bottom;
+  animation: insert-caret-blink 1s step-end infinite;
+}
+.contract-view .newp-mark.counter-pending { box-shadow: inset 0 -2px 0 var(--accent); }
+
+/* The numbered list of suggestions. */
+.redline-list-item { cursor: pointer; }
+.rl-top .rl-num {
+  flex: none; width: 20px; height: 20px; border-radius: 50%; background: var(--bg); color: var(--muted);
+  font: 700 11px/20px Inter, sans-serif; text-align: center;
+}
+.rl-tag { flex: none; font-size: 11px; font-weight: 700; border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+.rl-tag.insert, .rl-tag.paragraph { background: #ddf1e7; color: #17704a; }
+.rl-tag.replace { background: #fbefd6; color: #8a5300; }
+.rl-tag.delete { background: #fde4e4; color: #a12020; }
+.rl-tag.comment { background: var(--accent-soft); color: var(--accent); }
+.rl-top { align-items: center; }
+.rl-top .rl-label { flex: 1; min-width: 0; }
