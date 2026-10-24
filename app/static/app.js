@@ -611,10 +611,23 @@ function refreshTopbarInPlace() {
 // Auth view
 // ---------------------------------------------------------------------------
 
+// The faint repeated wordmark behind the log in / sign up / reset cards.
+// Purely decorative: aria-hidden, and CSS keeps it from taking clicks.
+function authBackdrop() {
+  const rows = [];
+  for (let i = 0; i < 12; i++) {
+    const words = [];
+    for (let j = 0; j < 4; j++) words.push(el("span", { class: "w" }, ["Rotely", el("i", {}, ".ai")]));
+    rows.push(el("div", { class: "row", style: "--i:" + i }, words));
+  }
+  return el("div", { class: "auth-bg", "aria-hidden": "true" }, rows);
+}
+
 function AuthView(mode) {
   let tab = mode || "login";
   const wrap = el("div", { class: "auth-shell" });
   const card = el("div", { class: "card" });
+  wrap.appendChild(authBackdrop());
   wrap.appendChild(card);
 
   // If we just landed here from a real (non-hash) redirect -- the
@@ -856,6 +869,7 @@ function AuthView(mode) {
 function ResetPasswordView() {
   const wrap = el("div", { class: "auth-shell" });
   const card = el("div", { class: "card" });
+  wrap.appendChild(authBackdrop());
   wrap.appendChild(card);
 
   const hashQuery = new URLSearchParams(location.hash.split("?")[1] || "");
