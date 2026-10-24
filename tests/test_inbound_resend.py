@@ -136,9 +136,10 @@ def test_unknown_address_is_not_drafted(hook):
     assert r.json()["ok"] is False and hook.got == []
 
 
-def test_sendgrid_form_posts_still_work(hook):
+def test_sendgrid_form_posts_still_work(hook, monkeypatch):
+    monkeypatch.setattr(ee, "RESEND_WEBHOOK_SECRET", "")  # the legacy path exists only where no Resend signing secret is set
     r = TestClient(m.app).post(f"/api/email/inbound/{PATH_SECRET}", data={
         "to": hook.address, "from": hook.owner_email, "subject": "NDA for Acme", "text": "Client is Acme",
-        "dkim": "{@x.test : pass}"})
+        "dkim": "{@%s : pass}" % hook.owner_email.split("@")[1]})
     assert r.status_code == 200 and r.json() == {"ok": True}
     assert hook.got[0]["body"] == "Client is Acme"

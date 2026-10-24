@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import string
+from html.parser import HTMLParser
 from typing import Optional
 
 import httpx
@@ -179,15 +180,20 @@ def verify_resend_signature(secret: str, svix_id: str, svix_timestamp: str, svix
     try:
         ts = int(svix_timestamp)
         key = base64.b64decode(secret.split("_", 1)[1] if secret.startswith("whsec_") else secret)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return False
-    if abs((now if now is not None else time.time()) - ts) > tolerance_seconds:
+    if not key:  # a mistyped secret that decodes to nothing must never validate anything
+        return False
+    try:
+        if abs((now if now is not None else time.time()) - ts) > tolerance_seconds:
+            return False
+    except OverflowError:
         return False
     signed = f"{svix_id}.{svix_timestamp}.".encode() + body
     expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
     for part in svix_signature.split():
         version, _, sig = part.partition(",")
-        if version == "v1" and hmac.compare_digest(sig, expected):
+        if version == "v1" and hmac.compare_digest(sig.encode("utf-8", "replace"), expected.encode()):
             return True
     return False
 
@@ -197,8 +203,11 @@ def fetch_received_email(email_id: str) -> dict:
     an API key with full access (a send-only key can't read received mail)."""
     if not RESEND_API_KEY:
         raise RuntimeError("RESEND_API_KEY is not set, so received email can't be read.")
+    if not email_id:
+        raise RuntimeError("The webhook didn't say which email to read.")
+    from urllib.parse import quote
     resp = httpx.get(
-        f"https://api.resend.com/emails/receiving/{email_id}",
+        f"https://api.resend.com/emails/receiving/{quote(str(email_id), safe='')}",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
         timeout=20,
     )
@@ -209,21 +218,29 @@ def fetch_received_email(email_id: str) -> dict:
 def sender_is_authenticated(authentication) -> bool:
     """Whether the receiving server vouches that the email really came from
     the address in its From line. Resend reports spf/dkim/dmarc as "pass",
-    "fail", "gray", ...; DMARC or DKIM passing means the From domain signed
-    it. Missing or unclear results count as NOT authenticated."""
+    "fail", "gray", ...; only DMARC passing counts, because DMARC is the check
+    that ties the result to the domain in the From line (a DKIM pass alone can
+    be for some other domain the sender controls). Missing or unclear results
+    count as NOT authenticated."""
     if not isinstance(authentication, dict):
         return False
-    return str(authentication.get("dmarc", "")).lower() == "pass" or str(authentication.get("dkim", "")).lower() == "pass"
+    return str(authentication.get("dmarc", "")).lower() == "pass"
 
 
 _SIGN_OFFS = re.compile(r"^(thanks|thank you|best|regards|kind regards|cheers|sincerely|sent from)\b", re.IGNORECASE)
-_FILLER = re.compile(
-    r"\b(send|it|this|to|the|client|is|name|email|e-mail|address|contact|please|their|his|her|and|with|for|"
-    r"full|first|last|you|can|go|ahead|share|draft|contract|they|are|his|hers)\b", re.IGNORECASE)
-_ANY_EMAIL = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
-# Addresses that are examples or placeholders, never a real client (our own
-# emails use tiffany@example.com as the sample to follow).
-_PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net", ".test", ".invalid", ".example")
+# Starts only where an address begins, so a long run of address characters is
+# scanned once instead of once per character (keeps a hostile email cheap).
+_ANY_EMAIL = re.compile(r"(?<![\w.+\-])[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
+# Domains that are examples or placeholders, never a real client (our own
+# emails use tiffany@example.com as the sample to follow). A domain matches
+# when it is one of these or a subdomain of one.
+_PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net", "test", "invalid", "example")
+MAX_REPLY_CHARS = 20000  # replies are short; anything past this is not the answer
+
+
+def _is_placeholder_address(address: str) -> bool:
+    domain = address.lower().rsplit("@", 1)[-1]
+    return any(domain == d or domain.endswith("." + d) for d in _PLACEHOLDER_DOMAINS)
 
 
 def strip_quoted_reply(text: str) -> str:
@@ -251,13 +268,59 @@ def _clean_name_part(value: str) -> str:
     return value.title() if value and value == value.lower() else value
 
 
+# A name word: letters in any language, with hyphens or apostrophes inside
+# (Mary-Jane, O'Brien, Renee, Garcia, Zoe), optionally ending in a full stop.
+_NAME_WORD = re.compile(r"[^\W\d_]+(?:['\u2019\-][^\W\d_]+)*\.?")
+_TITLES = {"dr", "mr", "mrs", "ms", "mx", "prof", "professor", "sir", "madam"}
+_TRAILING_WORDS = {"at", "on", "is", "email", "e-mail", "address", "mail"}
+_GREETING = re.compile(r"^\s*(hi|hello|hey|dear|thanks|thank you|good (?:morning|afternoon|evening))\b", re.IGNORECASE)
+_LEAD_IN = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can|could)\s+you\s+)?"
+    r"(?:send(?:\s+(?:it|this))?(?:\s+to)?|share(?:\s+it)?(?:\s+with)?|the\s+client(?:'s)?(?:\s+name)?\s+is|"
+    r"client(?:\s+name)?|name|to|for|contact)\b\s*[:\-]?\s*",
+    re.IGNORECASE)
+
+
+def _name_words(segment: str) -> list:
+    """The words of a segment if it reads as a plain person's name, else []."""
+    seg = segment.strip()
+    for _ in range(3):  # "please send it to ..." may stack lead-ins
+        stripped = _LEAD_IN.sub("", seg, count=1)
+        if stripped == seg:
+            break
+        seg = stripped
+    words = seg.split()
+    while words and words[0].lower().rstrip(".") in _TITLES:
+        words = words[1:]
+    while words and words[-1].lower() in _TRAILING_WORDS:
+        words = words[:-1]
+    if 2 <= len(words) <= 4 and all(_NAME_WORD.fullmatch(w) for w in words):
+        return words
+    return []
+
+
 def _name_from_line(line: str, email: str = "") -> tuple:
+    """First and last name from one line such as "Tiffany Xia, tiffany@virio.ai",
+    "Tiffany Xia <tiffany@virio.ai>" or "send it to Dr. Tiffany Xia at ...". Text
+    in brackets (a job title) is ignored; the first comma-separated piece that
+    looks like a name wins, so "Tiffany Xia, Acme Corp, t@acme.com" is Tiffany Xia."""
     cand = re.sub(re.escape(email), " ", line, flags=re.IGNORECASE) if email else line
-    cand = re.sub(r"[<>(),;:|\-\u2013]", " ", cand)
-    cand = _FILLER.sub(" ", cand)
-    words = [w for w in cand.split() if re.fullmatch(r"[A-Za-z'\u2019.\-]{1,40}", w)]
-    if 2 <= len(words) <= 4:
-        return _clean_name_part(words[0]), _clean_name_part(" ".join(words[1:]))
+    cand = re.sub(r"\([^)]*\)", " ", cand)
+    for segment in re.split(r"[,;|<>]|\s[-\u2013\u2014]\s", cand):
+        words = _name_words(segment)
+        if words:
+            return _clean_name_part(words[0]), _clean_name_part(" ".join(words[1:]))
+    return "", ""
+
+
+def _labelled_name(text: str) -> tuple:
+    fm = re.search(r"first\s*name\s*[:=\-]\s*(.+?)(?=\s+last\s*name\b|[\n,;]|$)", text, re.IGNORECASE)
+    lm = re.search(r"last\s*name\s*[:=\-]\s*([^\n,;]+)", text, re.IGNORECASE)
+    if not (fm and lm):
+        return "", ""
+    first, last = fm.group(1).strip(), lm.group(1).strip()
+    if all(_NAME_WORD.fullmatch(w) for w in (first.split() + last.split())) and 1 <= len(first.split()) <= 2 and 1 <= len(last.split()) <= 3:
+        return _clean_name_part(first), _clean_name_part(last)
     return "", ""
 
 
@@ -266,41 +329,75 @@ def parse_recipient(text: str, exclude=()) -> dict:
     like "Tiffany Xia, tiffany@virio.ai" or labelled lines ("First name: ...").
     Deliberately plain text rules, not an AI: the email body can come from
     anywhere, and a wrong guess here would send a contract to the wrong
-    person. Anything not clearly there comes back blank so the caller asks."""
+    person. The name has to be on the same line as the address or on the line
+    just above it (never below, where a signature lives), and greeting lines
+    never count. Anything not clearly there comes back blank so the caller asks."""
     skip = {e.lower() for e in exclude}
     body = []
-    for line in (text or "").splitlines():
+    for line in (text or "")[:MAX_REPLY_CHARS].splitlines():
         if _SIGN_OFFS.match(line.strip()):
             break
         body.append(line)
     text = "\n".join(body)
     emails = [e for e in _ANY_EMAIL.findall(text)
               if e.lower() not in skip and not e.lower().endswith("@" + EMAIL_DOMAIN.lower())
-              and not any(e.lower().endswith(d) or e.lower().endswith("@" + d) for d in _PLACEHOLDER_DOMAINS)]
+              and not _is_placeholder_address(e)]
     email = emails[0] if emails else ""
-    first = last = ""
-    fm = re.search(r"first\s*name\s*[:=\-]\s*([^\n,;]+)", text, re.IGNORECASE)
-    lm = re.search(r"last\s*name\s*[:=\-]\s*([^\n,;]+)", text, re.IGNORECASE)
-    if fm and lm:
-        first, last = _clean_name_part(fm.group(1)), _clean_name_part(lm.group(1))
-    else:
+    first, last = _labelled_name(text)
+    if not (first and last):
+        first = last = ""
         lines = text.splitlines()
         idx = next((i for i, l in enumerate(lines) if email and email.lower() in l.lower()), None)
         if idx is not None:
             first, last = _name_from_line(lines[idx], email)
-            for j in (idx - 1, idx + 1):  # name on the line just above/below the email
-                if not (first and last) and 0 <= j < len(lines) and lines[j].strip() and not _ANY_EMAIL.search(lines[j]):
-                    first, last = _name_from_line(lines[j])
+            j = idx - 1  # name on the line just above the email
+            if not (first and last) and j >= 0 and lines[j].strip() and not _ANY_EMAIL.search(lines[j]) \
+                    and not _GREETING.match(lines[j]):
+                first, last = _name_from_line(lines[j])
     return {"first_name": first, "last_name": last, "email": email}
+
+
+class _TextExtractor(HTMLParser):
+    """Visible text of an email, skipping scripts, styles and quoted replies
+    (blockquote, nested ones included). One pass over the input, so a hostile
+    pile of unclosed tags costs time in proportion to its size, not its square."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._skip = 0
+        self._quote = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag == "blockquote":
+            self._quote += 1
+        elif tag == "br":
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        elif tag == "blockquote":
+            self._quote = max(0, self._quote - 1)
+        elif tag in ("p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip and not self._quote:
+            self.parts.append(data)
 
 
 def html_to_text(html: str) -> str:
     """Plain text from an HTML-only email, good enough to read field values from."""
-    import html as htmllib
-    text = re.sub(r"(?is)<(script|style|blockquote).*?</\1>", " ", html or "")  # quoted replies are not the new message
-    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = htmllib.unescape(text)
+    parser = _TextExtractor()
+    try:
+        parser.feed((html or "")[:200000])
+        parser.close()
+    except Exception:  # malformed markup: use whatever was read so far
+        pass
+    text = "".join(parser.parts)
     text = re.sub(r"[ \t\xa0]+", " ", text)
     return re.sub(r"\n\s*\n+", "\n\n", text).strip()
 

@@ -6629,19 +6629,34 @@ def acknowledge_response(token: str, body: AckResponseBody, request: Request, se
 # Email drafting: per-account alias, inbound webhook, AI extraction
 # ---------------------------------------------------------------------------
 
-_EMAIL_ADDR_RE = re.compile(r"[\w\.\+\-]+@[\w\-]+\.[\w\.\-]+")
+# Starts only where an address begins (see email_engine._ANY_EMAIL).
+_EMAIL_ADDR_RE = re.compile(r"(?<![\w.+\-])[\w\.\+\-]+@[\w\-]+\.[\w\.\-]+")
+MAX_HEADER_CHARS = 2000
 
 
 def _extract_email_address(header_value: str) -> str:
-    """The real address in a From/To header. The address inside <...> wins:
-    a display name can contain any text, including someone else's email
-    ("aaron@gmail.com" <attacker@evil.test> is attacker@evil.test)."""
-    value = header_value or ""
-    for candidate in reversed(re.findall(r"<([^<>]+)>", value)):
-        if _EMAIL_ADDR_RE.fullmatch(candidate.strip()):
-            return candidate.strip()
-    m = _EMAIL_ADDR_RE.search(value)
-    return m.group(0) if m else value.strip()
+    """The one real address in a From header, or "" when there isn't exactly
+    one. Uses the standard header parser, so a display name that contains
+    someone else's email ("aaron@gmail.com" <attacker@evil.test>) and text in
+    (comments) are not mistaken for the sender, and a header listing several
+    people is refused rather than guessed at."""
+    from email.utils import getaddresses
+    found = [addr.strip() for _, addr in getaddresses([(header_value or "")[:MAX_HEADER_CHARS]]) if addr.strip()]
+    if len(found) != 1 or not _EMAIL_ADDR_RE.fullmatch(found[0]):
+        return ""
+    return found[0]
+
+
+def _dkim_passes_for(dkim_field: str, from_address: str) -> bool:
+    """SendGrid reports DKIM as text like "{@example.com : pass}". Counts only
+    when a signature that passed belongs to the From address's own domain (or
+    a parent of it); a pass for any other domain proves nothing."""
+    domain = from_address.lower().rsplit("@", 1)[-1]
+    for signer, result in re.findall(r"@([\w.\-]+)\s*:\s*(\w+)", str(dkim_field or "")[:1000]):
+        signer = signer.lower()
+        if result.lower() == "pass" and (domain == signer or domain.endswith("." + signer)):
+            return True
+    return False
 
 
 def _get_or_create_alias(session: Session, user: User) -> EmailAlias:
@@ -6917,10 +6932,17 @@ async def inbound_email(webhook_secret: str, request: Request, session: Session 
     source control: set it via the INBOUND_WEBHOOK_SECRET env var and use
     that exact value in the webhook URL. Resend requests are also checked
     against their signature whenever RESEND_WEBHOOK_SECRET is set."""
-    if not INBOUND_WEBHOOK_SECRET or not secrets.compare_digest(webhook_secret, INBOUND_WEBHOOK_SECRET):
+    if not INBOUND_WEBHOOK_SECRET or not secrets.compare_digest(
+            webhook_secret.encode("utf-8", "replace"), INBOUND_WEBHOOK_SECRET.encode("utf-8", "replace")):
         raise HTTPException(404)
 
-    if (request.headers.get("content-type") or "").lower().startswith("application/json"):
+    is_json = (request.headers.get("content-type") or "").lower().startswith("application/json")
+    if ee.RESEND_WEBHOOK_SECRET and not is_json:
+        # Signed Resend webhooks are the only thing accepted once a signing
+        # secret is configured; an unsigned form post could claim anything.
+        raise HTTPException(401, "Unsigned requests aren't accepted.")
+
+    if is_json:
         raw = await request.body()
         if ee.RESEND_WEBHOOK_SECRET and not ee.verify_resend_signature(
             ee.RESEND_WEBHOOK_SECRET,
@@ -6934,12 +6956,17 @@ async def inbound_email(webhook_secret: str, request: Request, session: Session 
             payload = json.loads(raw or b"{}")
         except ValueError:
             raise HTTPException(400, "Body isn't valid JSON.")
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "Body isn't a webhook event.")
         if payload.get("type") != "email.received":
-            return {"ok": True, "ignored": payload.get("type", "unknown event")}
-        data = payload.get("data") or {}
-        recipients = list(data.get("to") or []) + list(data.get("received_for") or [])
-        from_header = str(data.get("from", ""))
-        subject = str(data.get("subject", ""))
+            return {"ok": True, "ignored": str(payload.get("type", "unknown event"))[:80]}
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise HTTPException(400, "The event has no data.")
+        recipients = [str(x) for key in ("to", "received_for") for x in (data.get(key) or [])
+                      if isinstance(data.get(key), list)]
+        from_header = str(data.get("from", ""))[:MAX_HEADER_CHARS]
+        subject = str(data.get("subject", ""))[:500]
         try:
             full = await run_in_threadpool(ee.fetch_received_email, str(data.get("email_id", "")))
         except (RuntimeError, httpx.HTTPError) as exc:
@@ -6947,16 +6974,18 @@ async def inbound_email(webhook_secret: str, request: Request, session: Session 
             logging.getLogger("rotely.inbound").warning("could not read received email: %s", exc)
             raise HTTPException(502, "Could not read the received email yet.")
         body_text = (full.get("text") or "") or ee.html_to_text(full.get("html") or "")
+        body_text = body_text[:ee.MAX_REPLY_CHARS * 5]
         return _handle_inbound_email(session, request, ", ".join(recipients), from_header, subject, body_text,
                                      full.get("authentication"))
 
     form = await request.form()
     to_header = str(form.get("to", "") or form.get("envelope", ""))
-    from_header = str(form.get("from", ""))
-    subject = str(form.get("subject", ""))
-    body_text = str(form.get("text", "") or "")
-    # SendGrid reports DKIM as text like "{@example.com : pass}".
-    authentication = {"dkim": "pass" if "pass" in str(form.get("dkim", "")).lower() else "fail"}
+    from_header = str(form.get("from", ""))[:MAX_HEADER_CHARS]
+    subject = str(form.get("subject", ""))[:500]
+    body_text = str(form.get("text", "") or "")[:ee.MAX_REPLY_CHARS * 5]
+    # SendGrid has no DMARC result, so the equivalent is a passing DKIM
+    # signature from the From address's own domain.
+    authentication = {"dmarc": "pass" if _dkim_passes_for(form.get("dkim", ""), _extract_email_address(from_header)) else "fail"}
     return _handle_inbound_email(session, request, to_header, from_header, subject, body_text, authentication)
 
 
@@ -7020,6 +7049,13 @@ def _handle_inbound_email(session: Session, request: Request, to_header: str, fr
                     "else, open the document in Rotely and use Share for review.\n\n- Rotely",
                 )
                 return {"ok": True}
+            else:  # failed, generating or an older finished request: don't quietly start a new draft
+                _send_reply(
+                    user.email, _reply_subject(candidate),
+                    "Hi,\n\nThat request isn't waiting for anything from you any more, so I didn't act on this reply. "
+                    "To start a new draft, email your drafting address again.\n\n- Rotely",
+                )
+                return {"ok": True}
     if req is None:
         req = EmailDraftRequest(user_id=user.id, from_address=from_address, subject=subject, status="awaiting_template")
         session.add(req)
@@ -7052,7 +7088,7 @@ def _process_recipient_reply(session: Session, request: Request, user: User, ali
         _send_reply(
             user.email, subject,
             f"Hi,\n\nBefore I send this to your client I still need:\n\n{lines}\n\n"
-            "Reply with their first and last name and their email, for example: Tiffany Xia, tiffany@example.com\n\n- Rotely",
+            "Reply with all three together (I don't keep partial answers), for example: Tiffany Xia, tiffany@example.com\n\n- Rotely",
             reply_to=reply_to,
         )
         return
