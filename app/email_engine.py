@@ -126,6 +126,11 @@ def send_email(
     "mime_type": str}. Raises RuntimeError if no provider key is set, so
     callers can tell "not configured" apart from a real send failure (which
     raises httpx.HTTPError)."""
+    # ".invalid" is reserved and can never receive mail. The sample document's
+    # fake client uses one (see main.SAMPLE_CLIENT_EMAIL), so nothing the
+    # sample does can ever email a real address.
+    if to_address.strip().lower().endswith(".invalid"):
+        return
     provider = email_provider()
     if not provider:
         raise RuntimeError("No email provider is configured (set RESEND_API_KEY or SENDGRID_API_KEY).")
