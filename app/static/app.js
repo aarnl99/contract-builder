@@ -963,7 +963,11 @@ function _findParaEl(container, tablePath, pIndex) {
   return null;
 }
 
-function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, editable, onEdited }) {
+// nextSteps / moreItems (optional): the "What's next for this contract?" choices
+// shown under the document, and the "⋯" menu for rare actions. When nextSteps is
+// given the bottom button row goes away: there is one way to close (✕) and the
+// next steps are the page's call to action.
+function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, editable, onEdited, nextSteps, moreItems }) {
   const overlay = el("div", { class: "modal-overlay" });
   const box = el("div", { class: "modal", style: "width:720px;" });
 
@@ -984,7 +988,12 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
 
   const headerRow = el("div", { style: "display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;" }, [
     el("div", {}, [el("h2", {}, title), subtitle ? el("p", { class: "subtitle", style: "margin:2px 0 0;" }, subtitle) : null]),
-    el("button", { class: "btn ghost small", onclick: () => closeOverlay() }, "Close"),
+    nextSteps
+      ? el("div", { style: "display:flex;gap:8px;align-items:center;flex:none;" }, [
+          moreItems ? moreMenu(moreItems) : null,
+          el("button", { class: "btn ghost small", "aria-label": "Close", title: "Close", onclick: () => closeOverlay() }, "✕"),
+        ])
+      : el("button", { class: "btn ghost small", onclick: () => closeOverlay() }, "Close"),
   ]);
   box.appendChild(headerRow);
 
@@ -1380,13 +1389,18 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
     });
   }
 
-  const actions = el("div", { class: "panel-actions" });
-  if (generatedId) {
-    actions.appendChild(el("a", { class: "btn", href: `/api/generated/${generatedId}/download` }, "Download .docx"));
+  if (nextSteps) {
+    box.appendChild(el("div", { class: "next-heading" }, "What\u2019s next for this contract?"));
+    box.appendChild(nextSteps);
+  } else {
+    const actions = el("div", { class: "panel-actions" });
+    if (generatedId) {
+      actions.appendChild(el("a", { class: "btn", href: `/api/generated/${generatedId}/download` }, "Download .docx"));
+    }
+    if (extraButtons) extraButtons.forEach((b) => actions.appendChild(b));
+    actions.appendChild(el("button", { class: "btn secondary", onclick: () => closeOverlay() }, "Close"));
+    box.appendChild(actions);
   }
-  if (extraButtons) extraButtons.forEach((b) => actions.appendChild(b));
-  actions.appendChild(el("button", { class: "btn secondary", onclick: () => closeOverlay() }, "Close"));
-  box.appendChild(actions);
 
   overlay.appendChild(box);
   overlay.addEventListener("click", (e) => { if (e.target === overlay) closeOverlay(); });
@@ -3461,8 +3475,16 @@ function DraftView(preselectId) {
   }
 
   function showResult(tpl, result, lastPrefill) {
-    const editBtn = el("button", { class: "btn secondary" }, "Edit values");
-    editBtn.addEventListener("click", () => {
+    // Where the contract stands decides which next steps to offer and which
+    // one needs attention first. If the lookup fails we fall back to the
+    // plain draft choices rather than blocking the preview.
+    api(`/api/generated/${result.generated_id}`)
+      .then((g) => g.status || null, () => null)
+      .then((status) => renderResult(tpl, result, lastPrefill, status));
+  }
+
+  function renderResult(tpl, result, lastPrefill, status) {
+    const editFn = () => {
       overlay.remove();
       api(`/api/templates/${tpl.id}`)
         .then((freshTpl) => {
@@ -3472,17 +3494,53 @@ function DraftView(preselectId) {
         // without this, a failed request here silently dropped the person
         // back at the bare Draft tab with no fill form and no explanation.
         .catch((e) => alert(e.message || "Couldn't reopen this document for editing. Please try again."));
+    };
+
+    const key = (status && status.key) || "draft";
+    const roundOpen = key === "submitted" || key === "response_sent" || key === "client_reviewing";
+    const agreed = key === "applied" || key === "reviewed_no_changes";
+    const card = ({ title, text, onClick, badge }) =>
+      el("button", { type: "button", class: "next-card" + (badge ? " needs-you" : ""), onclick: onClick }, [
+        badge ? el("span", { class: "next-badge" }, badge) : null,
+        el("div", { class: "next-title" }, title),
+        el("div", { class: "next-text" }, text),
+      ]);
+    // Equal choices, ordered by what is most likely next. A round waiting on
+    // the owner comes first and carries a "Needs you" badge; Redlines only
+    // appears while a round is open.
+    const redlinesCard = roundOpen
+      ? card({
+          title: "Redlines",
+          text: key === "submitted" ? "The other side sent changes. Decide on each one." : "Waiting on the other side. Open to see where it stands.",
+          badge: key === "submitted" ? "Needs you" : null,
+          onClick: () => openRedlinesModal(result.generated_id),
+        })
+      : null;
+    const shareCard = card({
+      title: "Share for review",
+      text: agreed ? "Open a new round with someone else before signing." : key === "shared" ? "Shared, awaiting review. Open to see the link." : "Send someone a link to read and suggest changes.",
+      onClick: () => openShareModal(result.generated_id),
     });
-    const libBtn = el("button", { class: "btn secondary", onclick: () => { overlay.remove(); location.hash = "#/documents"; } }, "View in Documents");
-    const shareBtn = el("button", { class: "btn secondary", onclick: () => openShareModal(result.generated_id) }, "Share for review");
-    const signBtn = el("button", { class: "btn secondary", onclick: () => openSignatureModal(result.generated_id) }, "Send for signature");
-    const redlinesBtn = el("button", { class: "btn secondary", onclick: () => openRedlinesModal(result.generated_id) }, "Redlines");
+    const signCard = card({
+      title: "Send for signature",
+      text: roundOpen ? "Ready when every change is settled. Not yet: a round is open." : "Choose who signs and place the signature fields.",
+      onClick: () => openSignatureModal(result.generated_id),
+    });
+    const nextSteps = el("div", { class: "next-grid" }, (roundOpen ? [redlinesCard, shareCard, signCard] : agreed ? [signCard, shareCard] : [shareCard, signCard]).filter(Boolean));
     var overlay = showPreviewOverlay({
       title: result.name,
-      subtitle: `Generated from ${tpl.name} · saved to your Documents library`,
+      subtitle: agreed
+        ? "✓ Every change is settled. Nothing is waiting on you or the other side."
+        : `Generated from ${tpl.name} · saved to your Documents library`,
       html: result.html,
       generatedId: result.generated_id,
-      extraButtons: [editBtn, libBtn, shareBtn, signBtn, redlinesBtn],
+      nextSteps,
+      moreItems: [
+        { label: "Edit values", onClick: editFn },
+        { label: "View in Documents", onClick: () => { overlay.remove(); location.hash = "#/documents"; } },
+        { divider: true },
+        { label: "Download .docx", onClick: () => { location.href = `/api/generated/${result.generated_id}/download`; } },
+      ],
       editable: true,
       onEdited: (editRes) => {
         // Edge case: this dialog only shows right after a fresh generation,
@@ -4087,7 +4145,7 @@ function DocumentsView() {
           // document" below already does correctly.
           el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openShareModal(d.id); } }, "Share for review"),
           el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openSignatureModal(d.id); } }, "Send for signature"),
-          el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openRedlinesModal(d.id); } }, "Redlines"),
+          el("button", { class: "btn secondary", onclick: () => { panelOverlay.remove(); openRedlinesModal(d.id); } }, full.status && full.status.key === "submitted" ? "Redlines · Needs you" : "Redlines"),
           el("button", {
             class: "btn secondary",
             onclick: () => {
