@@ -5382,6 +5382,39 @@ def _brand_display_name(user: Optional[User]) -> str:
     return user.name.strip() or user.email
 
 
+MAX_LOGO_LINK_CHARS = 300
+
+
+def _clean_logo_link(raw: str) -> str:
+    """The website a logo should open, cleaned, or "" for none. Accepts
+    "acme.com" (adds https://) and refuses anything that isn't a plain
+    http(s) address: no javascript:, mailto:, data:, or user:password@ URLs,
+    since this ends up in a link on pages clients open."""
+    from urllib.parse import urlsplit
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if len(value) > MAX_LOGO_LINK_CHARS:
+        raise HTTPException(400, "That web address is too long.")
+    if re.search(r"[\s\x00-\x1f<>\"'\\]", value):
+        raise HTTPException(400, "That doesn't look like a web address.")
+    if "://" not in value:
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*:", value) and not re.match(r"^[^/]*:\d+(/|$)", value):
+            raise HTTPException(400, "Use a web address that starts with http:// or https://.")
+        value = "https://" + value
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname or ""
+        parts.port  # raises ValueError on a bad port
+    except ValueError:
+        raise HTTPException(400, "That doesn't look like a web address.")
+    if parts.scheme not in ("http", "https") or "@" in parts.netloc:
+        raise HTTPException(400, "Use a web address that starts with http:// or https://.")
+    if not re.fullmatch(r"[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+", host) or host.startswith(("-", ".")):
+        raise HTTPException(400, "That doesn't look like a web address, for example acme.com.")
+    return value
+
+
 def _brand_payload(user: Optional[User], logo_url: str) -> dict:
     path = _logo_abs_path(user) if user else None
     version = int(os.path.getmtime(path)) if path else 0
@@ -5389,6 +5422,7 @@ def _brand_payload(user: Optional[User], logo_url: str) -> dict:
         "name": _brand_display_name(user),
         "has_logo": bool(path),
         "logo_url": f"{logo_url}?v={version}" if path else None,
+        "link": (user.logo_link or None) if user else None,
     }
 
 
@@ -5401,6 +5435,24 @@ def _logo_response(user: Optional[User]):
 
 @app.get("/api/account/branding")
 def get_branding(user: User = Depends(get_current_user)):
+    return {**_brand_payload(user, "/api/account/logo"), "max_bytes": MAX_LOGO_BYTES}
+
+
+class BrandingBody(BaseModel):
+    link: str = ""
+
+
+@app.patch("/api/account/branding")
+def set_branding(
+    body: BrandingBody,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Where the logo links to on the pages clients open. Blank clears it, and
+    a logo is not clickable until the owner sets one."""
+    user.logo_link = _clean_logo_link(body.link)
+    session.add(user)
+    session.commit()
     return {**_brand_payload(user, "/api/account/logo"), "max_bytes": MAX_LOGO_BYTES}
 
 
