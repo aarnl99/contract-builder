@@ -2081,11 +2081,41 @@ def _client_lineage_timeline(gc: GeneratedContract, session: Session) -> dict:
     }
 
 
+def _edit_look(e) -> dict:
+    """What the owner/client review lists need to describe an edit in words:
+    the style of the new text and whether it is a whole new paragraph."""
+    try:
+        loc = json.loads(e.location_json or "{}")
+    except (ValueError, TypeError):
+        loc = {}
+    return {"format": loc.get("format", "") or "", "new_paragraph": bool(loc.get("new_paragraph"))}
+
+
+def _stored_location(r: dict) -> dict:
+    """The location_json for a resolved edit: where it goes, plus the look of
+    the new text and, for a new paragraph, which paragraph it follows."""
+    loc = {
+        "container_path": r["container_path"],
+        "paragraph_index": r["paragraph_index"],
+        "segments": r["segments"],
+    }
+    if r.get("format"):
+        loc["format"] = r["format"]
+    if r.get("new_paragraph"):
+        loc["new_paragraph"] = True
+        loc["anchor"] = r.get("anchor", "")
+    return loc
+
+
 class DirectEditItem(BaseModel):
     table_path: str = ""
     paragraph_index: int
-    segments: list  # [{"r": int, "start": int, "end": int}, ...] -- same shape the browser already captures for template field-marking and redlining
+    segments: list = []  # [{"r": int, "start": int, "end": int}, ...] -- same shape the browser already captures for template field-marking and redlining
     new_text: str
+    # Bold/italic/underline for the new text ("b", "i", "u" in any mix).
+    format: str = ""
+    # A whole new paragraph right after paragraph_index; segments stay empty.
+    new_paragraph: bool = False
 
 
 class DirectEditsBody(BaseModel):
@@ -2153,6 +2183,28 @@ def edit_generated_document(
     doc_for_read = de.load(gc.file_path)
     resolved = []
     for item in body.edits:
+        if item.new_paragraph:
+            container_path = (
+                [[int(x) for x in triple.split(",")] for triple in item.table_path.split(";")]
+                if item.table_path else []
+            )
+            if not item.new_text.strip():
+                raise HTTPException(400, "Type the new paragraph's text.")
+            try:
+                anchor = de.paragraph_anchor(doc_for_read, container_path, item.paragraph_index)
+            except de.MarkError as err:
+                raise HTTPException(400, f"That spot is no longer valid: {err}")
+            resolved.append({
+                "container_path": container_path,
+                "paragraph_index": item.paragraph_index,
+                "segments": [],
+                "new_text": item.new_text,
+                "original_text": "",
+                "format": de.clean_format(item.format),
+                "new_paragraph": True,
+                "anchor": anchor,
+            })
+            continue
         if not item.segments:
             raise HTTPException(400, "No selection to edit.")
         # A click-to-insert (see computeCursorPosition in app.js) sends one
@@ -2193,6 +2245,7 @@ def edit_generated_document(
             "segments": item.segments,
             "new_text": new_text,
             "original_text": original_text,
+            "format": de.clean_format(item.format),
         })
 
     # Bug tracker #44: reject a batch containing two edits that overlap the
@@ -2225,7 +2278,10 @@ def edit_generated_document(
         edits_created = []
         for r in resolved:
             excerpt = r["original_text"].strip()
-            if excerpt:
+            if r.get("new_paragraph"):
+                added = r["new_text"].strip()
+                label = "New paragraph: " + ((added[:45] + "…") if len(added) > 45 else added)
+            elif excerpt:
                 label = (excerpt[:57] + "…") if len(excerpt) > 57 else excerpt
             else:
                 # Insert (see above) -- there's no original text to
@@ -2249,11 +2305,7 @@ def edit_generated_document(
                 evaluation="needs_review",
                 decision="countered",
                 counter_value=r["new_text"],
-                location_json=json.dumps({
-                    "container_path": r["container_path"],
-                    "paragraph_index": r["paragraph_index"],
-                    "segments": r["segments"],
-                }),
+                location_json=json.dumps(_stored_location(r)),
             )
             session.add(edit)
             edits_created.append(edit)
@@ -2276,6 +2328,8 @@ def edit_generated_document(
                 "paragraph_index": r["paragraph_index"],
                 "segments": r["segments"],
                 "new_text": r["new_text"],
+                "format": r.get("format", ""),
+                "new_paragraph": bool(r.get("new_paragraph")),
             }
             for r in resolved
         ])
@@ -4835,6 +4889,7 @@ def get_redlines(
                 "id": e.id, "field_key": e.field_key, "label": e.label,
                 "original_value": e.original_value, "proposed_value": e.proposed_value,
                 "comment": e.comment,
+                **_edit_look(e),
                 "evaluation": e.evaluation, "decision": e.decision, "counter_value": e.counter_value,
                 "threshold_desc": threshold_desc, "inside_threshold": inside_threshold,
                 # "Worth a lawyer's eye" note, decided in code (advisor.clause_risk).
@@ -5156,7 +5211,7 @@ def apply_redline_submission(
     edit_targets = []  # (RedlineEdit, location dict) -- only edits with a still-usable recorded location
     for e in to_apply:
         loc = json.loads(e.location_json or "{}")
-        if loc.get("segments"):
+        if loc.get("segments") or loc.get("new_paragraph"):
             edit_targets.append((e, loc))
     if not edit_targets:
         raise HTTPException(
@@ -5185,9 +5240,17 @@ def apply_redline_submission(
     stale = []
     for e, loc in edit_targets:
         try:
+            if loc.get("new_paragraph"):
+                # No selected text to compare: check it is still the same
+                # paragraph this was meant to follow.
+                current_text = de.paragraph_anchor(doc, loc.get("container_path"), loc["paragraph_index"])
+                if current_text != loc.get("anchor", ""):
+                    stale.append(e)
+                continue
             current_text = de.extract_text_at(doc, loc.get("container_path"), loc["paragraph_index"], loc["segments"])
         except de.MarkError:
-            current_text = None
+            stale.append(e)
+            continue
         if current_text != e.original_value:
             stale.append(e)
     if stale:
@@ -5206,6 +5269,8 @@ def apply_redline_submission(
                 "paragraph_index": loc["paragraph_index"],
                 "segments": loc["segments"],
                 "new_text": e.proposed_value,
+                "format": loc.get("format", ""),
+                "new_paragraph": bool(loc.get("new_paragraph")),
             }
             for e, loc in edit_targets
         ])
@@ -5760,7 +5825,13 @@ class EditLocationBody(BaseModel):
     top-level document body."""
     table_path: str = ""
     paragraph_index: int
-    segments: list[MarkSegment]
+    segments: list[MarkSegment] = []
+    # Bold/italic/underline for the newly typed text: any of "b", "i", "u".
+    format: str = ""
+    # True for a whole new paragraph added right after paragraph_index; then
+    # there is no selection (segments stay empty) and proposed_value is the
+    # paragraph's text.
+    new_paragraph: bool = False
 
 
 class ShareEditBody(BaseModel):
@@ -5851,13 +5922,22 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
         if not e.location:
             continue  # no location captured -- can't be applied, so don't accept it
         container_path = _parse_table_path(e.location.table_path)
-        segments = [s.dict() for s in e.location.segments]
-        if not segments:
+        is_new_paragraph = bool(e.location.new_paragraph)
+        segments = [] if is_new_paragraph else [s.dict() for s in e.location.segments]
+        if not segments and not is_new_paragraph:
             continue
+        paragraph_anchor = ""
         try:
-            original_text = de.extract_text_at(doc, container_path, e.location.paragraph_index, segments)
+            if is_new_paragraph:
+                # Nothing is selected: the "original" is empty and the edit
+                # is tied to the paragraph it follows.
+                original_text = ""
+                paragraph_anchor = de.paragraph_anchor(doc, container_path, e.location.paragraph_index)
+            else:
+                original_text = de.extract_text_at(doc, container_path, e.location.paragraph_index, segments)
         except de.MarkError as err:
             raise HTTPException(400, f"That selection is no longer valid: {err}")
+        fmt = de.clean_format(e.location.format)
 
         proposed = e.proposed_value.strip()
 
@@ -5959,6 +6039,8 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
         has_comment = bool(e.comment and e.comment.strip())
         if proposed == original_text.strip() and not is_explicit_counter_response and not has_comment:
             continue  # not actually a change, no comment either, and not an explicit decision on a live counter either
+        if is_new_paragraph and not proposed and not is_explicit_counter_response:
+            continue  # a new paragraph with no words in it is nothing to suggest
 
         ph = placeholders_by_key.get(e.field_key) if e.field_key else None
         evaluation = rl.evaluate_edit(ph.threshold_type, ph.threshold_config, proposed) if ph else rl.NEEDS_REVIEW
@@ -5966,9 +6048,23 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
             label = ph.label
         else:
             label = e.label.strip()[:80]
+            if not label and is_new_paragraph:
+                added = final_value.strip()
+                label = "New paragraph: " + ((added[:45] + "…") if len(added) > 45 else added) if added else "New paragraph"
             if not label:
                 excerpt = original_text.strip()
                 label = (excerpt[:57] + "…") if len(excerpt) > 57 else (excerpt or "Custom edit")
+
+        location = {
+            "container_path": container_path,
+            "paragraph_index": e.location.paragraph_index,
+            "segments": segments,
+        }
+        if fmt:
+            location["format"] = fmt
+        if is_new_paragraph:
+            location["new_paragraph"] = True
+            location["anchor"] = paragraph_anchor
 
         out.append(dict(
             field_key=e.field_key if ph else "",
@@ -5979,11 +6075,7 @@ def _resolve_edits(session: Session, gc: GeneratedContract, edits_in: list[Share
             evaluation=evaluation,
             decision=decision,
             source_edit_id=source_edit_id,
-            location_json=json.dumps({
-                "container_path": container_path,
-                "paragraph_index": e.location.paragraph_index,
-                "segments": segments,
-            }),
+            location_json=json.dumps(location),
         ))
     return out
 
@@ -6199,6 +6291,7 @@ def get_share_redlines(token: str, request: Request, session: Session = Depends(
                     "id": e.id, "label": e.label,
                     "original_value": e.original_value, "proposed_value": e.proposed_value,
                     "comment": e.comment,
+                    **_edit_look(e),
                     "decision": e.decision, "counter_value": e.counter_value,
                     "comments": comments_by_edit.get(e.id, []),
                     "comments_resolved": e.comments_resolved,
