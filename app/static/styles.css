@@ -811,20 +811,22 @@ a.link:hover { text-decoration: underline; }
 
 /* ---- countered-spot decision chip (Accept / Reject / Suggest) ---- */
 .field-decision-chip {
-  position: fixed; z-index: 55; display: flex; gap: 6px; background: var(--panel); border: 1px solid var(--border);
-  border-radius: 20px; padding: 5px; box-shadow: var(--shadow-md);
+  position: fixed; z-index: 55; display: flex; flex-direction: column; gap: 6px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 14px; padding: 8px; box-shadow: var(--shadow-md);
 }
+.fdc-ask { font-size: 12px; font-weight: 600; color: var(--ink); padding: 0 4px; }
+.fdc-row { display: flex; gap: 6px; }
+/* Accept / Suggest edit / Reject are equal peers: same size, a light tint and a label
+   tell them apart, none is louder. */
 .fdc-btn {
-  border: none; border-radius: 16px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer;
-  font-family: inherit; transition: filter .08s, transform .08s;
+  border: 1.5px solid; border-radius: 10px; padding: 7px 12px; font-size: 12.5px; font-weight: 700; cursor: pointer;
+  font-family: inherit; transition: filter .08s, transform .08s; white-space: nowrap;
 }
 .fdc-btn:active { transform: scale(0.95); }
-.fdc-accept { background: var(--success); color: white; }
-.fdc-accept:hover { filter: brightness(0.92); }
-.fdc-reject { background: var(--danger); color: white; }
-.fdc-reject:hover { filter: brightness(0.92); }
-.fdc-suggest { background: var(--bg); color: var(--ink); border: 1px solid var(--border); }
-.fdc-suggest:hover { background: var(--accent-soft); }
+.fdc-accept { background: var(--success-soft); border-color: var(--success-soft-border); color: #047857; }
+.fdc-reject { background: var(--danger-soft); border-color: var(--danger-soft-border); color: #b91c1c; }
+.fdc-suggest { background: var(--accent-soft); border-color: var(--accent-soft-border); color: var(--accent-dark); }
+.fdc-btn:hover { filter: brightness(0.96); }
 
 /* Scoped to the del/ins pair for the countered edit itself, not the whole
    .run -- a run can span an entire clause (see share.js's repaint), so
@@ -844,16 +846,23 @@ a.link:hover { text-decoration: underline; }
 }
 .rl-mini-btn.accept { color: var(--success); border-color: var(--success-soft-border); background: var(--success-soft); }
 .rl-mini-btn.reject { color: var(--danger); border-color: var(--danger-soft-border); background: var(--danger-soft); }
+.rl-mini-btn.suggest { color: var(--accent-dark); border-color: var(--accent-soft-border); background: var(--accent-soft); }
 
 .redline-popover .rp-comment { margin-top: 8px; resize: vertical; min-height: 52px; font-family: inherit; }
 
 /* ---- bottom action bar ---- */
 .redline-bottom-bar {
   display: flex; align-items: center; gap: 10px; padding: 16px 0 10px; margin-top: 4px;
-  border-top: 1px solid var(--border); flex-wrap: wrap;
+  border-top: 1px solid var(--border); flex-wrap: wrap; justify-content: space-between;
 }
 .redline-bottom-bar .spacer { flex: 1; }
-.save-note { font-size: 12px; color: var(--success); font-weight: 700; margin-left: 4px; }
+.redline-bottom-bar .bar-text { flex: 1 1 260px; min-width: 0; }
+.redline-bottom-bar .bar-title { font-size: 14.5px; font-weight: 700; }
+.redline-bottom-bar .bar-sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.redline-bottom-bar .bar-actions { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-left: auto; }
+.redline-bottom-bar .bar-actions .btn { padding: 11px 22px; }
+.redline-bottom-bar .btn:disabled { opacity: .45; cursor: not-allowed; }
+.save-note { font-size: 12px; color: var(--success); font-weight: 600; }
 .redline-contact { font-size: 12.5px; color: var(--muted); padding: 14px 0 0; }
 .redline-contact a { color: var(--accent); font-weight: 600; }
 
