@@ -1400,3 +1400,16 @@ a.brand-custom:focus-visible { outline: 2px solid var(--accent); outline-offset:
 .rl-tag.comment { background: var(--accent-soft); color: var(--accent); }
 .rl-top { align-items: center; }
 .rl-top .rl-label { flex: 1; min-width: 0; }
+
+/* ---- contract preview: "What's next for this contract?" ---- */
+.next-heading { font-size: 15px; font-weight: 700; margin: 16px 0 10px; }
+.next-grid { display: flex; gap: 12px; flex-wrap: wrap; }
+.next-card {
+  flex: 1 1 180px; position: relative; text-align: left; font: inherit; cursor: pointer; background: white;
+  border: 1.5px solid var(--border); border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 5px;
+}
+.next-card:hover { border-color: var(--accent-soft-border); background: var(--accent-soft); }
+.next-card.needs-you { border-color: var(--accent-soft-border); }
+.next-title { font-size: 14px; font-weight: 700; color: var(--accent-dark); }
+.next-text { font-size: 13px; color: var(--muted); line-height: 1.45; }
+.next-badge { position: absolute; top: -10px; right: 12px; background: #b45309; color: white; font-size: 11.5px; font-weight: 700; border-radius: 999px; padding: 3px 10px; }
