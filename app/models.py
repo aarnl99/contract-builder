@@ -67,6 +67,9 @@ class User(SQLModel, table=True):
     # empty means "no logo, show the account's name instead".
     logo_file: str = ""
     logo_mime: str = ""
+    # Optional website the logo (or the name, with no logo) links to on the
+    # client pages. Empty means not clickable. Always a cleaned http(s) URL.
+    logo_link: str = ""
 
     # Per-type opt-outs for the owner-facing notifications a client's
     # actions can trigger -- both the in-app bell (see main.py's _notify

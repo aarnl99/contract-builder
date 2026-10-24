@@ -108,12 +108,17 @@ async function loadBrand() {
 
 function topbar() {
   if (BRAND && BRAND.name) {
+    const mark = [
+      BRAND.logo_url
+        ? el("img", { class: "brand-logo", src: BRAND.logo_url, alt: BRAND.name })
+        : el("div", { class: "brand-name" }, BRAND.name),
+    ];
+    // Clickable only when the owner chose a website for it (plain http(s) only).
+    const clickable = typeof BRAND.link === "string" && /^https?:\/\//i.test(BRAND.link);
     return el("div", { class: "share-topbar" }, [
-      el("div", { class: "brand brand-custom" }, [
-        BRAND.logo_url
-          ? el("img", { class: "brand-logo", src: BRAND.logo_url, alt: BRAND.name })
-          : el("div", { class: "brand-name" }, BRAND.name),
-      ]),
+      clickable
+        ? el("a", { class: "brand brand-custom", href: BRAND.link, target: "_blank", rel: "noopener noreferrer", title: "Visit " + BRAND.name }, mark)
+        : el("div", { class: "brand brand-custom" }, mark),
     ]);
   }
   return el("div", { class: "share-topbar" }, [
