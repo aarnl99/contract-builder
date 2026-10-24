@@ -600,7 +600,35 @@ a.link:hover { text-decoration: underline; }
 .decision-row .decided.pending { color: var(--muted); }
 .decision-row .decided-countered { font-size: 12.5px; color: var(--accent-dark); text-align: right; max-width: min(420px, 60vw); overflow-wrap: anywhere; line-height: 1.45; }
 .decision-row .decided-countered strong { font-weight: 700; }
-.decision-btns { display: flex; gap: 6px; }
+.decision-btns { display: flex; gap: 6px; align-items: center; }
+/* The real alternatives (Accept / Counter / Reject) are equal peers: same size,
+   told apart by a light tint and the label, none louder than another. */
+.decision-btns .btn.outcome { flex: 1 1 0; min-width: 96px; padding: 10px 14px; font-weight: 600; border: 1.5px solid; }
+.decision-btns .btn.outcome.o-accept { background: var(--success-soft); border-color: var(--success-soft-border); color: #047857; }
+.decision-btns .btn.outcome.o-counter { background: var(--accent-soft); border-color: var(--accent-soft-border); color: var(--accent-dark); }
+.decision-btns .btn.outcome.o-reject { background: var(--danger-soft); border-color: var(--danger-soft-border); color: #b91c1c; }
+.decision-btns .btn.outcome.o-accept:hover { background: #d9f7ea; }
+.decision-btns .btn.outcome.o-counter:hover { background: #e1e4fb; }
+.decision-btns .btn.outcome.o-reject:hover { background: #fde4e4; }
+.decision-col.wide .decision-btns { width: 100%; }
+.decision-btns .btn.outcome.staged-active { flex: 0 0 auto; }
+.decision-ask { font-size: 13px; font-weight: 600; color: var(--ink); }
+.decision-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 12px; font-size: 13.5px; }
+.decision-head-text .muted { color: var(--muted); font-weight: 400; }
+.decision-foot { display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 14px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
+.decision-foot-count { font-size: 14px; font-weight: 600; }
+.decision-foot-hint { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.decision-foot-btns { display: flex; gap: 10px; flex-wrap: wrap; margin-left: auto; }
+.decision-foot-btns .btn { padding: 11px 20px; }
+/* The "⋯" menu for rare or risky actions on a row. */
+.more-wrap { position: relative; display: inline-block; flex: none; }
+.more-btn { width: 32px; height: 32px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: white; color: var(--muted); font-size: 18px; line-height: 1; cursor: pointer; font-family: inherit; padding: 0 0 4px; }
+.more-btn:hover, .more-btn[aria-expanded="true"] { background: var(--bg); color: var(--ink); }
+.more-menu { position: absolute; right: 0; top: calc(100% + 6px); min-width: 210px; background: white; border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-md); padding: 6px; z-index: 60; display: flex; flex-direction: column; }
+.more-item { text-align: left; background: none; border: 0; border-radius: 6px; padding: 9px 12px; font: inherit; font-size: 13.5px; color: var(--ink); cursor: pointer; }
+.more-item:hover { background: var(--bg); }
+.more-item.danger { color: #b91c1c; }
+.more-sep { height: 1px; background: var(--border); margin: 4px 0; }
 .decision-btns .btn.staged-active { box-shadow: 0 0 0 2px var(--accent) inset; }
 /* The picked action is a status, not a button: it can't be pressed again (the "Change" link undoes it). */
 .decision-btns .btn.staged-active { pointer-events: none; cursor: default; }
