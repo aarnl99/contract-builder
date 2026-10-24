@@ -1363,3 +1363,9 @@ a.brand-custom:focus-visible { outline: 2px solid var(--accent); outline-offset:
 .rl-tag.comment { background: var(--accent-soft); color: var(--accent); }
 .rl-top { align-items: center; }
 .rl-top .rl-label { flex: 1; min-width: 0; }
+
+/* ---- after uploading a master document ---- */
+.upload-done { margin-top: 14px; padding: 14px 16px; border: 1.5px solid var(--success-soft-border); background: var(--success-soft); border-radius: 12px; }
+.upload-done-title { font-size: 14px; font-weight: 700; color: #047857; }
+.upload-done-sub { font-size: 13px; color: var(--ink-soft); margin-top: 4px; line-height: 1.45; }
+.upload-done-btns { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
