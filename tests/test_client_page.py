@@ -133,7 +133,7 @@ def test_share_brand_is_public_and_shows_name_without_logo(env):
     token, _ = make_link(env)
     got = TestClient(m.app).get(f"/api/share/{token}/brand")
     assert got.status_code == 200
-    assert got.json() == {"name": "Owner", "has_logo": False, "logo_url": None}
+    assert got.json() == {"name": "Owner", "has_logo": False, "logo_url": None, "link": None}
     assert TestClient(m.app).get(f"/api/share/{token}/logo").status_code == 404
 
 
@@ -320,3 +320,59 @@ def test_the_old_links_keep_working(env):
     r = c.post(f"/api/share/{token}/verify", json={"access_code": "abcd"})
     assert r.status_code == 200 and "session_token" in r.json()
     assert c.get(f"/api/share/{token}", headers={"x-share-session": r.json()["session_token"]}).status_code == 200
+
+
+# ---- the logo's website link --------------------------------------------------------
+
+def set_link(env, link):
+    return env.patch("/api/account/branding", json={"link": link})
+
+
+def test_logo_is_not_a_link_until_the_owner_sets_one(env):
+    assert env.get("/api/account/branding").json()["link"] is None
+    token, _ = make_link(env)
+    assert TestClient(m.app).get(f"/api/share/{token}/brand").json()["link"] is None
+
+
+def test_owner_sets_a_website_and_clients_see_it_on_both_pages(env):
+    r = set_link(env, "  acme.com/about  ")
+    assert r.status_code == 200, r.text
+    assert r.json()["link"] == "https://acme.com/about"
+    assert env.get("/api/account/branding").json()["link"] == "https://acme.com/about"
+    token, _ = make_link(env)
+    c = TestClient(m.app)
+    assert c.get(f"/api/share/{token}/brand").json()["link"] == "https://acme.com/about"
+    # the signing page's brand endpoint reads the same owner setting
+    place_all(env)
+    data = send(env, signers=signers_for("client@x.test")).json()
+    tok = rows(data["id"])["Client"].token
+    assert c.get(f"/api/sign/{tok}/brand").json()["link"] == "https://acme.com/about"
+
+
+def test_a_blank_website_makes_the_logo_unclickable_again(env):
+    set_link(env, "https://acme.com")
+    r = set_link(env, "")
+    assert r.status_code == 200 and r.json()["link"] is None
+
+
+def test_the_website_survives_replacing_or_removing_the_logo(env):
+    set_link(env, "acme.com")
+    upload(env, PNG)
+    assert env.get("/api/account/branding").json()["link"] == "https://acme.com"
+    env.delete("/api/account/logo")
+    assert env.get("/api/account/branding").json()["link"] == "https://acme.com"
+
+
+@pytest.mark.parametrize("bad", [
+    "javascript:alert(1)", "data:text/html,hi", "mailto:a@b.com", "ftp://acme.com", "https://user:pw@acme.com",
+    "acme", "http://", "https://acme.com/a b", 'https://acme.com/"x', "https://acme.com/<x>", "https://-bad.com",
+    "https://acme.com:99999", "http://[::1]/", "a" * 400 + ".com",
+])
+def test_only_plain_web_addresses_are_accepted(env, bad):
+    r = set_link(env, bad)
+    assert r.status_code == 400, bad
+    assert env.get("/api/account/branding").json()["link"] is None
+
+
+def test_the_website_needs_a_logged_in_owner(env):
+    assert TestClient(m.app).patch("/api/account/branding", json={"link": "acme.com"}).status_code in (401, 403)
