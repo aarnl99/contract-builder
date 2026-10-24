@@ -1207,3 +1207,21 @@ label.field-label { color: var(--ink); font-weight: 500; }
 .logo-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 
 .ai-banner { margin-bottom: 14px; }
+
+/* Log in / sign up / reset: the Rotely.ai wordmark repeated, oversized and
+   cropped at the edges, very faint. Flat ink with the brand accent on ".ai";
+   the middle clears so the card stays the focus. */
+.auth-shell { position: relative; z-index: 1; }
+.auth-shell .card { position: relative; z-index: 1; }
+.auth-bg { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; user-select: none; font-size: clamp(90px, 13vw, 170px);
+  -webkit-mask-image: radial-gradient(ellipse 42% 48% at 50% 52%, rgba(0, 0, 0, .12) 0%, #000 85%);
+  mask-image: radial-gradient(ellipse 42% 48% at 50% 52%, rgba(0, 0, 0, .12) 0%, #000 85%); }
+.auth-bg .row {
+  position: absolute; left: 0; display: flex; gap: .35em; white-space: nowrap;
+  font-weight: 700; line-height: 1; letter-spacing: -0.045em; color: var(--ink);
+  top: calc(var(--i) * 1.02em - .25em);
+  margin-left: -.3em;
+  opacity: max(.03, calc(.075 - var(--i) * .007));
+}
+.auth-bg .row:nth-child(even) { margin-left: -1.4em; }
+.auth-bg .row i { font-style: normal; color: var(--accent); }
