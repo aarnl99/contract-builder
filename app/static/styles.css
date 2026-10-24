@@ -1363,3 +1363,16 @@ a.brand-custom:focus-visible { outline: 2px solid var(--accent); outline-offset:
 .rl-tag.comment { background: var(--accent-soft); color: var(--accent); }
 .rl-top { align-items: center; }
 .rl-top .rl-label { flex: 1; min-width: 0; }
+
+/* ---- sample document ---- */
+.sample-tag { display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-dark); font-size: 11px; font-weight: 700; vertical-align: middle; }
+.sample-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 0 0 18px; padding: 16px 18px; border: 1.5px dashed var(--accent-soft-border); background: var(--accent-soft); border-radius: 14px; }
+.sample-card-text { flex: 1 1 320px; min-width: 0; }
+.sample-card-title { font-size: 15px; font-weight: 700; color: var(--accent-dark); }
+.sample-card-sub { font-size: 13px; color: var(--ink-soft); margin-top: 3px; line-height: 1.45; }
+.sample-card-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.sample-steps { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+.sample-step { text-align: left; font: inherit; cursor: pointer; background: white; border: 1.5px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+.sample-step:hover { border-color: var(--accent-soft-border); background: var(--accent-soft); }
+.sample-step-title { font-size: 14px; font-weight: 700; color: var(--accent-dark); }
+.sample-step-text { font-size: 13px; color: var(--muted); margin-top: 3px; line-height: 1.45; }
