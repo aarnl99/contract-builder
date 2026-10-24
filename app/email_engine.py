@@ -206,10 +206,98 @@ def fetch_received_email(email_id: str) -> dict:
     return resp.json()
 
 
+def sender_is_authenticated(authentication) -> bool:
+    """Whether the receiving server vouches that the email really came from
+    the address in its From line. Resend reports spf/dkim/dmarc as "pass",
+    "fail", "gray", ...; DMARC or DKIM passing means the From domain signed
+    it. Missing or unclear results count as NOT authenticated."""
+    if not isinstance(authentication, dict):
+        return False
+    return str(authentication.get("dmarc", "")).lower() == "pass" or str(authentication.get("dkim", "")).lower() == "pass"
+
+
+_SIGN_OFFS = re.compile(r"^(thanks|thank you|best|regards|kind regards|cheers|sincerely|sent from)\b", re.IGNORECASE)
+_FILLER = re.compile(
+    r"\b(send|it|this|to|the|client|is|name|email|e-mail|address|contact|please|their|his|her|and|with|for|"
+    r"full|first|last|you|can|go|ahead|share|draft|contract|they|are|his|hers)\b", re.IGNORECASE)
+_ANY_EMAIL = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+")
+# Addresses that are examples or placeholders, never a real client (our own
+# emails use tiffany@example.com as the sample to follow).
+_PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net", ".test", ".invalid", ".example")
+
+
+def strip_quoted_reply(text: str) -> str:
+    """Just what the person typed: drops quoted lines (> ...) and everything
+    from "On <date>, <someone> wrote:" or "-- Forwarded message --" onwards."""
+    lines = (text or "").splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith(">"):
+            continue
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if re.match(r"(?i)^on .+", s) and ("wrote:" in s.lower() or "wrote:" in nxt.lower()):
+            break
+        if re.match(r"(?i)^-{2,}\s*(original|forwarded) message", s) or re.match(r"^_{5,}$", s):
+            break
+        if re.match(r"(?i)^from:\s.*[@<]", s):  # Outlook-style quoted header block
+            break
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _clean_name_part(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip(" .,;:-")
+    return value.title() if value and value == value.lower() else value
+
+
+def _name_from_line(line: str, email: str = "") -> tuple:
+    cand = re.sub(re.escape(email), " ", line, flags=re.IGNORECASE) if email else line
+    cand = re.sub(r"[<>(),;:|\-\u2013]", " ", cand)
+    cand = _FILLER.sub(" ", cand)
+    words = [w for w in cand.split() if re.fullmatch(r"[A-Za-z'\u2019.\-]{1,40}", w)]
+    if 2 <= len(words) <= 4:
+        return _clean_name_part(words[0]), _clean_name_part(" ".join(words[1:]))
+    return "", ""
+
+
+def parse_recipient(text: str, exclude=()) -> dict:
+    """Reads a client's first name, last name and email out of a short reply
+    like "Tiffany Xia, tiffany@virio.ai" or labelled lines ("First name: ...").
+    Deliberately plain text rules, not an AI: the email body can come from
+    anywhere, and a wrong guess here would send a contract to the wrong
+    person. Anything not clearly there comes back blank so the caller asks."""
+    skip = {e.lower() for e in exclude}
+    body = []
+    for line in (text or "").splitlines():
+        if _SIGN_OFFS.match(line.strip()):
+            break
+        body.append(line)
+    text = "\n".join(body)
+    emails = [e for e in _ANY_EMAIL.findall(text)
+              if e.lower() not in skip and not e.lower().endswith("@" + EMAIL_DOMAIN.lower())
+              and not any(e.lower().endswith(d) or e.lower().endswith("@" + d) for d in _PLACEHOLDER_DOMAINS)]
+    email = emails[0] if emails else ""
+    first = last = ""
+    fm = re.search(r"first\s*name\s*[:=\-]\s*([^\n,;]+)", text, re.IGNORECASE)
+    lm = re.search(r"last\s*name\s*[:=\-]\s*([^\n,;]+)", text, re.IGNORECASE)
+    if fm and lm:
+        first, last = _clean_name_part(fm.group(1)), _clean_name_part(lm.group(1))
+    else:
+        lines = text.splitlines()
+        idx = next((i for i, l in enumerate(lines) if email and email.lower() in l.lower()), None)
+        if idx is not None:
+            first, last = _name_from_line(lines[idx], email)
+            for j in (idx - 1, idx + 1):  # name on the line just above/below the email
+                if not (first and last) and 0 <= j < len(lines) and lines[j].strip() and not _ANY_EMAIL.search(lines[j]):
+                    first, last = _name_from_line(lines[j])
+    return {"first_name": first, "last_name": last, "email": email}
+
+
 def html_to_text(html: str) -> str:
     """Plain text from an HTML-only email, good enough to read field values from."""
     import html as htmllib
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", html or "")
+    text = re.sub(r"(?is)<(script|style|blockquote).*?</\1>", " ", html or "")  # quoted replies are not the new message
     text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n", text)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     text = htmllib.unescape(text)
