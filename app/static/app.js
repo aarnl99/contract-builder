@@ -2702,14 +2702,29 @@ async function openRedlinesModal(generatedId) {
               const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
               const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
               const acceptBtn = el("button", { class: "btn small" }, "Accept");
-              function setRStage(d) {
-                rstage.decision = rstage.decision === d ? "pending" : d;
+              // Same idea as the first-time decision row: once picked, only
+              // that action shows, with a "Change" link to bring the rest back.
+              const rChange = el("button", {
+                type: "button", style: "display:none;background:none;border:0;padding:0 2px;font:inherit;font-size:12px;color:var(--accent);text-decoration:underline;cursor:pointer;",
+              }, "Change");
+              function paintRStage() {
+                const picked = rstage.decision !== "pending";
                 counterInput.style.display = rstage.decision === "countered" ? "" : "none";
                 [rejectBtn, counterBtn, acceptBtn].forEach((b) => b.classList.remove("staged-active", "stage-accepted", "stage-rejected", "stage-countered"));
                 if (rstage.decision === "rejected") rejectBtn.classList.add("staged-active", "stage-rejected");
-                if (rstage.decision === "countered") { counterBtn.classList.add("staged-active", "stage-countered"); counterInput.focus(); }
+                if (rstage.decision === "countered") counterBtn.classList.add("staged-active", "stage-countered");
                 if (rstage.decision === "accepted") acceptBtn.classList.add("staged-active", "stage-accepted");
+                rejectBtn.style.display = picked && rstage.decision !== "rejected" ? "none" : "";
+                counterBtn.style.display = picked && rstage.decision !== "countered" ? "none" : "";
+                acceptBtn.style.display = picked && rstage.decision !== "accepted" ? "none" : "";
+                rChange.style.display = picked ? "" : "none";
               }
+              function setRStage(d) {
+                rstage.decision = rstage.decision === d ? "pending" : d;
+                paintRStage();
+                if (rstage.decision === "countered") counterInput.focus();
+              }
+              rChange.addEventListener("click", () => { rstage.decision = "pending"; paintRStage(); });
               rejectBtn.addEventListener("click", () => setRStage("rejected"));
               counterBtn.addEventListener("click", () => setRStage("countered"));
               acceptBtn.addEventListener("click", () => setRStage("accepted"));
@@ -2734,7 +2749,7 @@ async function openRedlinesModal(generatedId) {
               reconsiderBox.appendChild(
                 el("div", {}, [
                   el("div", { style: "font-size:12px;color:var(--muted);margin-bottom:6px;" }, "Change your decision -- sent to the client as its own update, by email, right away."),
-                  el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn]),
+                  el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn, rChange]),
                   counterInput,
                   el("div", { style: "margin-top:8px;" }, [sendBtn]),
                 ])
@@ -2751,14 +2766,33 @@ async function openRedlinesModal(generatedId) {
             const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
             const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
             const acceptBtn = el("button", { class: "btn small" }, "Accept");
-            function setStage(d) {
-              stage.decision = stage.decision === d ? "pending" : d;
+            // Once an action is picked, only that action shows: the other two
+            // buttons and the AI-suggestion extras get out of the way (they
+            // read as competing choices), and a small "Change" link brings
+            // the full set back. See the matching block in buildReconsiderForm.
+            const changeLink = el("button", {
+              type: "button", style: "display:none;background:none;border:0;padding:0 2px;font:inherit;font-size:12px;color:var(--accent);text-decoration:underline;cursor:pointer;",
+            }, "Change");
+            const extras = el("div"); // AI suggestion + lawyer note; hidden once an action is picked
+            function paintStage() {
+              const picked = stage.decision !== "pending";
               counterInput.style.display = stage.decision === "countered" ? "" : "none";
               [rejectBtn, counterBtn, acceptBtn].forEach((b) => b.classList.remove("staged-active", "stage-accepted", "stage-rejected", "stage-countered"));
               if (stage.decision === "rejected") rejectBtn.classList.add("staged-active", "stage-rejected");
-              if (stage.decision === "countered") { counterBtn.classList.add("staged-active", "stage-countered"); counterInput.focus(); }
+              if (stage.decision === "countered") counterBtn.classList.add("staged-active", "stage-countered");
               if (stage.decision === "accepted") acceptBtn.classList.add("staged-active", "stage-accepted");
+              rejectBtn.style.display = picked && stage.decision !== "rejected" ? "none" : "";
+              counterBtn.style.display = picked && stage.decision !== "countered" ? "none" : "";
+              acceptBtn.style.display = picked && stage.decision !== "accepted" ? "none" : "";
+              changeLink.style.display = picked ? "" : "none";
+              extras.style.display = picked ? "none" : "";
             }
+            function setStage(d) {
+              stage.decision = stage.decision === d ? "pending" : d;
+              paintStage();
+              if (stage.decision === "countered") counterInput.focus();
+            }
+            changeLink.addEventListener("click", () => { stage.decision = "pending"; paintStage(); });
             rejectBtn.addEventListener("click", () => setStage("rejected"));
             counterBtn.addEventListener("click", () => setStage("countered"));
             acceptBtn.addEventListener("click", () => setStage("accepted"));
@@ -2809,14 +2843,15 @@ async function openRedlinesModal(generatedId) {
                   el("div", { class: "advisor-why" }, edit.risk.message),
                 ])
               : null;
+            [lawyerNote || adviceBtn, lawyerNote ? null : adviceBox].forEach((n) => { if (n) extras.appendChild(n); });
             actions = el("div", { class: "decision-col" }, [
               el("div", { class: "decision-row" }, [
-                el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn]),
+                el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn, changeLink]),
                 counterInput,
               ]),
-              lawyerNote || adviceBtn,
-              lawyerNote ? null : adviceBox,
+              extras,
             ]);
+            paintStage();
           }
 
           subBox.appendChild(
