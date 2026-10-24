@@ -174,7 +174,9 @@ def suggest_counter(packet: dict) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 _RISK_TOPICS = [
-    ("liability", r"liabilit|\bliable\b|\bdamages\b|consequential|gross negligence|willful misconduct|wilful misconduct"),
+    ("liability", r"liabilit|\bliable\b|\bdamages\b|consequential|gross negligence|willful misconduct|wilful misconduct"
+                  r"|not (?:be )?responsible|no responsibility|responsibility (?:is |shall be )?(?:capped|limited)"
+                  r"|\brecourse\b|limit(?:s|ed)? (?:the )?recovery|recovery (?:is |shall be )?limited"),
     ("indemnity", r"indemnif|hold harmless"),
     ("ownership and licensing", r"intellectual property|work product|work[- ]made[- ]for[- ]hire|work[- ]for[- ]hire|copyright|\bpatents?\b|trademark|\blicen[sc]e|\bownership\b|assign(?:s|ed|ment)? (?:all )?(?:of )?(?:its |their |your )?(?:right|title|interest)"),
     ("termination", r"terminat|\bcancel|for convenience|\bbreach\b|cure period"),
@@ -192,7 +194,7 @@ _RISK_RES = [(name, re.compile(rx, re.I)) for name, rx in _RISK_TOPICS]
 # looked for. A real liability clause in the same text still has its own
 # "liability" and is still caught.
 _ENTITY_NAMES = re.compile(
-    r"\blimited[- ]liability[- ](?:company|companies|(?:limited[- ])?partnerships?|corporations?|co\b\.?|entity|entities)",
+    r"\blimited[- ]liability[- ](?:company|companies|(?:limited[- ])?partnerships?|corporations?|co\b(?!-)\.?|entity|entities)",
     re.I,
 )
 

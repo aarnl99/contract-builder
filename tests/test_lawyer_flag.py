@@ -82,6 +82,20 @@ def test_real_liability_is_still_flagged_next_to_an_entity_name():
     assert risk(label="Limitation of liability", original="limited liability company", proposed="S Corp") is not None
 
 
+@pytest.mark.parametrize("text", [
+    "Provider is a limited liability company and is not responsible for any loss",
+    "Limited Liability Company's responsibility is capped at $1",
+    "Acme, a limited liability corporation, limits recovery to fees paid",
+    "The buyer has no recourse against the seller",
+])
+def test_wording_about_who_bears_a_loss_is_still_flagged_next_to_an_entity_name(text):
+    assert risk(label="Section 9", original="", proposed=text, free_text=True) is not None
+
+
+def test_a_co_signer_is_not_mistaken_for_a_company():
+    assert risk(label="Limited liability co-signer", original="A", proposed="B") is not None
+
+
 def test_topic_in_the_clients_note_counts():
     assert risk(comment="we need unlimited liability here") is not None
 
