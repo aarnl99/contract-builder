@@ -3167,6 +3167,92 @@ function openFillModal(tpl, prefill, onDone) {
 }
 
 // ---------------------------------------------------------------------------
+// Sample document: a made-up contract and client to practice on
+// ---------------------------------------------------------------------------
+
+function sampleTag(isSample) {
+  return isSample ? el("span", { class: "sample-tag" }, "Sample") : null;
+}
+
+// After the sample is created: three equal ways in. Closing is the only other exit.
+function showSampleGuide(s) {
+  const overlay = el("div", { class: "modal-overlay" });
+  const close = () => overlay.remove();
+  const step = (title, text, onClick) =>
+    el("button", { type: "button", class: "sample-step", onclick: onClick }, [
+      el("div", { class: "sample-step-title" }, title),
+      el("div", { class: "sample-step-text" }, text),
+    ]);
+  const steps = [];
+  if (s.generated_id) {
+    steps.push(step("Review their changes", "A made-up client sent back three changes. Accept one, counter one, reject one.", () => { close(); openRedlinesModal(s.generated_id); }));
+  }
+  if (s.share_url) {
+    steps.push(step("See what the client sees", `Opens their page in a new tab. Access code: ${s.access_code}`, () => window.open(s.share_url, "_blank", "noopener")));
+  }
+  if (s.template_id) {
+    steps.push(step("Draft your own from it", "Use the sample\u2019s fields to see how drafting works.", () => { close(); location.hash = `#/draft/${s.template_id}`; }));
+  }
+  const box = el("div", { class: "modal", style: "width:620px;" }, [
+    el("div", { style: "display:flex;justify-content:space-between;align-items:flex-start;" }, [
+      el("div", {}, [el("h2", {}, "Your sample is ready"), el("p", { class: "subtitle", style: "margin:2px 0 0;" }, "Nothing here is emailed, and it doesn\u2019t use up your plan.")]),
+      el("button", { type: "button", class: "btn ghost small", "aria-label": "Close", title: "Close", onclick: close }, "\u2715"),
+    ]),
+    el("div", { class: "sample-steps" }, steps),
+  ]);
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  document.body.appendChild(overlay);
+}
+
+function sampleCard() {
+  const box = el("div", { class: "sample-card" });
+  function paint(st) {
+    box.innerHTML = "";
+    box.appendChild(el("div", { class: "sample-card-text" }, [
+      el("div", { class: "sample-card-title" }, "New here? Try a sample contract"),
+      el("div", { class: "sample-card-sub" }, "A made-up contract and client, with three changes already sent back. Click through the whole flow with nothing at stake: nothing is emailed and it doesn\u2019t use up your plan."),
+    ]));
+    const actions = el("div", { class: "sample-card-actions" });
+    const openBtn = el("button", { type: "button", class: "btn" }, st.exists ? "Open the sample" : "Start the sample");
+    openBtn.addEventListener("click", async () => {
+      openBtn.disabled = true;
+      openBtn.textContent = "Setting up...";
+      try {
+        const s = st.exists ? st : await api("/api/sample", { method: "POST" });
+        showSampleGuide(s);
+        paint(s);
+      } catch (e) {
+        alert(e.message);
+        openBtn.disabled = false;
+        openBtn.textContent = st.exists ? "Open the sample" : "Start the sample";
+      }
+    });
+    actions.appendChild(openBtn);
+    if (st.exists) {
+      const reset = el("button", { type: "button", class: "link-btn" }, "Start over");
+      reset.addEventListener("click", async () => {
+        if (!confirm("Reset the sample? Your changes to it are removed and a fresh copy is made.")) return;
+        reset.disabled = true;
+        try { const s = await api("/api/sample", { method: "POST" }); paint(s); showSampleGuide(s); } catch (e) { alert(e.message); reset.disabled = false; }
+      });
+      const remove = el("button", { type: "button", class: "link-btn" }, "Remove it");
+      remove.addEventListener("click", async () => {
+        if (!confirm("Remove the sample document and everything made from it?")) return;
+        remove.disabled = true;
+        try { await api("/api/sample", { method: "DELETE" }); paint({ exists: false }); } catch (e) { alert(e.message); remove.disabled = false; }
+      });
+      actions.appendChild(reset);
+      actions.appendChild(remove);
+    }
+    box.appendChild(actions);
+  }
+  box.style.display = "none";
+  api("/api/sample").then((st) => { paint(st); box.style.display = ""; }).catch(() => {});
+  return box;
+}
+
+// ---------------------------------------------------------------------------
 // Draft view
 // ---------------------------------------------------------------------------
 
@@ -3179,6 +3265,7 @@ function DraftView(preselectId) {
       el("button", { class: "btn secondary", onclick: () => startDraftFromText() }, "Draft from an email or notes"),
     ])
   );
+  wrap.appendChild(sampleCard());
 
   const body = el("div");
   wrap.appendChild(body);
@@ -3220,7 +3307,7 @@ function DraftView(preselectId) {
             : "Not used yet";
           return el("div", { class: "doc-card" }, [
             el("div", { class: "top-row" }, [el("div", { class: "icon" }, "☰"), el("div", { class: "type-tag" }, t.document_type)]),
-            el("div", { class: "name" }, t.name),
+            el("div", { class: "name" }, [t.name, sampleTag(t.is_sample)]),
             el("div", { class: "field-chips" }, chips),
             el("div", { class: "meta" }, `${t.placeholder_count} field${t.placeholder_count === 1 ? "" : "s"} · ${used}`),
             el("div", { class: "actions" }, [el("button", { class: "btn small block", onclick: () => startDraft(t.id) }, "Use this template")]),
@@ -3493,7 +3580,7 @@ function MastersView() {
                 el("div", { class: "badge " + (t.status === "ready" ? "ready" : "draft") }, t.status === "ready" ? "Ready" : "Draft"),
               ]),
               el("div", { class: "type-tag" }, t.document_type),
-              el("div", { class: "name" }, t.name),
+              el("div", { class: "name" }, [t.name, sampleTag(t.is_sample)]),
               el("div", { class: "meta" }, `${t.placeholder_count} field${t.placeholder_count === 1 ? "" : "s"} · ${t.generated_count} drafted · uploaded ${new Date(t.created_at).toLocaleDateString()}`),
               el("div", { class: "actions" }, actions),
             ])
@@ -3648,7 +3735,7 @@ function DocumentsView() {
       el("div", { class: "left" }, [
         el("div", { class: "file-icon" }, "✓"),
         el("div", {}, [
-          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), statusTagEl(d.status), signatureTagEl(d.signature, d.id), termTagEl(d), unresolvedBadgeEl(d.unresolved_count)]),
+          el("div", { class: "folder-name-row" }, [el("div", { class: "name" }, d.name), sampleTag(d.is_sample), statusTagEl(d.status), signatureTagEl(d.signature, d.id), termTagEl(d), unresolvedBadgeEl(d.unresolved_count)]),
           el("div", { class: "lineage" }, ["Originated from ", el("span", { class: "tag" }, d.template_name)]),
           partiesLineEl(d.parties),
         ]),
@@ -3843,6 +3930,7 @@ function DocumentsView() {
               el("div", {}, showArchived ? "Documents you archive will show up here." : "Head to the Draft tab to generate your first one."),
             ])
           );
+          if (!showArchived) listWrap.appendChild(sampleCard());
           return;
         }
         const docsById = {};
@@ -3962,7 +4050,7 @@ function DocumentsView() {
       const panelOverlay = el("div", { class: "panel-overlay" });
       const panel = el("div", { class: "slide-panel" }, [
         el("button", { class: "close", onclick: () => panelOverlay.remove() }, "✕"),
-        el("div", { class: "folder-name-row" }, [el("h2", { style: "margin:0;" }, full.name), statusTagEl(full.status), unresolvedBadgeEl(full.unresolved_count)]),
+        el("div", { class: "folder-name-row" }, [el("h2", { style: "margin:0;" }, full.name), sampleTag(full.is_sample), statusTagEl(full.status), unresolvedBadgeEl(full.unresolved_count)]),
         el("div", { class: "sub" }, `Drafted ${new Date(full.created_at).toLocaleString()}`),
         partiesLineEl(full.parties),
         el("div", { class: "lineage-box" }, [

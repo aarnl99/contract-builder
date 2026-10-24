@@ -117,6 +117,11 @@ class Template(SQLModel, table=True):
     # render the editor view and to generate finished contracts.
     working_path: str
     finalized: bool = False
+    # The "Try a sample" master document (see main.create_sample): a real
+    # template with fake content that's safe to play with. It never counts
+    # toward the monthly plan, never emails anyone, and can't be sent for
+    # signature.
+    is_sample: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
