@@ -2496,6 +2496,37 @@ function counterStatusNote() {
   return n;
 }
 
+// A "⋯" button that opens a small menu of the rare or risky actions for a row,
+// so they are one deliberate click away instead of competing with the main
+// choices. items: [{label, onClick, danger}] or {divider: true}.
+function moreMenu(items) {
+  const wrap = el("div", { class: "more-wrap" });
+  const btn = el("button", { type: "button", class: "more-btn", "aria-label": "More actions", "aria-haspopup": "menu", "aria-expanded": "false" }, "⋯");
+  const menu = el("div", { class: "more-menu", role: "menu", style: "display:none;" });
+  const onDoc = (ev) => { if (!wrap.contains(ev.target)) close(); };
+  function close() {
+    menu.style.display = "none";
+    btn.setAttribute("aria-expanded", "false");
+    document.removeEventListener("click", onDoc, true);
+  }
+  items.forEach((it) => {
+    if (it.divider) { menu.appendChild(el("div", { class: "more-sep" })); return; }
+    const b = el("button", { type: "button", role: "menuitem", class: "more-item" + (it.danger ? " danger" : "") }, it.label);
+    b.addEventListener("click", () => { close(); it.onClick(); });
+    menu.appendChild(b);
+  });
+  btn.addEventListener("click", () => {
+    const open = menu.style.display === "none";
+    menu.style.display = open ? "" : "none";
+    btn.setAttribute("aria-expanded", String(open));
+    if (open) document.addEventListener("click", onDoc, true);
+    else document.removeEventListener("click", onDoc, true);
+  });
+  wrap.appendChild(btn);
+  wrap.appendChild(menu);
+  return wrap;
+}
+
 async function openRedlinesModal(generatedId) {
   // See the matching comment in openShareModal -- a leftover detail panel
   // would otherwise render on top of this modal (panel-overlay's z-index
@@ -2639,6 +2670,30 @@ async function openRedlinesModal(generatedId) {
           subBox.appendChild(sumBox);
         }
 
+        // Live progress for this round ("2 of 3 decided") and the shortcut
+        // for long rounds. onStageChange is called by each row when its
+        // choice changes; the header, the footer and the Send button all
+        // follow from it.
+        const acceptable = [];
+        const flaggedUpfront = sub.edits.filter((e) => e.decision === "pending" && e.risk).length;
+        const progressHead = el("div", { class: "decision-head" });
+        const progressText = el("div", { class: "decision-head-text" });
+        let onStageChange = () => {};
+        const decidedNow = () => sub.edits.filter((e) => e.decision !== "pending" || (subStage[e.id] && subStage[e.id].decision !== "pending")).length;
+        if (awaitingResponse && sub.origin !== "owner_reconsideration" && sub.origin !== "owner_edit") {
+          progressHead.appendChild(progressText);
+          if (undecidedCount >= 2) {
+            const acceptAllLink = el("button", {
+              type: "button", class: "link-btn",
+              title: flaggedUpfront ? "Changes flagged for a lawyer's eye are skipped" : "",
+            }, flaggedUpfront ? `Accept all remaining (skips ${flaggedUpfront} flagged)` : "Accept all remaining");
+            acceptAllLink.addEventListener("click", () => acceptable.forEach((f) => f()));
+            progressHead.appendChild(acceptAllLink);
+            progressHead.acceptAll = acceptAllLink;
+          }
+          subBox.appendChild(progressHead);
+        }
+
         sub.edits.forEach((edit) => {
           const already = edit.decision !== "pending"; // already decided server-side (from a prior response)
           const thresholdLines = [];
@@ -2667,21 +2722,17 @@ async function openRedlinesModal(generatedId) {
           let reconsiderBox = null;
           if (isRemovableOwnerEdit) {
             const summaryEl = el("div", { class: "decided pending" }, "Proposed — awaiting the client's decision");
-            const removeBtn = el("button", { class: "btn secondary small" }, "Remove");
-            removeBtn.addEventListener("click", async () => {
+            // Withdrawing is rare, so it lives in the "⋯" menu (and still asks first).
+            const doRemove = async () => {
               if (!confirm("Remove this change? The client will no longer see it.")) return;
-              removeBtn.disabled = true;
-              removeBtn.textContent = "Removing...";
               try {
                 await api(`/api/redline-edits/${edit.id}/withdraw`, { method: "DELETE" });
                 load();
               } catch (e) {
-                removeBtn.disabled = false;
-                removeBtn.textContent = "Remove";
                 alert(e.message);
               }
-            });
-            actions = el("div", { class: "decision-row" }, [summaryEl, removeBtn]);
+            };
+            actions = el("div", { class: "decision-row" }, [summaryEl, moreMenu([{ label: "Remove this change…", danger: true, onClick: doRemove }])]);
           } else if (already) {
             const summaryEl = edit.decision === "countered"
               ? el("div", { class: "decided-countered" }, ["Countered: ", el("strong", {}, edit.counter_value)])
@@ -2702,9 +2753,10 @@ async function openRedlinesModal(generatedId) {
             // 400. Don't offer the button at all on a row that's already
             // been superseded; only the still-live row (the newest one in
             // the chain) gets a working Reconsider control.
+            let toggleReconsider = () => {};
             const reconsiderBtn = edit.superseded
               ? null
-              : el("button", { class: "btn secondary small" }, "Reconsider");
+              : moreMenu([{ label: "Reconsider this decision", onClick: () => toggleReconsider() }]);
             actions = el("div", { class: "decision-row" }, [summaryEl, supersededNote, reconsiderBtn]);
 
             // Reconsider: reopens accept/reject/counter controls for an
@@ -2717,12 +2769,11 @@ async function openRedlinesModal(generatedId) {
             reconsiderBox = el("div", { style: "display:none;margin-top:8px;" });
             let reconsiderOpen = false;
             let reconsiderBuilt = false;
-            reconsiderBtn.addEventListener("click", () => {
+            toggleReconsider = () => {
               reconsiderOpen = !reconsiderOpen;
               reconsiderBox.style.display = reconsiderOpen ? "" : "none";
-              reconsiderBtn.textContent = reconsiderOpen ? "Cancel" : "Reconsider";
               if (reconsiderOpen && !reconsiderBuilt) { reconsiderBuilt = true; buildReconsiderForm(); }
-            });
+            };
 
             function buildReconsiderForm() {
               const rstage = { decision: "pending", counter_value: "" };
@@ -2730,9 +2781,9 @@ async function openRedlinesModal(generatedId) {
               const rNote = counterStatusNote();
               rNote.style.display = "none";
               counterInput.addEventListener("input", () => { rstage.counter_value = counterInput.value; rNote.refresh(counterInput.value); });
-              const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
-              const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
-              const acceptBtn = el("button", { class: "btn small" }, "Accept");
+              const rejectBtn = el("button", { class: "btn small outcome o-reject" }, "Reject");
+              const counterBtn = el("button", { class: "btn small outcome o-counter" }, "Counter");
+              const acceptBtn = el("button", { class: "btn small outcome o-accept" }, "Accept");
               // Same idea as the first-time decision row: once picked, only
               // that action shows, with a "Change" link to bring the rest back.
               const rChange = el("button", {
@@ -2764,7 +2815,9 @@ async function openRedlinesModal(generatedId) {
               rejectBtn.addEventListener("click", () => setRStage("rejected"));
               counterBtn.addEventListener("click", () => setRStage("countered"));
               acceptBtn.addEventListener("click", () => setRStage("accepted"));
-              const sendBtn = el("button", { class: "btn small" }, "Send new decision");
+              const sendBtn = el("button", { class: "btn" }, "Send new decision");
+              const rCancel = el("button", { type: "button", class: "link-btn" }, "Cancel");
+              rCancel.addEventListener("click", () => toggleReconsider());
               sendBtn.addEventListener("click", async () => {
                 if (rstage.decision === "pending") { alert("Pick accept, reject, or counter first."); return; }
                 if (rstage.decision === "countered" && !rstage.counter_value.trim()) { alert("Enter a counter value."); return; }
@@ -2785,10 +2838,10 @@ async function openRedlinesModal(generatedId) {
               reconsiderBox.appendChild(
                 el("div", {}, [
                   el("div", { style: "font-size:12px;color:var(--muted);margin-bottom:6px;" }, "Change your decision -- sent to the client as its own update, by email, right away."),
-                  el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn, rChange]),
+                  el("div", { class: "decision-btns" }, [acceptBtn, counterBtn, rejectBtn, rChange]),
                   rNote,
                   counterInput,
-                  el("div", { style: "margin-top:8px;" }, [sendBtn]),
+                  el("div", { style: "margin-top:8px;display:flex;gap:14px;align-items:center;" }, [sendBtn, rCancel]),
                 ])
               );
             }
@@ -2802,9 +2855,12 @@ async function openRedlinesModal(generatedId) {
             const cNote = counterStatusNote();
             let fromAI = false;
             counterInput.addEventListener("input", () => { stage.counter_value = counterInput.value; cNote.refresh(counterInput.value, fromAI); });
-            const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
-            const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
-            const acceptBtn = el("button", { class: "btn small" }, "Accept");
+            // Three real alternatives, shown at equal weight: same size, told
+            // apart by label and a light tint, never by one being louder.
+            const rejectBtn = el("button", { class: "btn small outcome o-reject" }, "Reject");
+            const counterBtn = el("button", { class: "btn small outcome o-counter" }, "Counter");
+            const acceptBtn = el("button", { class: "btn small outcome o-accept" }, "Accept");
+            const askLine = el("div", { class: "decision-ask" }, "Decide on this change.");
             // Once an action is picked, only that action shows: the other two
             // buttons and the AI-suggestion extras get out of the way (they
             // read as competing choices), and a small "Change" link brings
@@ -2812,9 +2868,11 @@ async function openRedlinesModal(generatedId) {
             const changeLink = el("button", {
               type: "button", style: "display:none;background:none;border:0;padding:0 2px;font:inherit;font-size:12px;color:var(--accent);text-decoration:underline;cursor:pointer;",
             }, "Change");
-            const extras = el("div"); // AI suggestion + lawyer note; hidden once an action is picked
+            const extras = el("div"); // lawyer note (always) and the AI helper (inside the Counter step only)
+            const aiWrap = el("div"); // "Suggest with AI" + its box; shown only once Counter is picked
             function paintStage() {
               const picked = stage.decision !== "pending";
+              askLine.style.display = picked ? "none" : "";
               counterInput.style.display = stage.decision === "countered" ? "" : "none";
               cNote.style.display = stage.decision === "countered" ? "" : "none";
               cNote.refresh(counterInput.value, fromAI);
@@ -2831,11 +2889,12 @@ async function openRedlinesModal(generatedId) {
               counterBtn.style.display = picked && stage.decision !== "countered" ? "none" : "";
               acceptBtn.style.display = picked && stage.decision !== "accepted" ? "none" : "";
               changeLink.style.display = picked ? "" : "none";
-              extras.style.display = picked ? "none" : "";
-              // A counter needs room to be written and read: give the whole
-              // decision area the full row width while it is open.
-              if (actions) actions.classList.toggle("wide", stage.decision === "countered" || (!picked && adviceBox.style.display === ""));
+              // The AI helper belongs to the Counter step: it is not offered
+              // before a choice is made, where it would compete with the three
+              // real options.
+              aiWrap.style.display = stage.decision === "countered" ? "" : "none";
               if (stage.decision === "countered") counterInput.fit();
+              onStageChange();
             }
             function setStage(d) {
               stage.decision = stage.decision === d ? "pending" : d;
@@ -2850,7 +2909,7 @@ async function openRedlinesModal(generatedId) {
             // model only proposes a value plus a short reason. The result is
             // an editable draft; nothing is sent until "Send response".
             const adviceBox = el("div", { class: "advisor-box", style: "display:none;" });
-            const adviceBtn = el("button", { class: "btn secondary small advisor-btn" }, "Suggest a counter");
+            const adviceBtn = el("button", { type: "button", class: "link-btn advisor-btn" }, "✦ Suggest with AI");
             adviceBtn.addEventListener("click", async () => {
               adviceBtn.disabled = true;
               adviceBtn.textContent = "Thinking...";
@@ -2865,6 +2924,7 @@ async function openRedlinesModal(generatedId) {
                   counterInput.value = input.value;
                   stage.counter_value = input.value;
                   fromAI = true;
+                  adviceBox.style.display = "none"; // it is now the counter above, so close the suggestion
                   cNote.refresh(counterInput.value, fromAI);
                   counterInput.fit();
                   counterInput.focus();
@@ -2879,7 +2939,6 @@ async function openRedlinesModal(generatedId) {
                   el("span", { class: "advisor-left" }, `${res.usage.remaining} of ${res.usage.limit} AI suggestions left this month`),
                 ]));
                 adviceBox.style.display = "";
-                if (actions) actions.classList.add("wide");
                 input.fit();
               } catch (e) {
                 adviceBox.innerHTML = "";
@@ -2887,7 +2946,7 @@ async function openRedlinesModal(generatedId) {
                 adviceBox.style.display = "";
               }
               adviceBtn.disabled = false;
-              adviceBtn.textContent = "Suggest a counter";
+              adviceBtn.textContent = "✦ Suggest with AI";
             });
             // A change that touches liability, ownership, termination and the
             // like gets a plain note instead of an AI counter (decided in
@@ -2898,10 +2957,17 @@ async function openRedlinesModal(generatedId) {
                   el("div", { class: "advisor-why" }, edit.risk.message),
                 ])
               : null;
-            [lawyerNote || adviceBtn, lawyerNote ? null : adviceBox].forEach((n) => { if (n) extras.appendChild(n); });
-            actions = el("div", { class: "decision-col" }, [
+            if (lawyerNote) extras.appendChild(lawyerNote);
+            else { aiWrap.appendChild(adviceBtn); aiWrap.appendChild(adviceBox); }
+            extras.appendChild(aiWrap);
+            // "Accept all remaining" can only act on rows that are not flagged
+            // for a lawyer's eye: those always need a person's decision.
+            if (!edit.risk) acceptable.push(() => { if (stage.decision === "pending") { stage.decision = "accepted"; paintStage(); } });
+
+            actions = el("div", { class: "decision-col wide" }, [
+              askLine,
               el("div", { class: "decision-row" }, [
-                el("div", { class: "decision-btns" }, [rejectBtn, counterBtn, acceptBtn, changeLink]),
+                el("div", { class: "decision-btns" }, [acceptBtn, counterBtn, rejectBtn, changeLink]),
                 cNote,
                 counterInput,
               ]),
@@ -2967,7 +3033,11 @@ async function openRedlinesModal(generatedId) {
           subBox.appendChild(buildCommentThread(edit, { editPath: `/api/redline-edits/${edit.id}/comments`, myAuthorType: "owner" }));
         });
 
-        const footerActions = el("div", { style: "display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;" });
+        // The footer says where the round stands and carries the one button
+        // that moves it forward (Send response, or Apply once it is sent).
+        const footerNote = el("div", { class: "decision-foot-note" });
+        const footerBtns = el("div", { class: "decision-foot-btns" });
+        const footerActions = el("div", { class: "decision-foot" }, [footerNote]);
 
         if (awaitingResponse) {
           const sendBtn = el("button", { class: "btn" }, "Send response");
@@ -2988,7 +3058,30 @@ async function openRedlinesModal(generatedId) {
               alert(e.message);
             }
           });
-          footerActions.appendChild(sendBtn);
+          footerBtns.appendChild(sendBtn);
+          onStageChange = () => {
+            const stagedCount = Object.values(subStage).filter((v) => v.decision !== "pending").length;
+            const decided = decidedNow();
+            const total = sub.edits.length;
+            progressText.innerHTML = "";
+            progressText.appendChild(el("strong", {}, "Decide on each change. "));
+            progressText.appendChild(el("span", { class: "muted" }, `${decided} of ${total} decided.`));
+            footerNote.innerHTML = "";
+            footerNote.appendChild(el("div", { class: "decision-foot-count" }, `${decided} of ${total} decided`));
+            footerNote.appendChild(el("div", { class: "decision-foot-hint" },
+              stagedCount === 0
+                ? "Decide on at least one change to send a response."
+                : decided === total
+                ? "Everything is decided. Nothing is sent until you press the button."
+                : "Send now, or finish the rest first. Nothing is sent until you press the button."));
+            sendBtn.disabled = stagedCount === 0;
+            // Nothing left that the shortcut could accept: take it away.
+            if (progressHead.acceptAll) {
+              const anyLeft = sub.edits.some((e) => !e.risk && e.decision === "pending" && subStage[e.id] && subStage[e.id].decision === "pending");
+              progressHead.acceptAll.style.display = anyLeft ? "" : "none";
+            }
+          };
+          onStageChange();
         }
 
         // Excludes superseded edits (see apply_redline_submission's
@@ -2999,7 +3092,16 @@ async function openRedlinesModal(generatedId) {
         // a dead end that fails with "No accepted edits to apply yet."
         const hasAcceptedSomewhere = sub.edits.some((e) => !e.superseded && (e.decision === "accepted" || (e.decision === "pending" && e.evaluation === "auto_approved")));
         if (sub.status === "pending" && hasAcceptedSomewhere) {
-          const applyBtn = el("button", { class: "btn secondary" }, "Apply accepted changes → new draft");
+          // Once nothing is left to decide, Apply is the step that moves the
+          // round forward, so it is the main button; while decisions are still
+          // open it stays quiet so there is only one clear next step.
+          const applyBtn = el("button", { class: awaitingResponse ? "btn secondary" : "btn" }, "Apply accepted changes → new draft");
+          if (!awaitingResponse) {
+            const acceptedN = sub.edits.filter((e) => !e.superseded && e.decision === "accepted").length;
+            const counteredN = sub.edits.filter((e) => !e.superseded && e.decision === "countered").length;
+            footerNote.appendChild(el("div", { class: "decision-foot-count" }, `${acceptedN} accepted${counteredN ? `, ${counteredN} countered` : ""}`));
+            footerNote.appendChild(el("div", { class: "decision-foot-hint" }, "Applying creates a new draft with the accepted changes." + (counteredN ? " Counters stay open." : "")));
+          }
           applyBtn.addEventListener("click", async () => {
             // Warn BEFORE applying if a newer round exists on this same link
             // that hasn't been applied yet -- otherwise it's easy to apply an
@@ -3051,9 +3153,12 @@ async function openRedlinesModal(generatedId) {
               alert(e.message);
             }
           });
-          footerActions.appendChild(applyBtn);
+          footerBtns.appendChild(applyBtn);
         }
-        if (footerActions.children.length) subBox.appendChild(footerActions);
+        if (footerBtns.children.length) {
+          footerActions.appendChild(footerBtns);
+          subBox.appendChild(footerActions);
+        }
 
         if (sub.status === "reviewed") {
           subBox.appendChild(el("div", { class: "notice-box", style: "margin-top:12px;" }, "Applied, see the new version in your Documents library."));
