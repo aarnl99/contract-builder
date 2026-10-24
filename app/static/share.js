@@ -4,7 +4,7 @@
 // never in localStorage/sessionStorage/cookies, so it's gone the moment
 // they close or reload the tab and they simply enter the code again next
 // time, matching how this was scoped. In-progress redlines themselves are
-// saved server-side via "Save progress" instead, so re-entering the code
+// saved server-side by autosave instead, so re-entering the code
 // later picks up where they left off even though the session token itself
 // doesn't persist.
 
@@ -31,13 +31,20 @@ const TOKEN = location.pathname.replace(/^\/share\//, "").replace(/\/$/, "");
 let sessionToken = null;
 
 // Tracks whether there's redlining work sitting only in this tab's memory
-// that hasn't been sent to the server yet, via either "Save progress" or
+// that hasn't been sent to the server yet, via either autosave or
 // "Finalize and submit" -- an accidental reload or tab close would silently
 // lose it with no warning otherwise. Module-level (not local to
 // DocumentView) so it survives DocumentView being torn down and rebuilt
 // mid-session (e.g. after acknowledging a response) without stacking up
 // duplicate beforeunload listeners that could reference stale state.
 let hasUnsavedChanges = false;
+// The page saves a moment after the last edit (see the bottom bar in
+// DocumentView, which sets this hook), so there is no Save button to forget.
+let autosaveHook = null;
+function markDirty() {
+  hasUnsavedChanges = true;
+  if (autosaveHook) autosaveHook();
+}
 window.addEventListener("beforeunload", (e) => {
   if (!hasUnsavedChanges) return;
   e.preventDefault();
@@ -397,7 +404,11 @@ function DocumentView(data) {
 
   // ---- stats bar ----
   const statsBar = el("div", { class: "stats-bar" });
+  // Set once the bottom bar exists; keeps its message and Finalize button
+  // in step with the edits (see the bar below).
+  let barUpdate = () => {};
   function renderStats() {
+    barUpdate();
     statsBar.innerHTML = "";
     const changed = Object.keys(edits).length;
     statsBar.appendChild(
@@ -437,8 +448,8 @@ function DocumentView(data) {
         rows.unshift(el("div", { class: "rl-counter-note" }, "The sender countered this — accept it, reject it, or suggest something else."));
         topRight = el("div", { class: "rl-counter-actions" }, [
           el("button", { class: "rl-mini-btn accept", onclick: (ev) => { ev.stopPropagation(); acceptCounter(key); } }, "Accept"),
+          el("button", { class: "rl-mini-btn suggest", onclick: (ev) => { ev.stopPropagation(); editFromKey(key, ev.currentTarget.getBoundingClientRect()); } }, "Suggest edit"),
           el("button", { class: "rl-mini-btn reject", onclick: (ev) => { ev.stopPropagation(); rejectCounter(key); } }, "Reject"),
-          el("button", { class: "rl-mini-btn", onclick: (ev) => { ev.stopPropagation(); editFromKey(key, ev.currentTarget.getBoundingClientRect()); } }, "Suggest edit"),
         ]);
       } else {
         topRight = el("div", { class: "rl-remove", onclick: (ev) => { ev.stopPropagation(); removeSuggestion(key); } }, "Remove");
@@ -466,6 +477,7 @@ function DocumentView(data) {
   function acceptCounter(key) {
     if (!edits[key]) return;
     edits[key].counterPending = false;
+    markDirty();
     dismiss();
     repaint();
   }
@@ -474,6 +486,7 @@ function DocumentView(data) {
     if (!edits[key]) return;
     edits[key].value = edits[key].clientOriginalValue;
     edits[key].counterPending = false;
+    markDirty();
     dismiss();
     repaint();
   }
@@ -661,14 +674,14 @@ function DocumentView(data) {
         value, comment, sourceEditId: priorSourceEditId,
       };
     }
-    hasUnsavedChanges = true;
+    markDirty();
     dismiss();
     repaint();
   }
 
   function removeSuggestion(key) {
     delete edits[key];
-    hasUnsavedChanges = true;
+    markDirty();
     dismiss();
     repaint();
   }
@@ -741,11 +754,14 @@ function DocumentView(data) {
     if (actionChip) actionChip.remove();
     const acceptBtn = el("button", { class: "fdc-btn fdc-accept" }, "Accept");
     const rejectBtn = el("button", { class: "fdc-btn fdc-reject" }, "Reject");
-    const suggestBtn = el("button", { class: "fdc-btn fdc-suggest" }, "Suggest edit ✎");
+    const suggestBtn = el("button", { class: "fdc-btn fdc-suggest" }, "Suggest edit");
     acceptBtn.addEventListener("click", (e) => { e.stopPropagation(); onAccept(); });
     rejectBtn.addEventListener("click", (e) => { e.stopPropagation(); onReject(); });
     suggestBtn.addEventListener("click", (e) => { e.stopPropagation(); onSuggest(); });
-    actionChip = el("div", { class: "field-decision-chip" }, [acceptBtn, rejectBtn, suggestBtn]);
+    actionChip = el("div", { class: "field-decision-chip" }, [
+      el("div", { class: "fdc-ask" }, "The sender countered. Decide:"),
+      el("div", { class: "fdc-row" }, [acceptBtn, suggestBtn, rejectBtn]),
+    ]);
     document.body.appendChild(actionChip);
     actionChip.style.top = Math.min(window.innerHeight - 60, anchorRect.bottom + 8) + "px";
     actionChip.style.left = Math.min(window.innerWidth - 270, Math.max(8, anchorRect.left)) + "px";
@@ -993,8 +1009,8 @@ function DocumentView(data) {
     if (range) highlightRange(range);
     const base = { key, location: loc, fieldKey: "", label: "", originalText: info.text, anchorRect };
     showPill(anchorRect, [
-      { label: "💬 Comment", onClick: () => openCard({ ...base, mode: "comment", currentValue: info.text, currentComment: "" }) },
       { label: "✎ Replace", onClick: () => openCard({ ...base, mode: "replace", currentValue: info.text, currentComment: "" }) },
+      { label: "💬 Comment", onClick: () => openCard({ ...base, mode: "comment", currentValue: info.text, currentComment: "" }) },
       { label: "🗑 Delete", cls: "warn", onClick: () => commit({ ...base, mode: "delete", value: "", comment: "", format: "" }) },
     ]);
   }
@@ -1061,7 +1077,7 @@ function DocumentView(data) {
 
   const noteInput = el("textarea", { placeholder: "Anything else worth flagging that isn't captured above?" }, (data.draft && data.draft.note) || "");
   noteInput.addEventListener("input", () => {
-    hasUnsavedChanges = true;
+    markDirty();
     renderStats();
   });
   docCard.appendChild(
@@ -1349,11 +1365,16 @@ function DocumentView(data) {
   shell.appendChild(el("div", { class: "redline-layout" }, [el("div", { class: "redline-doc-col" }, [docCard]), sideCol]));
 
   // ---- bottom action bar ----
-  const saveBtn = el("button", { class: "btn secondary" }, "Save progress");
+  // Changes save themselves ~1.5s after the last edit, so there is no
+  // "Save progress" button. The bar just says when it last saved.
   const saveNote = el("span", { class: "save-note" }, "");
-  saveBtn.addEventListener("click", async () => {
-    saveBtn.disabled = true;
-    saveBtn.textContent = "Saving...";
+  let saveTimer = null;
+  let saving = false;
+  let dirtyWhileSaving = false;
+  async function saveProgress() {
+    if (saving) { dirtyWhileSaving = true; return; }
+    saving = true;
+    saveNote.textContent = "Saving…";
     try {
       // counter_decided: #32 -- accepting_edit_id alone doesn't tell the
       // server whether this row was actually decided; sourceEditId stays
@@ -1365,18 +1386,22 @@ function DocumentView(data) {
       // silently recorded server-side as accepted.
       const editList = Object.values(edits).map((e) => ({ field_key: e.field_key, proposed_value: e.value, comment: e.comment, label: e.label, location: e.location, accepting_edit_id: e.sourceEditId || null, counter_decided: !e.counterPending }));
       await api(`/api/share/${TOKEN}/save-progress`, { method: "POST", body: { edits: editList, note: noteInput.value.trim() } });
-      hasUnsavedChanges = false;
-      saveNote.textContent = "Saved — come back anytime with your access code.";
+      if (!dirtyWhileSaving) hasUnsavedChanges = false;
+      saveNote.textContent = "✓ Saved " + new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) + ". Come back anytime with your access code.";
     } catch (e) {
-      saveNote.textContent = e.message;
+      saveNote.textContent = "Couldn't save yet (" + e.message + "). Your changes are still here.";
     } finally {
-      saveBtn.disabled = false;
-      saveBtn.textContent = "Save progress";
-      setTimeout(() => (saveNote.textContent = ""), 4000);
+      saving = false;
+      if (dirtyWhileSaving) { dirtyWhileSaving = false; saveProgress(); }
     }
-  });
+  }
+  autosaveHook = () => {
+    saveNote.textContent = "Saving soon…";
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveProgress, 1500);
+  };
 
-  const downloadBtn = el("button", { class: "btn secondary" }, "Download");
+  const downloadBtn = el("button", { type: "button", class: "link-btn" }, "Download");
   downloadBtn.addEventListener("click", async () => {
     downloadBtn.disabled = true;
     downloadBtn.textContent = "Downloading...";
@@ -1404,6 +1429,9 @@ function DocumentView(data) {
   });
 
   const submitBtn = el("button", { class: "btn" }, "Finalize and submit");
+  const signBtn = data.signing && data.signing.state === "ready"
+    ? el("a", { class: "btn", href: data.signing.sign_url, style: "display:none;" }, "Review and sign")
+    : null;
   submitBtn.addEventListener("click", async () => {
     errBox.innerHTML = "";
     // Hard block -- bug tracker #21 / phase 4. Inaction on a counter used
@@ -1445,11 +1473,43 @@ function DocumentView(data) {
       errBox.appendChild(el("div", { class: "error-box" }, e.message));
       submitBtn.disabled = false;
       submitBtn.textContent = "Finalize and submit";
+      barUpdate();
     }
   });
 
+  // The bar says where things stand and carries the one button that moves
+  // them forward: Finalize and submit, or, once everything is agreed and it
+  // is the client's turn to sign, Review and sign. Finalize is disabled with
+  // the reason shown, instead of failing with an error after the click.
+  const barTitle = el("div", { class: "bar-title" });
+  const barSub = el("div", { class: "bar-sub" });
+  barUpdate = () => {
+    const pending = Object.values(edits).filter((e) => e.counterPending).length;
+    const changes = Object.keys(edits).length;
+    const readyToSign = !!signBtn && !changes && !pending;
+    barSub.innerHTML = "";
+    if (readyToSign) {
+      barTitle.textContent = "Agreed. Nothing left to submit.";
+      barSub.appendChild(document.createTextNode("Review the final document, then sign. "));
+    } else if (pending) {
+      barTitle.textContent = `${pending} counter${pending === 1 ? "" : "s"} left to decide`;
+      barSub.appendChild(document.createTextNode("Accept, reject or suggest an edit on each one, then submit. "));
+    } else {
+      barTitle.textContent = changes ? `Ready to submit: ${changes} change${changes === 1 ? "" : "s"}` : "Ready to submit";
+      barSub.appendChild(document.createTextNode("Nothing is sent until you press the button. "));
+    }
+    barSub.appendChild(saveNote);
+    submitBtn.style.display = readyToSign ? "none" : "";
+    if (signBtn) signBtn.style.display = readyToSign ? "" : "none";
+    if (!submitBtn.textContent.endsWith("...")) submitBtn.disabled = pending > 0;
+  };
+  barUpdate();
+
   shell.appendChild(
-    el("div", { class: "redline-bottom-bar" }, [saveBtn, downloadBtn, submitBtn, saveNote])
+    el("div", { class: "redline-bottom-bar" }, [
+      el("div", { class: "bar-text" }, [barTitle, barSub]),
+      el("div", { class: "bar-actions" }, [downloadBtn, signBtn, submitBtn]),
+    ])
   );
 
   if (data.sender_email) {
@@ -1530,12 +1590,11 @@ async function loadDocument() {
           seeded.forEach((s) => { if (s.location.new_paragraph || !existingKeys.has(locKey(s.location))) fresh.draft.edits.push(s); });
         }
         showDocument(fresh);
-        // The seeded counter-acceptances above exist only in this tab's
-        // memory until "Save progress" or "Finalize" actually sends them --
-        // see the comment on hasUnsavedChanges. Without this, accepting a
-        // counter and then reloading before saving would silently lose it
-        // with no warning at all.
-        if (seeded.length) hasUnsavedChanges = true;
+        // The seeded counters above exist only in this tab's memory until
+        // a save sends them -- see the comment on hasUnsavedChanges.
+        // markDirty() starts the autosave, so reloading right away can't
+        // lose them.
+        if (seeded.length) markDirty();
       })]));
     } else {
       showDocument(data);
