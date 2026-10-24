@@ -2467,6 +2467,18 @@ function unresolvedBadgeEl(count) {
   return el("span", { class: "unresolved-badge" }, `${count} unresolved`);
 }
 
+// A multi-line text box that grows with what is typed in it, so a long counter
+// or a long AI suggestion can be read and edited without scrolling a tiny box.
+function longTextBox(attrs, value) {
+  const ta = el("textarea", { rows: "3", ...attrs }, value || "");
+  ta.classList.add("counter-text");
+  const grow = () => { ta.style.height = "auto"; ta.style.height = Math.min(Math.max(ta.scrollHeight, 76), 420) + "px"; };
+  ta.addEventListener("input", grow);
+  // Size it once it is on screen (scrollHeight is 0 while hidden / detached).
+  ta.fit = () => requestAnimationFrame(grow);
+  return ta;
+}
+
 async function openRedlinesModal(generatedId) {
   // See the matching comment in openShareModal -- a leftover detail panel
   // would otherwise render on top of this modal (panel-overlay's z-index
@@ -2697,7 +2709,7 @@ async function openRedlinesModal(generatedId) {
 
             function buildReconsiderForm() {
               const rstage = { decision: "pending", counter_value: "" };
-              const counterInput = el("input", { type: "text", placeholder: "Your counter value...", style: "display:none;margin-top:8px;" });
+              const counterInput = longTextBox({ placeholder: "Your counter value...", style: "display:none;margin-top:8px;" });
               counterInput.addEventListener("input", () => { rstage.counter_value = counterInput.value; });
               const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
               const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
@@ -2722,7 +2734,7 @@ async function openRedlinesModal(generatedId) {
               function setRStage(d) {
                 rstage.decision = rstage.decision === d ? "pending" : d;
                 paintRStage();
-                if (rstage.decision === "countered") counterInput.focus();
+                if (rstage.decision === "countered") { counterInput.fit(); counterInput.focus(); }
               }
               rChange.addEventListener("click", () => { rstage.decision = "pending"; paintRStage(); });
               rejectBtn.addEventListener("click", () => setRStage("rejected"));
@@ -2761,7 +2773,7 @@ async function openRedlinesModal(generatedId) {
           } else {
             const stage = subStage[edit.id] || { decision: "pending", counter_value: "" };
             subStage[edit.id] = stage;
-            const counterInput = el("input", { type: "text", placeholder: "Your counter value...", value: stage.counter_value, style: stage.decision === "countered" ? "" : "display:none;" });
+            const counterInput = longTextBox({ placeholder: "Your counter value...", style: stage.decision === "countered" ? "" : "display:none;" }, stage.counter_value);
             counterInput.addEventListener("input", () => { stage.counter_value = counterInput.value; });
             const rejectBtn = el("button", { class: "btn secondary small" }, "Reject");
             const counterBtn = el("button", { class: "btn secondary small" }, "Counter");
@@ -2786,6 +2798,10 @@ async function openRedlinesModal(generatedId) {
               acceptBtn.style.display = picked && stage.decision !== "accepted" ? "none" : "";
               changeLink.style.display = picked ? "" : "none";
               extras.style.display = picked ? "none" : "";
+              // A counter needs room to be written and read: give the whole
+              // decision area the full row width while it is open.
+              if (actions) actions.classList.toggle("wide", stage.decision === "countered" || (!picked && adviceBox.style.display === ""));
+              if (stage.decision === "countered") counterInput.fit();
             }
             function setStage(d) {
               stage.decision = stage.decision === d ? "pending" : d;
@@ -2808,12 +2824,13 @@ async function openRedlinesModal(generatedId) {
               try {
                 const res = await api(`/api/redline-edits/${edit.id}/suggest-counter`, { method: "POST" });
                 const sug = res.suggestion;
-                const input = el("input", { type: "text", value: sug.counter_value, "aria-label": "Suggested counter" });
+                const input = longTextBox({ "aria-label": "Suggested counter" }, sug.counter_value);
                 const useBtn = el("button", { class: "btn small" }, "Use as my counter");
                 useBtn.addEventListener("click", () => {
                   if (stage.decision !== "countered") setStage("countered");
                   counterInput.value = input.value;
                   stage.counter_value = input.value;
+                  counterInput.fit();
                   counterInput.focus();
                 });
                 adviceBox.innerHTML = "";
@@ -2826,6 +2843,8 @@ async function openRedlinesModal(generatedId) {
                   el("span", { class: "advisor-left" }, `${res.usage.remaining} of ${res.usage.limit} AI suggestions left this month`),
                 ]));
                 adviceBox.style.display = "";
+                if (actions) actions.classList.add("wide");
+                input.fit();
               } catch (e) {
                 adviceBox.innerHTML = "";
                 adviceBox.appendChild(el("div", { class: "advisor-why" }, e.message));
