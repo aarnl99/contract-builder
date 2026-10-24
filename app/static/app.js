@@ -3444,7 +3444,12 @@ function MastersView() {
         throw new Error(data.detail || "Upload failed");
       }
       const tpl = await res.json();
-      location.hash = `#/editor/${tpl.id}`;
+      // Uploading is a finished action on its own: people often just want the
+      // document saved. Marking fields is offered, never forced.
+      nameInput.value = "";
+      fileInput.value = "";
+      showUploaded(tpl);
+      load();
     } catch (e) {
       uploadErr.appendChild(el("div", { class: "error-box" }, e.message));
     } finally {
@@ -3458,6 +3463,19 @@ function MastersView() {
   uploadCard.appendChild(el("div", { class: "form-row" }, [el("label", { class: "field-label" }, "Word document (.docx)"), fileInput]));
   uploadCard.appendChild(uploadErr);
   uploadCard.appendChild(el("div", { style: "margin-top:6px;" }, uploadBtn));
+  // Shown after a successful upload: two equal choices, no forced next step.
+  const uploadedBox = el("div", { class: "upload-done", style: "display:none;" });
+  function showUploaded(tpl) {
+    uploadedBox.innerHTML = "";
+    uploadedBox.style.display = "";
+    uploadedBox.appendChild(el("div", { class: "upload-done-title" }, `\u2713 \u201c${tpl.name}\u201d is saved to your master documents.`));
+    uploadedBox.appendChild(el("div", { class: "upload-done-sub" }, "Mark the parts that change (names, dates, amounts) to turn it into a fillable template, or leave it as it is for now. You can do this any time from the list below."));
+    uploadedBox.appendChild(el("div", { class: "upload-done-btns" }, [
+      el("button", { type: "button", class: "btn secondary", onclick: () => (location.hash = `#/editor/${tpl.id}`) }, "Mark fields now"),
+      el("button", { type: "button", class: "btn secondary", onclick: () => { uploadedBox.style.display = "none"; } }, "Done for now"),
+    ]));
+  }
+  uploadCard.appendChild(uploadedBox);
   wrap.appendChild(uploadCard);
 
   const listWrap = el("div", { class: "grid" });
@@ -4246,6 +4264,7 @@ function EditorView(templateId) {
   const genBtn = el("button", { class: "btn block", style: "margin-bottom:8px;" }, "Draft from this document →");
   genBtn.addEventListener("click", () => (location.hash = `#/draft/${templateId}`));
   actionsCard.appendChild(genBtn);
+  actionsCard.appendChild(el("div", { style: "text-align:center;margin:0 0 12px;" }, el("button", { type: "button", class: "link-btn", onclick: () => (location.hash = "#/masters") }, "Done for now, back to Master Documents")));
   actionsCard.appendChild(resetBtn);
   sidebar.appendChild(actionsCard);
 
