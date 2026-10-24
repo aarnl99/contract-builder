@@ -963,17 +963,6 @@ function _findParaEl(container, tablePath, pIndex) {
   return null;
 }
 
-// Short human-readable summary of one staged direct edit, for the pending-
-// changes list below the preview -- an insert reads as "Insert: ...", a
-// replace as "original" → "new".
-function _describeStagedEdit(e) {
-  const shorten = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
-  if (e.segments.every((s) => s.start === s.end)) {
-    return "Insert: " + shorten(e.new_text.trim(), 60);
-  }
-  return `"${shorten((e.originalText || "").trim(), 30)}" → "${shorten(e.new_text.trim(), 30)}"`;
-}
-
 function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, editable, onEdited }) {
   const overlay = el("div", { class: "modal-overlay" });
   const box = el("div", { class: "modal", style: "width:720px;" });
@@ -1006,7 +995,9 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
     // insert (no selection needed) added right after Phase 5 shipped, once
     // it was clear "select something to edit it" left no way to just add
     // new text -- see computeCursorPosition.
-    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:-8px 0 10px;" }, "Select text to edit it, or click anywhere to insert something new. Stage as many changes as you like, then save them all at once -- applied instantly as one new revision if this document hasn't been shared yet, or sent to the client for approval if it has."));
+    // The key stays above the document while editing; "How to edit" explains the gestures.
+    box.appendChild(window.RedlineUI.keyBar({ comment: false }));
+    box.appendChild(el("p", { style: "font-size:12.5px;color:var(--muted);margin:0 0 10px;" }, "Stage as many changes as you like, then save them all at once -- applied instantly as one new revision if this document hasn't been shared yet, or sent to the client for approval if it has."));
   }
 
   const preview = el("div", { class: "contract-view compact", style: "max-height:52vh;overflow-y:auto;" });
@@ -1017,60 +1008,103 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
   box.appendChild(stagedBar);
 
   if (editable && generatedId) {
+    // The sender gets the same tools as the client (see redline_ui.js):
+    // highlight text to replace or delete it, click between words to insert
+    // text or add a new paragraph, with Bold / Italic / Underline for new
+    // text. Everything is staged locally and painted straight into the
+    // document (the same marks the client sees), then saved as one batch.
+    const RU = window.RedlineUI;
+    let newParaSeq = 0;
+    let ghost = null; // { kind, edit, replacesId } -- an unsaved edit being typed in the card
+    const pristineRoot = document.createElement("div");
+    pristineRoot.innerHTML = pristineHtml;
+    const pristineParaText = (tp, pi) => { const p = _findParaEl(pristineRoot, tp, pi); return p ? p.textContent : ""; };
+    const pristineRunText = (tp, pi, r) => {
+      const p = _findParaEl(pristineRoot, tp, pi);
+      const run = p ? p.querySelector(`.run[data-r="${r}"]`) : null;
+      return run ? run.textContent : "";
+    };
+    const shorten = (s, n) => { s = (s || "").replace(/\s+/g, " ").trim(); return s.length > n ? s.slice(0, n) + "…" : s; };
+
+    function stagedKind(e) {
+      if (e.new_paragraph) return "paragraph";
+      if (e.segments.length && e.segments.every((s) => s.start === s.end)) return "insert";
+      if (!(e.new_text || "").trim()) return "delete";
+      return "replace";
+    }
+    const KIND_LABEL = { insert: "Insert", paragraph: "New paragraph", replace: "Replace", delete: "Delete" };
+
+    function paddedInsert(info, value) {
+      const seg = info.segments[0];
+      const t = pristineRunText(info.table_path, info.paragraph_index, seg.r);
+      return RU.padInsert(t[seg.start - 1] || "", t[seg.start] || "", value);
+    }
+
     // Rebuilds the preview from the pristine (server-rendered) HTML, then
-    // splices every staged edit's fv-del/fv-ins decoration back in -- the
-    // exact same pattern share.js's repaint() uses to show a client their
-    // pending redlines in place, in the actual document text, rather than
-    // only in a separate list. Reusing .fv-del/.fv-ins here (not a new
-    // class) is deliberate: it's already styled, and an in-progress owner
-    // edit reads the same way an already-applied one does elsewhere.
-    function repaintStaged() {
+    // splices every staged edit back in at its exact run/offset -- the same
+    // pattern share.js uses to show a client their pending redlines in place.
+    function paintPreview() {
       preview.innerHTML = pristineHtml;
-      const byPara = {};
-      staged.forEach((e) => {
-        const pk = `${e.table_path || ""} ${e.paragraph_index}`;
-        (byPara[pk] = byPara[pk] || []).push(e);
+      const items = staged.filter((e) => !(ghost && ghost.replacesId === e.localId)).map((e) => ({ e, isGhost: false, kind: stagedKind(e) }));
+      if (ghost) items.push({ e: ghost.edit, isGhost: true, kind: ghost.kind });
+      const byPara = {}, newParas = {};
+      items.forEach((it) => {
+        const pk = `${it.e.table_path || ""} ${it.e.paragraph_index}`;
+        const bucket = it.e.new_paragraph ? newParas : byPara;
+        (bucket[pk] = bucket[pk] || []).push(it);
       });
       Object.entries(byPara).forEach(([pk, list]) => {
         const sp = pk.lastIndexOf(" ");
-        const tablePath = pk.slice(0, sp);
-        const pIdx = parseInt(pk.slice(sp + 1), 10);
-        const paraEl = _findParaEl(preview, tablePath, pIdx);
+        const paraEl = _findParaEl(preview, pk.slice(0, sp), parseInt(pk.slice(sp + 1), 10));
         if (!paraEl) return;
         const runEls = Array.from(paraEl.querySelectorAll(".run"));
         const byRun = {};
-        list.forEach((e) => {
-          e.segments.forEach((seg) => {
-            (byRun[seg.r] = byRun[seg.r] || []).push({ seg, e });
-          });
-        });
-        const seen = new Set();
+        list.forEach((it) => it.e.segments.forEach((seg) => { (byRun[seg.r] = byRun[seg.r] || []).push({ seg, it }); }));
         Object.entries(byRun).forEach(([rIdxStr, segEdits]) => {
           const runEl = runEls[parseInt(rIdxStr, 10)];
           if (!runEl) return;
-          segEdits.sort((a, b) => a.seg.start - b.seg.start);
+          segEdits.sort((a, b) => a.seg.start - b.seg.start || a.seg.end - b.seg.end);
           const text = runEl.textContent;
           const frag = document.createDocumentFragment();
+          const seen = new Set();
           let cursor = 0;
-          segEdits.forEach(({ seg, e }) => {
-            if (seg.start > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, seg.start)));
-            if (seg.start < seg.end) {
-              frag.appendChild(el("span", { class: "fv-del", "data-staged-id": String(e.localId) }, text.slice(seg.start, seg.end)));
+          segEdits.forEach(({ seg, it }) => {
+            const start = Math.max(seg.start, cursor), end = Math.max(seg.end, start);
+            if (start > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, start)));
+            const attrs = it.isGhost ? {} : { "data-staged-id": String(it.e.localId) };
+            const first = !seen.has(it.e);
+            seen.add(it.e);
+            const fmt = RU.fmtClasses(it.e.format);
+            const ins = () => el("span", { class: (it.isGhost ? "fv-ghost" : "fv-ins") + fmt, ...attrs }, it.e.new_text || "");
+            if (it.kind === "insert") { if (first) frag.appendChild(ins()); }
+            else {
+              frag.appendChild(el("span", { class: "fv-del", ...attrs }, text.slice(start, end)));
+              if (it.kind === "replace" && first) frag.appendChild(ins());
             }
-            // A multi-run edit (a drag-selection spanning several runs)
-            // shares one new_text across all its segments -- only show it
-            // once, at the first run it touches, not once per run.
-            if (!seen.has(e)) {
-              frag.appendChild(el("span", { class: "fv-ins", "data-staged-id": String(e.localId) }, e.new_text || "(blank)"));
-              seen.add(e);
-            }
-            cursor = Math.max(cursor, seg.end);
+            cursor = end;
           });
           if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
           runEl.innerHTML = "";
           runEl.appendChild(frag);
         });
       });
+      Object.entries(newParas).forEach(([pk, list]) => {
+        const sp = pk.lastIndexOf(" ");
+        let anchor = _findParaEl(preview, pk.slice(0, sp), parseInt(pk.slice(sp + 1), 10));
+        if (!anchor) return;
+        list.forEach((it) => {
+          const p = el("p", {
+            class: "newp-mark" + (it.isGhost ? " ghost" : "") + RU.fmtClasses(it.e.format),
+            ...(it.isGhost ? {} : { "data-staged-id": String(it.e.localId) }),
+          }, [el("span", { class: "np-text" }, it.e.new_text || "")]);
+          anchor.after(p);
+          anchor = p;
+        });
+      });
+    }
+
+    function repaintStaged() {
+      paintPreview();
       renderStagedBar();
     }
 
@@ -1079,7 +1113,15 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
       if (!staged.length) { stagedBar.style.display = "none"; return; }
       stagedBar.style.display = "";
       const list = el("div", { style: "display:flex;flex-direction:column;gap:6px;margin-bottom:10px;" });
-      staged.forEach((e) => {
+      staged.forEach((e, i) => {
+        const kind = stagedKind(e);
+        const fw = RU.fmtWords(e.format);
+        const fwNote = fw ? ` (${fw})` : "";
+        let text;
+        if (kind === "insert") text = `Add “${shorten(e.new_text, 60)}”${fwNote}`;
+        else if (kind === "paragraph") text = `Add paragraph “${shorten(e.new_text, 70)}”${fwNote}`;
+        else if (kind === "delete") text = `Remove “${shorten(e.originalText, 60)}”`;
+        else text = `“${shorten(e.originalText, 30)}” → “${shorten(e.new_text, 30)}”${fwNote}`;
         const removeBtn = el("span", { class: "staged-edit-remove" }, "Remove");
         removeBtn.addEventListener("click", () => {
           const idx = staged.indexOf(e);
@@ -1088,7 +1130,8 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
         });
         list.appendChild(
           el("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12.5px;background:var(--panel-2, var(--panel));border:1px solid var(--border);border-radius:6px;padding:6px 10px;" }, [
-            el("div", { style: "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" }, _describeStagedEdit(e)),
+            el("span", { class: "rl-tag " + kind, style: "flex:none;" }, KIND_LABEL[kind]),
+            el("div", { style: "min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" }, text),
             removeBtn,
           ])
         );
@@ -1109,6 +1152,8 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
                 paragraph_index: e.paragraph_index,
                 segments: e.segments,
                 new_text: e.new_text,
+                format: e.format || "",
+                new_paragraph: !!e.new_paragraph,
               })),
             },
           });
@@ -1130,97 +1175,207 @@ function showPreviewOverlay({ title, subtitle, html, generatedId, extraButtons, 
       stagedBar.appendChild(el("div", { style: "display:flex;justify-content:flex-end;" }, saveBtn));
     }
 
-    let activePopover = null;
-    // Reported bug: clicking to insert opened a popover with no visible
-    // anchor in the document itself -- you typed into a floating box with
-    // no way to see where, exactly, the new text would land relative to
-    // the surrounding words. activeMarker is a live ghost-text span
-    // spliced into the document AT the click point (see range.insertNode
-    // below); the textarea's input mirrors into it as you type, so the
-    // insertion is visible in place, in context, the whole time. It's
-    // distinct from a staged edit's own fv-ins decoration (see
-    // repaintStaged) -- this one only exists while THIS popover is open,
-    // and is discarded (not staged) on Cancel.
-    let activeMarker = null;
-    const closePop = () => {
-      if (activePopover) { activePopover.remove(); activePopover = null; }
-      if (activeMarker) { activeMarker.remove(); activeMarker = null; }
-    };
-    preview.addEventListener("mouseup", () => {
+    // ---- floating pill + card ----
+    let pill = null, activePopover = null, hlEls = [], hlRange = null;
+    const clearHl = () => { hlEls.forEach((n) => n.remove()); hlEls = []; };
+    function highlight(range) {
+      clearHl();
+      hlRange = range;
+      Array.from(range.getClientRects()).forEach((r) => {
+        if (r.width <= 0 || r.height <= 0) return;
+        const box = el("div", { class: "text-selection-highlight" });
+        box.style.cssText = `top:${r.top}px;left:${r.left}px;width:${r.width}px;height:${r.height}px`;
+        document.body.appendChild(box);
+        hlEls.push(box);
+      });
+    }
+    preview.addEventListener("scroll", () => { if (hlRange) { try { highlight(hlRange); } catch (e) { clearHl(); } } });
+    const removePill = () => { if (pill) { pill.remove(); pill = null; } };
+    const closeCard = () => { if (activePopover) { activePopover.remove(); activePopover = null; } };
+    function dismiss() {
+      closeCard(); removePill(); clearHl(); hlRange = null;
+      preview.querySelectorAll(".selected").forEach((n) => n.classList.remove("selected"));
+      if (ghost) { ghost = null; paintPreview(); }
+    }
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") dismiss(); });
+    document.addEventListener("click", function outside(e) {
+      if (!document.body.contains(overlay)) { document.removeEventListener("click", outside); return; }
+      if (e.target.closest(".contract-view") || e.target.closest(".rl-pill") || e.target.closest(".redline-popover")) return;
+      dismiss();
+    });
+
+    function commitStaged(o) {
+      // o: { mode, existing, info, value, format }
+      const base = { table_path: o.info.table_path, paragraph_index: o.info.paragraph_index, segments: o.info.segments };
+      let rec = null;
+      if (o.mode === "insert") {
+        if (o.value.trim()) rec = { ...base, new_text: paddedInsert(o.info, o.value), originalText: "", format: o.format };
+      } else if (o.mode === "paragraph") {
+        const v = o.value.trim();
+        if (v && v !== (o.prefill || "").trim()) rec = { ...base, segments: [], new_paragraph: true, uid: o.info.uid, new_text: v, originalText: "", format: o.format };
+      } else if (o.mode === "delete") {
+        rec = { ...base, new_text: "", originalText: o.info.text, format: "" };
+      } else {
+        const v = o.value.trim();
+        if (v !== (o.info.text || "").trim()) rec = { ...base, new_text: v, originalText: o.info.text || "", format: o.format };
+      }
+      const idx = o.existing ? staged.indexOf(o.existing) : -1;
+      if (rec) {
+        rec.localId = o.existing ? o.existing.localId : ++stagedSeq;
+        if (idx !== -1) staged[idx] = rec; else staged.push(rec);
+      } else if (idx !== -1) staged.splice(idx, 1);
+      dismiss();
+      repaintStaged();
+    }
+
+    function openCard(o) {
+      // o: { mode: replace|insert|paragraph, info, existing, anchorRect, contextText, prefill }
+      closeCard(); removePill();
+      const mode = o.mode;
+      const st = RU.fmtFlags(o.existing ? o.existing.format : "");
+      const live = mode === "insert" || mode === "paragraph";
+      const startValue = o.existing ? o.existing.new_text : (mode === "replace" ? (o.info.text || "") : (o.prefill || ""));
+      const input = el("textarea", { class: "rl-main-input", rows: mode === "replace" ? "2" : "3",
+        placeholder: mode === "insert" ? "Type the words to add…" : mode === "paragraph" ? "Type the new paragraph…" : "" }, startValue);
+      const quote = mode === "replace" ? `Currently: “${shorten(o.info.text, 160) || "(blank)"}”`
+        : mode === "paragraph" ? `After: “${shorten(o.contextText, 80)}”` : null;
+      const hint = mode === "insert" ? "You can see it in the contract as you type. Nothing existing is removed, and we add spaces around it if needed."
+        : mode === "paragraph" ? ((o.prefill ? `Your list uses typed labels, so it starts with “${o.prefill.trim()}”. Change it if you like. ` : "It copies the look of the paragraph above. ") + "Nothing existing is changed.")
+        : null;
+      let okBtn;
+      const syncGhost = () => {
+        if (!live) return;
+        ghost.edit.new_text = mode === "insert" ? paddedInsert(o.info, input.value) : input.value;
+        ghost.edit.format = RU.fmtString(st);
+        paintPreview();
+      };
+      const syncOk = () => {
+        const v = input.value.trim();
+        if (mode === "insert") okBtn.disabled = !v;
+        else if (mode === "paragraph") okBtn.disabled = !v || v === (o.prefill || "").trim();
+        else okBtn.disabled = false;
+      };
+      okBtn = el("button", { class: "btn", onclick: () => commitStaged({ mode, existing: o.existing, info: o.info, value: input.value, format: RU.fmtString(st), prefill: o.prefill }) },
+        mode === "insert" ? "Add text" : mode === "paragraph" ? "Add paragraph" : "Stage edit");
+      const kids = [
+        el("div", { class: "rp-label" }, mode === "insert" ? "Insert text here" : mode === "paragraph" ? "New paragraph below" : "Replace with"),
+        quote ? el("div", { class: "rl-quote" }, quote) : null,
+        el("div", { class: "rp-label rl-label-row" }, [el("span", {}, mode === "replace" ? "New text" : mode === "insert" ? "New text" : "Paragraph text"), RU.formatButtons(st, syncGhost)]),
+        input,
+        hint ? el("div", { class: "rl-hint" }, hint) : null,
+        el("div", { class: "rp-actions" }, [el("button", { class: "btn secondary", onclick: () => dismiss() }, "Cancel"), okBtn]),
+      ];
+      if (o.existing) kids.push(el("div", { class: "rp-remove", onclick: () => { staged.splice(staged.indexOf(o.existing), 1); dismiss(); repaintStaged(); } }, "Remove change"));
+
+      let anchorRect = o.anchorRect;
+      if (live) {
+        ghost = {
+          kind: mode, replacesId: o.existing ? o.existing.localId : null,
+          edit: { table_path: o.info.table_path, paragraph_index: o.info.paragraph_index, segments: o.info.segments, new_paragraph: mode === "paragraph", new_text: mode === "insert" ? paddedInsert(o.info, startValue) : startValue, format: RU.fmtString(st) },
+        };
+        paintPreview();
+        const g = preview.querySelector(".fv-ghost, .newp-mark.ghost");
+        if (g) {
+          // Keep the spot in view inside the scrolling preview.
+          g.scrollIntoView({ block: "nearest" });
+          anchorRect = g.getBoundingClientRect();
+        }
+      }
+      const pop = el("div", { class: "redline-popover rl-card" }, kids);
+      document.body.appendChild(pop);
+      RU.place(pop, anchorRect || { left: 20, bottom: 80, top: 60 }, 320);
+      activePopover = pop;
+      input.addEventListener("input", () => { syncGhost(); syncOk(); });
+      syncOk();
+      input.focus();
+      if (mode !== "replace") { try { input.setSelectionRange(input.value.length, input.value.length); } catch (e) {} }
+    }
+
+    function overlapsStaged(info, ignore) {
+      if (info.new_paragraph) return false;
+      return staged.some((e) => {
+        if (e === ignore || e.new_paragraph) return false;
+        if (e.table_path !== info.table_path || e.paragraph_index !== info.paragraph_index) return false;
+        return e.segments.some((a) => info.segments.some((b) => {
+          if (a.r !== b.r) return false;
+          const aZero = a.start === a.end, bZero = b.start === b.end;
+          if (aZero && bZero) return a.start === b.start;
+          if (aZero) return a.start > b.start && a.start < b.end;
+          if (bZero) return b.start > a.start && b.start < a.end;
+          return a.start < b.end && b.start < a.end;
+        }));
+      });
+    }
+
+    function startParagraph(info, rect) {
+      const above = pristineParaText(info.table_path, info.paragraph_index);
+      const label = RU.nextLabel(above);
+      openCard({ mode: "paragraph", info: { table_path: info.table_path, paragraph_index: info.paragraph_index, segments: [], new_paragraph: true, uid: ++newParaSeq, text: "" }, anchorRect: rect, contextText: above, prefill: label });
+    }
+
+    function editStaged(e, rect) {
+      const kind = stagedKind(e);
+      const info = { table_path: e.table_path, paragraph_index: e.paragraph_index, segments: e.segments, text: e.originalText, new_paragraph: !!e.new_paragraph, uid: e.uid };
+      openCard({ mode: kind === "delete" ? "replace" : kind, info, existing: e, anchorRect: rect,
+        contextText: kind === "paragraph" ? pristineParaText(e.table_path, e.paragraph_index) : "", prefill: "" });
+    }
+
+    function onMarkClick(markEl) {
+      const e = staged.find((x) => String(x.localId) === markEl.getAttribute("data-staged-id"));
+      if (!e) return;
+      dismiss();
+      const marks = Array.from(preview.querySelectorAll(`[data-staged-id="${e.localId}"]`));
+      marks.forEach((n) => n.classList.add("selected"));
+      const rect = marks[marks.length - 1].getBoundingClientRect();
+      pill = RU.pill([
+        { label: "✎ Edit", onClick: () => editStaged(e, rect) },
+        { label: "Remove", cls: "warn", onClick: () => { staged.splice(staged.indexOf(e), 1); dismiss(); repaintStaged(); } },
+      ], rect);
+    }
+
+    preview.addEventListener("mouseup", (ev) => {
+      const target = ev.target;
       setTimeout(() => {
         const sel = window.getSelection();
-        if (!sel || sel.rangeCount === 0) return;
-        const range = sel.getRangeAt(0);
-        if (!preview.contains(range.commonAncestorContainer)) return;
-        // A drag (real selection) edits/replaces that text; a plain click
-        // (collapsed selection) inserts new text at that point instead --
-        // see computeCursorPosition. Both post to the same endpoint; the
-        // only difference is a zero-width vs. a real segment.
-        const isInsert = sel.isCollapsed;
-        const rect = range.getBoundingClientRect();
-        const info = isInsert ? computeCursorPosition(preview) : computeSelectionSegments(preview);
-        sel.removeAllRanges();
+        if (sel && sel.rangeCount && !sel.isCollapsed) {
+          const range = sel.getRangeAt(0);
+          if (!preview.contains(range.commonAncestorContainer)) return;
+          const rect = range.getBoundingClientRect();
+          const info = RU.selectionInfo(preview, range);
+          const hl = range.cloneRange();
+          sel.removeAllRanges();
+          if (!info) return;
+          if (info.error === "cross-paragraph") { alert("Please select text within a single paragraph."); return; }
+          if (!info.text.trim()) return;
+          dismiss();
+          if (overlapsStaged(info)) { alert("Part of that is already in a change you've staged below. Click the mark to edit or remove it, or pick different words."); return; }
+          highlight(hl);
+          pill = RU.pill([
+            { label: "✎ Replace", onClick: () => openCard({ mode: "replace", info, anchorRect: rect }) },
+            { label: "🗑 Delete", cls: "warn", onClick: () => commitStaged({ mode: "delete", info, value: "", format: "" }) },
+          ], rect);
+          return;
+        }
+        const markEl = target.closest ? target.closest("[data-staged-id]") : null;
+        if (markEl && preview.contains(markEl)) { onMarkClick(markEl); return; }
+        const runEl = target.closest ? target.closest(".run") : null;
+        if (!runEl || !preview.contains(runEl)) { dismiss(); return; }
+        const fallback = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+        const info = RU.caretInfo(preview, ev.clientX, ev.clientY, fallback);
+        dismiss();
         if (!info) return;
-        if (info.error === "cross-paragraph") { alert("Please select text within a single paragraph."); return; }
-        if (info.error === "inside-pending-edit") { alert("That's part of a change you've already staged below -- remove it first if you want to change that spot again."); return; }
-        closePop();
-        // Splice the ghost marker in at the exact click point BEFORE the
-        // popover is built -- range is still a live, valid Range (clearing
-        // the Selection above doesn't invalidate Ranges obtained from it),
-        // and it's still collapsed to the click position since nothing has
-        // mutated the DOM yet.
-        let marker = null;
-        if (isInsert) {
-          marker = document.createElement("span");
-          marker.className = "insert-ghost-marker";
-          try { range.insertNode(marker); } catch (e) { marker = null; }
-          activeMarker = marker;
-        }
-        const input = el("textarea", { rows: "2", placeholder: isInsert ? "Type text to insert here..." : "" }, info.text);
-        if (marker) {
-          input.addEventListener("input", () => { marker.textContent = input.value; });
-        }
-        const errBox = el("div");
-        const saveBtn = el("button", { class: "btn" }, isInsert ? "Insert" : "Stage edit");
-        saveBtn.addEventListener("click", () => {
-          errBox.innerHTML = "";
-          if (isInsert && !input.value.trim()) {
-            errBox.appendChild(el("div", { class: "error-box" }, "Type something to insert."));
-            return;
-          }
-          if (!isInsert && input.value.trim() === (info.text || "").trim()) {
-            errBox.appendChild(el("div", { class: "error-box" }, "That's already the current text."));
-            return;
-          }
-          staged.push({
-            localId: ++stagedSeq,
-            table_path: info.table_path,
-            paragraph_index: info.paragraph_index,
-            segments: info.segments,
-            new_text: input.value,
-            originalText: info.text || "",
-          });
-          closePop();
-          // repaintStaged() rebuilds the preview from pristineHtml and
-          // reapplies every staged edit's decoration -- including the one
-          // just pushed above, so the ghost marker's job is done the
-          // moment this fires; it's already been removed by closePop().
-          repaintStaged();
-        });
-        const pop = el("div", { class: "redline-popover" }, [
-          el("div", { class: "rp-label" }, isInsert ? "Insert text" : "Edit text"),
-          input,
-          errBox,
-          el("div", { class: "rp-actions" }, [
-            el("button", { class: "btn secondary", onclick: closePop }, "Cancel"),
-            saveBtn,
-          ]),
-        ]);
-        document.body.appendChild(pop);
-        pop.style.top = Math.min(window.innerHeight - 220, rect.bottom + 8) + "px";
-        pop.style.left = Math.min(window.innerWidth - 300, Math.max(8, rect.left)) + "px";
-        activePopover = pop;
-        input.focus();
+        const loc = { table_path: info.table_path, paragraph_index: info.paragraph_index, segments: info.segments, text: "" };
+        const existing = staged.find((x) => !x.new_paragraph && x.segments.length === 1 && x.segments[0].r === loc.segments[0].r && x.segments[0].start === loc.segments[0].start && x.segments[0].end === loc.segments[0].end && x.paragraph_index === loc.paragraph_index && x.table_path === loc.table_path);
+        if (existing) { editStaged(existing, info.rect); return; }
+        // Show the blinking caret where the words would go.
+        ghost = { kind: "insert", replacesId: null, edit: { ...loc, new_paragraph: false, new_text: "", format: "" } };
+        paintPreview();
+        const g = preview.querySelector(".fv-ghost");
+        const rect = g ? g.getBoundingClientRect() : info.rect;
+        pill = RU.pill([
+          { label: "＋ Insert text here", onClick: () => openCard({ mode: "insert", info: loc, anchorRect: rect }) },
+          { label: "¶ New paragraph below", onClick: () => startParagraph(loc, rect) },
+        ], rect);
       }, 0);
     });
   }
@@ -2685,11 +2840,28 @@ async function openRedlinesModal(generatedId) {
                 // deliberately mirrors original_value (see
                 // edit_generated_document) -- the actual change is in
                 // counter_value, or this would read "30 days → 30 days".
-                el("div", { class: "change" }, [
-                  el("span", { class: "from" }, edit.original_value || "(blank)"),
-                  " → ",
-                  el("span", { class: "to" }, sub.origin === "owner_edit" ? edit.counter_value : edit.proposed_value),
-                ]),
+                (() => {
+                  // Read the change in plain words: an addition, a removal, a
+                  // comment on unchanged text, or a before -> after.
+                  const shownTo = (sub.origin === "owner_edit" ? edit.counter_value : edit.proposed_value) || "";
+                  const fw = window.RedlineUI.fmtWords(edit.format);
+                  const fwNote = fw ? ` (${fw})` : "";
+                  if (!edit.original_value && shownTo.trim()) {
+                    return el("div", { class: "change" }, [edit.new_paragraph ? "Add a new paragraph: “" : "Add: “", el("span", { class: "to" }, shownTo.trim()), `”${fwNote}`]);
+                  }
+                  if (edit.original_value && !shownTo.trim()) {
+                    return el("div", { class: "change" }, ["Remove: “", el("span", { class: "from" }, edit.original_value), "”"]);
+                  }
+                  if (edit.original_value && edit.original_value.trim() === shownTo.trim() && edit.comment) {
+                    return el("div", { class: "change" }, ["Comment on: “", el("span", { class: "from", style: "text-decoration:none;" }, edit.original_value), "”"]);
+                  }
+                  return el("div", { class: "change" }, [
+                    el("span", { class: "from" }, edit.original_value || "(blank)"),
+                    " → ",
+                    el("span", { class: "to" }, shownTo),
+                    fwNote,
+                  ]);
+                })(),
                 edit.comment ? el("div", { class: "edit-comment" }, ["“", edit.comment, "”"]) : null,
                 ...thresholdLines,
                 el("div", { style: "margin-top:6px;" }, el("span", { class: "eval-badge " + edit.evaluation }, edit.evaluation === "auto_approved" ? "Auto-approved" : "Needs review")),
