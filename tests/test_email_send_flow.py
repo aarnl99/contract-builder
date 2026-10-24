@@ -51,7 +51,9 @@ def test_incomplete_replies_leave_blanks_instead_of_guessing():
 
 def test_only_vouched_for_senders_count_as_authenticated():
     assert ee.sender_is_authenticated({"dmarc": "pass", "dkim": "gray"})
-    assert ee.sender_is_authenticated({"dkim": "pass"})
+    # a DKIM pass alone can be for some other domain the sender controls
+    assert not ee.sender_is_authenticated({"dkim": "pass"})
+    assert not ee.sender_is_authenticated({"dkim": "pass", "dmarc": "fail"})
     assert not ee.sender_is_authenticated({"spf": "pass", "dkim": "fail", "dmarc": "fail"})
     assert not ee.sender_is_authenticated(None)
 
